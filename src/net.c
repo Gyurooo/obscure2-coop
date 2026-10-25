@@ -16,7 +16,7 @@
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
 #define NET_VERSION 1
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
-	PKT_STATE = 8, PKT_REQ = 9 };
+	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
 
 #pragma pack(push, 1)
@@ -27,10 +27,14 @@ typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; } ch_s
 #define MAX_CH 8
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; ch_state ch[MAX_CH]; } pkt_state;
 typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; } pkt_req;
+typedef struct { DWORD cls, tag; float pos[3]; float dir[3]; } npc_state;   // cls = the object's vtable address (its class)
+#define MAX_NPC 24
+typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; npc_state npc[MAX_NPC]; } pkt_npc;
 #pragma pack(pop)
 
 static void guest_on_state(const char *buf, int n);
 static void guest_on_req(const char *buf, int n);
+static void guest_on_npc(const char *buf, int n);
 
 #include "steam.c"
 
@@ -192,6 +196,8 @@ static void net_handle(const char *buf, int n, sid_t from)
 			}
 		} else if (h->type == PKT_STATE) {
 			guest_on_state(buf, n);
+		} else if (h->type == PKT_NPC) {
+			guest_on_npc(buf, n);
 		} else if (h->type == PKT_REQ) {
 			guest_on_req(buf, n);
 		} else if (h->type == PKT_PONG && n == sizeof(pkt_ping)) {
