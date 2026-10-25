@@ -38,6 +38,7 @@ typedef struct { sid_t game_id; DWORD ip; WORD port, query_port; sid_t lobby; } 
 static void *g_suser, *g_sfriends, *g_snet;
 static sid_t g_self_sid;
 static char g_host_name[64];          // guest: the host's Steam name from OBSCOOP_HOST_NAME (optional)
+static DWORD g_scan_appid = 254480;   // friends playing this app are host candidates (480 in Spacewar mode)
 static sid_t g_host_sid_cfg;          // guest: host Steam id from OBSCOOP_HOST_STEAMID (optional)
 static volatile LONG g_steam_ok, g_steam_session_requests, g_steam_accepted, g_steam_refused;
 static volatile LONG g_steam_tx_fail;
@@ -105,6 +106,13 @@ static int steam_start(void)
 	((p2p_relay_t)vt_of(g_snet)[7])(g_snet, NULL, 1);
 	reg(&g_cb_session, 1202);
 	// Sanity: a real individual account id has universe 1, type 1 (0x011000010...) in the top bits.
+	{
+		friend_game_info me;
+		memset(&me, 0, sizeof me);
+		int playing = ((friend_game_t)vt_of(g_sfriends)[8])(g_sfriends, NULL, g_self_sid, &me);
+		logf("steam: this account shows as %s (game id %llu); looking for friends in app %lu", playing ? "playing" : "not playing",
+			(unsigned long long)(me.game_id & 0xffffff), (unsigned long)g_scan_appid);
+	}
 	int id_ok = (g_self_sid >> 52) == 0x011;
 	logf("steam: ready; own id %s, persona name %s (%d chars), %d friends, session-request callback registered",
 		id_ok ? "valid" : "INVALID", name ? "readable" : "missing", name ? (int)strlen(name) : 0, nfriends);
@@ -146,7 +154,7 @@ static int steam_find_hosts(sid_t *out, int max)
 		if (!((friend_game_t)vt_of(g_sfriends)[8])(g_sfriends, NULL, id, &gi))
 			continue;
 		in_game++;
-		if (!g_host_name[0] && (gi.game_id & 0xffffff) == 254480)
+		if (!g_host_name[0] && (gi.game_id & 0xffffff) == g_scan_appid)
 			out[n++] = id;
 	}
 	static int logged;
