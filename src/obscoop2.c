@@ -432,6 +432,11 @@ static xstate g_vpad[4];
 static CRITICAL_SECTION g_vpad_cs;
 
 static int g_role;   // 0 off, 1 host, 2 guest (net.c)
+static xstate g_netpad;                 // guest: the host's controller (net.c)
+static volatile DWORD g_netpad_tick;
+static int g_local_pad;
+static void net_status(char *reply, size_t replysz);
+static void sync_status(char *reply, size_t replysz);
 
 // The pad as a player holds it: the virtual pad if set, else the real device unless hidden.
 static DWORD pad_read(DWORD user, void *state)
@@ -448,7 +453,20 @@ static DWORD pad_read(DWORD user, void *state)
 DWORD WINAPI XInputGetState(DWORD user, void *state)
 {
 	load_xinput();
-	if (g_role == 2)   // guest: the pad belongs to the host's player 2, not to this local game
+	if (g_role == 2 && user < 2) {   // guest: user 0 is the host's controller (player 1), user 1 is this PC's (player 2)
+		InterlockedIncrement(&g_polls[user]);
+		if (user == 0) {
+			if (GetTickCount() - g_netpad_tick < 500)
+				memcpy(state, &g_netpad, sizeof(xstate));
+			else
+				memset(state, 0, sizeof(xstate));
+			return ERROR_SUCCESS;
+		}
+		memset(state, 0, sizeof(xstate));
+		pad_read((DWORD)g_local_pad, state);
+		return ERROR_SUCCESS;
+	}
+	if (g_role == 2)
 		return ERROR_DEVICE_NOT_CONNECTED;
 	if (user < 4)
 		InterlockedIncrement(&g_polls[user]);
@@ -742,6 +760,10 @@ static void vpad_set(int user, int on, unsigned buttons, int lx, int ly, int rx,
 	LeaveCriticalSection(&g_vpad_cs);
 }
 
+static unsigned player_human(int player);   // sync.c
+#define H_POS 0x23c
+#define H_DIR 0x248
+
 static void handle_command(char *line, char *reply, size_t replysz)
 {
 	int user, lx = 0, ly = 0, rx = 0, ry = 0, lt = 0, rt = 0;
@@ -771,21 +793,61 @@ static void handle_command(char *line, char *reply, size_t replysz)
 			g_polls[0], g_polls[1], g_polls[2], g_polls[3], g_virtual_reads[0], g_virtual_reads[1],
 			g_virtual_reads[2], g_virtual_reads[3], g_kbd_data_reads, fgpid == GetCurrentProcessId());
 	} else if (!strncmp(line, "level ", 6)) {
-		// Same request the Cslh_ChangeLevel script command makes (FUN_004a1c00): game+0x364 level tag,
-		// +0x368 entry (door) id, +0x370 flag, then the state machine value 4 at +0x320.
+		// Makes the same call the Cslh_ChangeLevel script command makes (FUN_004a1c00, hooked, so it is logged and
+		// forwarded to the guest). Only use a tag the game itself produced: a guessed one crashes the game.
 		char tag[16] = "";
 		int entry = 0, flag = 1;
 		sscanf(line + 6, "%15s %d %d", tag, &entry, &flag);
-		volatile unsigned *gp = (volatile unsigned *)0x6c3068;
-		if (strlen(tag) != 4 || !*gp) {
+		unsigned g = *(volatile unsigned *)0x6c3068;
+		if (strlen(tag) != 4 || !g) {
 			_snprintf(reply, replysz, "error level <4 char tag> [entry] [flag] (game running?)");
 		} else {
-			unsigned g = *gp;
-			*(volatile unsigned *)(g + 0x364) = ((unsigned)tag[0] << 24) | ((unsigned)tag[1] << 16) | ((unsigned)tag[2] << 8) | (unsigned)tag[3];
-			*(volatile int *)(g + 0x368) = entry;
-			*(volatile int *)(g + 0x370) = flag;
-			*(volatile int *)(g + 0x320) = 4;
-			logf("level request %s entry %d flag %d", tag, entry, flag);
+			unsigned t = ((unsigned)tag[0] << 24) | ((unsigned)tag[1] << 16) | ((unsigned)tag[2] << 8) | (unsigned)tag[3];
+			((void(__fastcall *)(void *, void *, unsigned, unsigned, unsigned))0x4a1c00)((void *)(uintptr_t)g, NULL, t, (unsigned)entry, (unsigned)flag);
+			_snprintf(reply, replysz, "ok");
+		}
+	} else if (!strncmp(line, "wr ", 3)) {
+		// wr <addr hex> <hex bytes>: test-only memory write into the game process (never used by the mod).
+		unsigned addr = 0;
+		char hex[512] = "";
+		if (sscanf(line + 3, "%x %511s", &addr, hex) != 2 || (strlen(hex) & 1) || addr < 0x10000) {
+			_snprintf(reply, replysz, "error wr <addr> <hexbytes>");
+		} else {
+			size_t n = strlen(hex) / 2;
+			BYTE tmp[256];
+			if (n > sizeof tmp) {
+				_snprintf(reply, replysz, "error too long");
+			} else {
+				for (size_t i = 0; i < n; i++) {
+					unsigned b;
+					sscanf(hex + 2 * i, "%2x", &b);
+					tmp[i] = (BYTE)b;
+				}
+				if (IsBadWritePtr((void *)(uintptr_t)addr, n)) {
+					_snprintf(reply, replysz, "error bad address");
+				} else {
+					memcpy((void *)(uintptr_t)addr, tmp, n);
+					_snprintf(reply, replysz, "ok %u bytes", (unsigned)n);
+				}
+			}
+		}
+	} else if (!strncmp(line, "sync", 4)) {
+		sync_status(reply, replysz);
+	} else if (!strncmp(line, "net", 3)) {
+		net_status(reply, replysz);
+	} else if (!strncmp(line, "tp ", 3)) {
+		// tp <player 0|1> <x> <y> [z] [dx dy]: move a player's character (test tool; the position is a plain float
+		// triple at character+0x23c, facing at +0x248).
+		int pl = 0;
+		float v[5] = { 0, 0, 0.92f, 0, 0 };
+		int got = sscanf(line + 3, "%d %f %f %f %f %f", &pl, &v[0], &v[1], &v[2], &v[3], &v[4]);
+		unsigned h = (pl == 0 || pl == 1) ? player_human(pl) : 0;
+		if (got < 3 || !h) {
+			_snprintf(reply, replysz, "error tp <0|1> x y [z dx dy] (in game?)");
+		} else {
+			float *pos = (float *)(uintptr_t)(h + H_POS), *dir = (float *)(uintptr_t)(h + H_DIR);
+			pos[0] = v[0]; pos[1] = v[1]; pos[2] = v[2];
+			if (got >= 6) { dir[0] = v[3]; dir[1] = v[4]; dir[2] = 0; }
 			_snprintf(reply, replysz, "ok");
 		}
 	} else if (!strncmp(line, "ping", 4)) {
@@ -877,7 +939,7 @@ static const char *reg_map(const char *sub, char *buf, size_t n)
 {
 	static const char real[] = "Software\\MRS\\Obscure2";
 	if (sub && !_stricmp(sub, real)) {
-		_snprintf(buf, n, "%s_coop_test", real);
+		{ char suf[16] = ""; GetEnvironmentVariableA("OBSCOOP_REGSUFFIX", suf, sizeof suf); _snprintf(buf, n, "%s_coop_test%s", real, suf); }
 		buf[n - 1] = 0;
 		logf("registry %s -> %s", sub, buf);
 		return buf;
@@ -898,7 +960,9 @@ static LSTATUS WINAPI hk_RegCreateKeyA(HKEY k, LPCSTR sub, PHKEY out)
 }
 
 #include "window.c"
+#include "net.c"
 #include "hooks.c"
+#include "sync.c"
 
 // The game refuses to start while the mutex "obscure2_lock" exists. With OBSCOOP_MULTI=1 this copy
 // gets a private name, so two copies can run on one PC (bot tests).
@@ -1037,7 +1101,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	// environment variable with the full name wins (the one-PC tests use those).
 	{
 		static const char *keys[] = { "ROLE", "NET", "HOST_STEAMID", "REMOTE_PAD", "LOCAL_PAD", "HIDE_REAL_PADS",
-			"BACKGROUND", "VPADS", "MULTI", "WINDOWED" };
+			"BACKGROUND", "VPADS", "MULTI", "UDP", "PEER", "WINDOWED" };
 		char ini[MAX_PATH], v[64], name[64];
 		_snprintf(ini, MAX_PATH, "%s\\obscoop.ini", g_dir);
 		if (GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES) {
@@ -1071,6 +1135,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	g_hide_real_pads = GetEnvironmentVariableA("OBSCOOP_HIDE_REAL_PADS", bg, sizeof bg) && bg[0] == '1';
 	logf("real controllers %s", g_hide_real_pads ? "hidden" : "visible");
 	{ char m[8]; g_multi = GetEnvironmentVariableA("OBSCOOP_MULTI", m, sizeof m) && m[0] == '1'; }
+	sync_init();
 	install_request_hooks();
 	apply_hooks(1);
 	// OBSCOOP_VPADS=0,1 : report those virtual pads as connected (idle) from the first poll.
@@ -1084,5 +1149,6 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	}
 	CloseHandle(CreateThread(NULL, 0, watcher, NULL, 0, NULL));
 	CloseHandle(CreateThread(NULL, 0, pipe_server, NULL, 0, NULL));
+	net_start();
 	return TRUE;
 }

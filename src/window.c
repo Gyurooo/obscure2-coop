@@ -10,9 +10,14 @@ typedef HRESULT(STDMETHODCALLTYPE *d3d_create_device_t)(IDirect3D9 *, UINT, D3DD
 	D3DPRESENT_PARAMETERS *, IDirect3DDevice9 **);
 typedef HRESULT(STDMETHODCALLTYPE *dev_reset_t)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *);
 
+static void frame_tick(void);
+typedef HRESULT(STDMETHODCALLTYPE *dev_present_t)(IDirect3DDevice9 *, const RECT *, const RECT *, HWND, const RGNDATA *);
+static dev_present_t real_dev_Present;
 static Direct3DCreate9_t real_Direct3DCreate9;
 static d3d_create_device_t real_d3d_CreateDevice;
 static dev_reset_t real_dev_Reset;
+
+static int env_int(const char *name, int def);
 
 static void win_patch_slot(void **slot, void *hook, void **orig)
 {
@@ -51,8 +56,15 @@ static void win_adjust(D3DPRESENT_PARAMETERS *pp, HWND focus)
 	RECT r = { 0, 0, (LONG)bw, (LONG)bh };
 	AdjustWindowRect(&r, style, FALSE);
 	SetWindowLongA(w, GWL_STYLE, (LONG)style);
-	SetWindowPos(w, HWND_NOTOPMOST, 40, 40, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+	SetWindowPos(w, HWND_NOTOPMOST, env_int("OBSCOOP_WINX", 40), env_int("OBSCOOP_WINY", 40), r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
 	ShowWindow(w, SW_SHOWNOACTIVATE);   // also restores a window that was minimised
+}
+
+// Once per frame on the game's render thread, which is also its main thread.
+static HRESULT STDMETHODCALLTYPE hk_dev_Present(IDirect3DDevice9 *dev, const RECT *a, const RECT *b, HWND w, const RGNDATA *r)
+{
+	frame_tick();
+	return real_dev_Present(dev, a, b, w, r);
 }
 
 static HRESULT STDMETHODCALLTYPE hk_dev_Reset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp)
@@ -75,6 +87,8 @@ static HRESULT STDMETHODCALLTYPE hk_d3d_CreateDevice(IDirect3D9 *d3d, UINT adapt
 	logf("windowed: CreateDevice %ux%u -> 0x%08lx", pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0, (unsigned long)hr);
 	if (SUCCEEDED(hr) && out && *out)
 		win_patch_slot(&(*(void ***)*out)[16], (void *)hk_dev_Reset, (void **)&real_dev_Reset);
+	if (SUCCEEDED(hr) && out && *out)
+		win_patch_slot(&(*(void ***)*out)[17], (void *)hk_dev_Present, (void **)&real_dev_Present);
 	return hr;
 }
 

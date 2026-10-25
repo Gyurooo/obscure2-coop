@@ -39,6 +39,8 @@ static const char *tag4(unsigned v, char *out)
 }
 
 static volatile LONG g_req_seq;   // number of requests seen, for tests
+static volatile LONG g_req_sent;  // requests forwarded to the guest (host)
+static int g_apply_host_req;      // guest: the request being made comes from the host, let it through
 
 typedef void(__fastcall *req3_t)(void *, void *, unsigned, unsigned, unsigned);
 typedef void(__fastcall *req1_t)(void *, void *, unsigned);
@@ -51,9 +53,17 @@ static void __fastcall hk_change_level(void *game, void *edx, unsigned level, un
 {
 	char t[5];
 	InterlockedIncrement(&g_req_seq);
+	if (g_role == 2 && g_peer_ok && !g_apply_host_req) {   // guest: only the host changes levels
+		logf("guest: own ChangeLevel %s dropped (the host decides)", tag4(level, t));
+		return;
+	}
 	logf("request ChangeLevel level %s (0x%08x) entry %u flag %u [mode %u state %u]", tag4(level, t), level, entry, flag,
 		*(unsigned *)((BYTE *)game + 0x310), *(unsigned *)((BYTE *)game + 0x320));
 	g_change_level(game, edx, level, entry, flag);
+	if (g_role == 1 && !g_apply_host_req && g_peer_ok) {
+		net_send_req(REQ_LEVEL, level, entry, flag, NULL);
+		InterlockedIncrement(&g_req_sent);
+	}
 }
 
 static void __fastcall hk_load_progress(void *game, void *edx, unsigned arg)
@@ -61,6 +71,10 @@ static void __fastcall hk_load_progress(void *game, void *edx, unsigned arg)
 	InterlockedIncrement(&g_req_seq);
 	logf("request LoadProgress arg %u [mode %u]", arg, *(unsigned *)((BYTE *)game + 0x310));
 	g_load_progress(game, edx, arg);
+	if (g_role == 1 && !g_apply_host_req && g_peer_ok) {
+		net_send_req(REQ_LOAD_PROGRESS, arg, 0, 0, NULL);
+		InterlockedIncrement(&g_req_sent);
+	}
 }
 
 static void __fastcall hk_load_name(void *game, void *edx, unsigned name)
@@ -68,6 +82,10 @@ static void __fastcall hk_load_name(void *game, void *edx, unsigned name)
 	InterlockedIncrement(&g_req_seq);
 	logf("request LoadByName \"%.60s\" [mode %u]", name ? (const char *)name : "(null)", *(unsigned *)((BYTE *)game + 0x310));
 	g_load_name(game, edx, name);
+	if (g_role == 1 && !g_apply_host_req && g_peer_ok && name) {
+		net_send_req(REQ_LOAD_NAME, 0, 0, 0, (const char *)name);
+		InterlockedIncrement(&g_req_sent);
+	}
 }
 
 static void __fastcall hk_to_menu(void *game, void *edx)
@@ -75,6 +93,10 @@ static void __fastcall hk_to_menu(void *game, void *edx)
 	InterlockedIncrement(&g_req_seq);
 	logf("request ToMenu [mode %u]", *(unsigned *)((BYTE *)game + 0x310));
 	g_to_menu(game, edx);
+	if (g_role == 1 && !g_apply_host_req && g_peer_ok) {
+		net_send_req(REQ_TO_MENU, 0, 0, 0, NULL);
+		InterlockedIncrement(&g_req_sent);
+	}
 }
 
 static void install_request_hooks(void)

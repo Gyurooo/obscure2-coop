@@ -1,0 +1,370 @@
+// Network link between a host and a guest copy of Obscure II (included by obscoop2.c).
+//
+// Design (hybrid): both copies run the game. The host's controller is the guest's player 1, the guest's
+// controller is the host's player 2, so each copy simulates both players from the same inputs and the
+// game's own logic produces the animations, door opening and "Press A" prompts. The host stays
+// authoritative: it sends level / load / menu requests, which the guest executes in step (the guest drops
+// its own level changes), and position snapshots that correct drift.
+//
+// Roles (OBSCOOP_ROLE): host | guest. Transport (OBSCOOP_NET): udp (one-PC tests, loopback only,
+// OBSCOOP_UDP = host port) or steam (P2P through the game's steam_api.dll, friends only).
+// Packet: u32 magic, u8 type, u8 version, u16 payload length, u32 seq, payload.
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
+#define NET_VERSION 1
+enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
+	PKT_STATE = 8, PKT_REQ = 9 };
+enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
+
+#pragma pack(push, 1)
+typedef struct { DWORD magic; BYTE type, version; WORD len; DWORD seq; } pkt_hdr;
+typedef struct { pkt_hdr h; DWORD tick; xstate pad; } pkt_pad;      // INPUT (guest -> host) and HOSTPAD (host -> guest)
+typedef struct { pkt_hdr h; DWORD t_ms; } pkt_ping;
+typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; } ch_state;
+#define MAX_CH 8
+typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; ch_state ch[MAX_CH]; } pkt_state;
+typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; } pkt_req;
+#pragma pack(pop)
+
+static void guest_on_state(const char *buf, int n);
+static void guest_on_req(const char *buf, int n);
+
+#include "steam.c"
+
+static int g_use_steam;
+static int g_last_candidates;
+static int g_host_self_test;
+static int g_remote_pad = 1, g_local_pad;   // host: the guest's pad is game user 1; guest: our controller index
+static SOCKET g_sock = INVALID_SOCKET;
+static struct sockaddr_in g_udp_peer;
+static sid_t g_peer;
+static volatile LONG g_peer_ok;
+static volatile LONG g_net_rx, g_net_tx, g_net_bad, g_net_rtt_ms = -1;
+static volatile LONG g_last_input_seq, g_last_hostpad_seq;
+static volatile DWORD g_last_rx_tick;
+static DWORD g_tx_seq;
+
+// The host's controller as the guest's game user 0 (player 1).
+static xstate g_netpad;
+static volatile DWORD g_netpad_tick;
+
+static sid_t udp_key(const struct sockaddr_in *a)
+{
+	return ((sid_t)ntohl(a->sin_addr.s_addr) << 16) | ntohs(a->sin_port);
+}
+
+static void net_send_to(sid_t to, BYTE type, void *pkt, WORD payload)
+{
+	pkt_hdr *h = (pkt_hdr *)pkt;
+	h->magic = NET_MAGIC;
+	h->type = type;
+	h->version = NET_VERSION;
+	h->len = payload;
+	h->seq = ++g_tx_seq;
+	int len = (int)(sizeof(pkt_hdr) + payload);
+	int ok;
+	if (g_use_steam) {
+		ok = steam_send(to, pkt, len);
+	} else {
+		(void)to;
+		ok = sendto(g_sock, (const char *)pkt, len, 0, (struct sockaddr *)&g_udp_peer, sizeof g_udp_peer) > 0;
+	}
+	if (ok)
+		InterlockedIncrement(&g_net_tx);
+}
+
+static void net_send(BYTE type, void *pkt, WORD payload)
+{
+	net_send_to(g_peer, type, pkt, payload);
+}
+
+static int local_pad(int user, xstate *out)
+{
+	memset(out, 0, sizeof *out);
+	load_xinput();
+	return pad_read((DWORD)user, out) == ERROR_SUCCESS;
+}
+
+static void host_drop_guest(const char *why)
+{
+	if (!g_peer_ok)
+		return;
+	g_peer_ok = 0;
+	vpad_set(g_remote_pad, 0, 0, 0, 0, 0, 0, 0, 0);
+	logf("net: guest dropped (%s); virtual pad %d disconnected", why, g_remote_pad);
+}
+
+static void steam_session_request(sid_t from)
+{
+	InterlockedIncrement(&g_steam_session_requests);
+	int ok = (g_host_self_test || getenv("OBSCOOP_ALLOW_SELF")) && from == g_self_sid ? 1 :
+		g_role == 1 ? (g_peer_ok ? from == g_peer : steam_is_friend(from))
+		: (g_host_sid_cfg ? from == g_host_sid_cfg : steam_is_friend(from));
+	if (ok) {
+		steam_accept(from);
+		logf("steam: accepted a P2P session from a friend");
+	} else {
+		InterlockedIncrement(&g_steam_refused);
+		logf("steam: refused a P2P session (not a friend, or not our peer)");
+	}
+}
+
+// Sends a request to the guest (host only); the guest executes it in step with the host.
+static void net_send_req(DWORD kind, unsigned a, unsigned b, unsigned c, const char *name)
+{
+	if (g_role != 1 || !g_peer_ok)
+		return;
+	pkt_req r;
+	memset(&r, 0, sizeof r);
+	r.kind = kind; r.a = a; r.b = b; r.c = c;
+	if (name)
+		_snprintf(r.name, sizeof r.name - 1, "%s", name);
+	net_send(PKT_REQ, &r, sizeof r - sizeof(pkt_hdr));
+}
+
+static void net_handle(const char *buf, int n, sid_t from)
+{
+	const pkt_hdr *h = (const pkt_hdr *)buf;
+	if (n < (int)sizeof *h || h->magic != NET_MAGIC || h->version != NET_VERSION ||
+		(int)(sizeof *h + h->len) != n) {
+		InterlockedIncrement(&g_net_bad);
+		return;
+	}
+	if (g_role == 1) {
+		if (!g_peer_ok) {
+			if (h->type != PKT_HELLO)
+				return;
+			g_peer = from;
+			g_peer_ok = 1;
+			g_last_input_seq = 0;
+			logf("net: guest joined (%s)", g_use_steam ? "steam" : "udp");
+		} else if (from != g_peer) {
+			return;
+		}
+		g_last_rx_tick = GetTickCount();
+		InterlockedIncrement(&g_net_rx);
+		switch (h->type) {
+		case PKT_HELLO: {
+			pkt_hdr w;
+			net_send(PKT_WELCOME, &w, 0);
+			break;
+		}
+		case PKT_INPUT: {
+			const pkt_pad *in = (const pkt_pad *)buf;
+			if (n != sizeof *in || (LONG)(h->seq - (DWORD)g_last_input_seq) <= 0)
+				break;
+			g_last_input_seq = (LONG)h->seq;
+			vpad_set(g_remote_pad, 1, in->pad.buttons, in->pad.lx, in->pad.ly, in->pad.rx, in->pad.ry, in->pad.lt, in->pad.rt);
+			break;
+		}
+		case PKT_PING: {
+			pkt_ping pong = *(const pkt_ping *)buf;
+			if (n == sizeof pong)
+				net_send(PKT_PONG, &pong, sizeof pong - sizeof(pkt_hdr));
+			break;
+		}
+		case PKT_BYE:
+			host_drop_guest("bye");
+			break;
+		}
+	} else if (g_role == 2) {
+		if (!g_peer_ok) {
+			if (h->type != PKT_WELCOME)
+				return;
+			g_peer = from;
+			g_peer_ok = 1;
+			g_last_hostpad_seq = 0;
+			logf("net: host welcomed us (%s)", g_use_steam ? "steam" : "udp");
+		} else if (from != g_peer) {
+			return;
+		}
+		g_last_rx_tick = GetTickCount();
+		InterlockedIncrement(&g_net_rx);
+		if (h->type == PKT_HOSTPAD) {
+			const pkt_pad *in = (const pkt_pad *)buf;
+			if (n == sizeof *in && (LONG)(h->seq - (DWORD)g_last_hostpad_seq) > 0) {
+				g_last_hostpad_seq = (LONG)h->seq;
+				g_netpad = in->pad;
+				g_netpad_tick = GetTickCount();
+			}
+		} else if (h->type == PKT_STATE) {
+			guest_on_state(buf, n);
+		} else if (h->type == PKT_REQ) {
+			guest_on_req(buf, n);
+		} else if (h->type == PKT_PONG && n == sizeof(pkt_ping)) {
+			g_net_rtt_ms = (LONG)(GetTickCount() - ((const pkt_ping *)buf)->t_ms);
+		}
+	}
+}
+
+static void net_tick(void)
+{
+	static DWORD last_hello, last_ping, last_pad, tick;
+	DWORD now = GetTickCount();
+	if (g_role == 1) {
+		if (g_peer_ok && now - g_last_rx_tick > (g_use_steam ? 10000u : 3000u))
+			host_drop_guest(g_use_steam ? "timeout 10 s" : "timeout 3 s");
+		static DWORD last_accept;
+		if (g_use_steam && !g_peer_ok && now - last_accept >= 2000) {
+			last_accept = now;
+			sid_t ids[16];
+			sid_t saved = g_host_sid_cfg;
+			g_host_sid_cfg = 0;
+			int k = steam_find_hosts(ids, 16);
+			g_host_sid_cfg = saved;
+			g_last_candidates = k;
+			for (int i = 0; i < k; i++)
+				steam_accept(ids[i]);
+		}
+		if (g_peer_ok && now - last_pad >= 8) {   // the host's own pad is the guest's player 1
+			pkt_pad hp;
+			local_pad(0, &hp.pad);
+			hp.tick = ++tick;
+			net_send(PKT_HOSTPAD, &hp, sizeof hp - sizeof(pkt_hdr));
+			last_pad = now;
+		}
+		return;
+	}
+	if (!g_peer_ok && now - last_hello >= 1000) {
+		pkt_hdr hello;
+		if (g_use_steam) {
+			sid_t hosts[16];
+			int n = steam_find_hosts(hosts, 16);
+			g_last_candidates = n;
+			for (int i = 0; i < n; i++)
+				net_send_to(hosts[i], PKT_HELLO, &hello, 0);
+			static int logged;
+			if (!logged++)
+				logf("net: looking for the host among %d candidate(s)", n);
+		} else {
+			net_send(PKT_HELLO, &hello, 0);
+		}
+		last_hello = now;
+	}
+	if (g_peer_ok && now - g_last_rx_tick > (g_use_steam ? 10000u : 3000u)) {
+		g_peer_ok = 0;
+		logf("net: host silent; saying hello again");
+	}
+	if (g_peer_ok && now - last_pad >= 8) {   // this PC's controller is the host's player 2
+		pkt_pad in;
+		local_pad(g_local_pad, &in.pad);
+		in.tick = ++tick;
+		net_send(PKT_INPUT, &in, sizeof in - sizeof(pkt_hdr));
+		last_pad = now;
+	}
+	if (g_peer_ok && now - last_ping >= 500) {
+		pkt_ping p;
+		p.t_ms = now;
+		net_send(PKT_PING, &p, sizeof p - sizeof(pkt_hdr));
+		last_ping = now;
+	}
+}
+
+static DWORD WINAPI udp_thread(LPVOID arg)
+{
+	(void)arg;
+	char buf[4096];
+	for (;;) {
+		fd_set rd;
+		FD_ZERO(&rd);
+		FD_SET(g_sock, &rd);
+		struct timeval tv = { 0, 2000 };
+		if (select(0, &rd, NULL, NULL, &tv) > 0) {
+			struct sockaddr_in from;
+			int fl = sizeof from;
+			int n = recvfrom(g_sock, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+			if (n > 0) {
+				if (g_role == 1 && !g_peer_ok)
+					g_udp_peer = from;
+				net_handle(buf, n, udp_key(&from));
+			}
+		}
+		net_tick();
+	}
+}
+
+// Steam: once per frame on the main thread (Present hook).
+static void net_frame(void)
+{
+	if (!g_use_steam || !g_role)
+		return;
+	if (!g_steam_ok) {
+		static DWORD last_try;
+		if (GetTickCount() - last_try < 1000)
+			return;
+		last_try = GetTickCount();
+		if (!steam_start())
+			return;
+		g_steam_ok = 1;
+		if (g_host_self_test)
+			g_host_sid_cfg = g_self_sid;
+	}
+	steam_poll();
+	net_tick();
+}
+
+static int env_int(const char *name, int def)
+{
+	char v[32];
+	return GetEnvironmentVariableA(name, v, sizeof v) ? atoi(v) : def;
+}
+
+static void net_start(void)
+{
+	char role[16] = "", net[16] = "udp", peer[64] = "127.0.0.1", hostid[32] = "";
+	GetEnvironmentVariableA("OBSCOOP_ROLE", role, sizeof role);
+	GetEnvironmentVariableA("OBSCOOP_NET", net, sizeof net);
+	GetEnvironmentVariableA("OBSCOOP_PEER", peer, sizeof peer);
+	GetEnvironmentVariableA("OBSCOOP_HOST_STEAMID", hostid, sizeof hostid);
+	g_role = !_stricmp(role, "host") ? 1 : !_stricmp(role, "guest") ? 2 : 0;
+	if (!g_role)
+		return;
+	g_remote_pad = env_int("OBSCOOP_REMOTE_PAD", 1) & 3;
+	g_local_pad = env_int("OBSCOOP_LOCAL_PAD", 0) & 3;
+	if (!_stricmp(net, "steam")) {
+		g_use_steam = 1;
+		g_host_sid_cfg = _strtoui64(hostid, NULL, 10);
+		g_host_self_test = !_stricmp(hostid, "self");
+		logf("net: %s over steam (starts after SteamAPI_Init), remote pad %d, local pad %d, host id %s",
+			g_role == 1 ? "host" : "guest", g_remote_pad, g_local_pad, g_host_sid_cfg ? "configured" : "from friends list");
+		return;
+	}
+	if (_stricmp(net, "udp")) {
+		logf("net: transport '%s' unknown", net);
+		g_role = 0;
+		return;
+	}
+	int port = env_int("OBSCOOP_UDP", 27961);
+	WSADATA w;
+	WSAStartup(MAKEWORD(2, 2), &w);
+	g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	struct sockaddr_in me = { 0 };
+	me.sin_family = AF_INET;
+	me.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // loopback only: udp is the one-PC test transport
+	if (g_role == 1) {
+		me.sin_port = htons((u_short)port);
+	} else {
+		me.sin_port = 0;
+		g_udp_peer.sin_family = AF_INET;
+		g_udp_peer.sin_port = htons((u_short)port);
+		inet_pton(AF_INET, peer, &g_udp_peer.sin_addr);
+		g_peer = udp_key(&g_udp_peer);
+	}
+	if (bind(g_sock, (struct sockaddr *)&me, sizeof me)) {
+		logf("net: bind failed (%d)", WSAGetLastError());
+		return;
+	}
+	logf("net: %s over udp, %s port %d, remote pad %d, local pad %d", g_role == 1 ? "host" : "guest",
+		g_role == 1 ? "listening on 127.0.0.1" : peer, port, g_remote_pad, g_local_pad);
+	CloseHandle(CreateThread(NULL, 0, udp_thread, NULL, 0, NULL));
+}
+
+static void net_status(char *reply, size_t replysz)
+{
+	_snprintf(reply, replysz, "net role %s via %s peer_ok %ld rx %ld tx %ld bad %ld last_input_seq %ld rtt_ms %ld",
+		g_role == 1 ? "host" : g_role == 2 ? "guest" : "off", g_use_steam ? "steam" : "udp", g_peer_ok, g_net_rx,
+		g_net_tx, g_net_bad, g_last_input_seq, g_net_rtt_ms);
+}
