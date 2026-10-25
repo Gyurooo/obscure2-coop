@@ -770,6 +770,24 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		_snprintf(reply, replysz, "polls %ld %ld %ld %ld virtual %ld %ld %ld %ld kbd_data_reads %ld foreground_is_game %d",
 			g_polls[0], g_polls[1], g_polls[2], g_polls[3], g_virtual_reads[0], g_virtual_reads[1],
 			g_virtual_reads[2], g_virtual_reads[3], g_kbd_data_reads, fgpid == GetCurrentProcessId());
+	} else if (!strncmp(line, "level ", 6)) {
+		// Same request the Cslh_ChangeLevel script command makes (FUN_004a1c00): game+0x364 level tag,
+		// +0x368 entry (door) id, +0x370 flag, then the state machine value 4 at +0x320.
+		char tag[16] = "";
+		int entry = 0, flag = 1;
+		sscanf(line + 6, "%15s %d %d", tag, &entry, &flag);
+		volatile unsigned *gp = (volatile unsigned *)0x6c3068;
+		if (strlen(tag) != 4 || !*gp) {
+			_snprintf(reply, replysz, "error level <4 char tag> [entry] [flag] (game running?)");
+		} else {
+			unsigned g = *gp;
+			*(volatile unsigned *)(g + 0x364) = ((unsigned)tag[0] << 24) | ((unsigned)tag[1] << 16) | ((unsigned)tag[2] << 8) | (unsigned)tag[3];
+			*(volatile int *)(g + 0x368) = entry;
+			*(volatile int *)(g + 0x370) = flag;
+			*(volatile int *)(g + 0x320) = 4;
+			logf("level request %s entry %d flag %d", tag, entry, flag);
+			_snprintf(reply, replysz, "ok");
+		}
 	} else if (!strncmp(line, "ping", 4)) {
 		_snprintf(reply, replysz, "pong %lu", GetCurrentProcessId());
 	} else {
@@ -880,6 +898,7 @@ static LSTATUS WINAPI hk_RegCreateKeyA(HKEY k, LPCSTR sub, PHKEY out)
 }
 
 #include "window.c"
+#include "hooks.c"
 
 // The game refuses to start while the mutex "obscure2_lock" exists. With OBSCOOP_MULTI=1 this copy
 // gets a private name, so two copies can run on one PC (bot tests).
@@ -957,8 +976,7 @@ static DWORD WINAPI watcher(LPVOID arg)
 	for (int i = 0; i < 2000; i++) {   // first ~20 s
 		if (!hooks_intact()) {
 			logf("import table changed after load; re-applying hooks");
-			{ char m[8]; g_multi = GetEnvironmentVariableA("OBSCOOP_MULTI", m, sizeof m) && m[0] == '1'; }
-	apply_hooks(1);
+			apply_hooks(1);
 		}
 		Sleep(10);
 	}
@@ -1052,6 +1070,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	logf("background running %s", g_background ? "on" : "off");
 	g_hide_real_pads = GetEnvironmentVariableA("OBSCOOP_HIDE_REAL_PADS", bg, sizeof bg) && bg[0] == '1';
 	logf("real controllers %s", g_hide_real_pads ? "hidden" : "visible");
+	{ char m[8]; g_multi = GetEnvironmentVariableA("OBSCOOP_MULTI", m, sizeof m) && m[0] == '1'; }
+	install_request_hooks();
 	apply_hooks(1);
 	// OBSCOOP_VPADS=0,1 : report those virtual pads as connected (idle) from the first poll.
 	char vp[32];
