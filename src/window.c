@@ -11,9 +11,27 @@ typedef HRESULT(STDMETHODCALLTYPE *d3d_create_device_t)(IDirect3D9 *, UINT, D3DD
 typedef HRESULT(STDMETHODCALLTYPE *dev_reset_t)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *);
 
 static void frame_tick(void);
+static float fabsf_(float v) { return v < 0 ? -v : v; }
+float atan2f(float y, float x);
+static volatile float g_cam_yaw;           // radians: ground direction of the camera's forward axis (world x, y; z is up)
+static volatile LONG g_cam_yaw_valid;
+// The game sets several view matrices per frame (UI, map, shadows). The scene camera is the tilted look-down one:
+// forward has a small downward z, up points up. Facing of a character after "stick up" matched this forward (observed).
+static void cam_yaw_update(void);
 static HWND g_game_wnd;   // the game's window, for the title status line
 typedef HRESULT(STDMETHODCALLTYPE *dev_present_t)(IDirect3DDevice9 *, const RECT *, const RECT *, HWND, const RGNDATA *);
 static dev_present_t real_dev_Present;
+typedef HRESULT(STDMETHODCALLTYPE *dev_settransform_t)(IDirect3DDevice9 *, D3DTRANSFORMSTATETYPE, const D3DMATRIX *);
+static dev_settransform_t real_dev_SetTransform;
+static volatile float g_view[16];        // the last D3DTS_VIEW matrix the game set (row-major, as D3D stores it)
+static volatile LONG g_view_sets, g_xf_sets;
+static volatile float g_view_first[16];   // the first view matrix set after the last Present (the 3D scene camera)
+static volatile LONG g_view_first_seen;
+#define NVIEWS 12
+static float g_views[NVIEWS][16];          // distinct view matrices seen in the last completed frame
+static LONG g_views_n[NVIEWS], g_views_count;
+static float g_cur_views[NVIEWS][16];      // being collected in the current frame
+static LONG g_cur_n[NVIEWS], g_cur_count;
 static Direct3DCreate9_t real_Direct3DCreate9;
 static d3d_create_device_t real_d3d_CreateDevice;
 static dev_reset_t real_dev_Reset;
@@ -61,10 +79,64 @@ static void win_adjust(D3DPRESENT_PARAMETERS *pp, HWND focus)
 	ShowWindow(w, SW_SHOWNOACTIVATE);   // also restores a window that was minimised
 }
 
+// Camera: the view matrix the game gives Direct3D. Stick directions are relative to the camera, so a copy whose camera
+// differs from the other's must turn the other's stick into its own camera frame (see sync.c).
+static HRESULT STDMETHODCALLTYPE hk_dev_SetTransform(IDirect3DDevice9 *dev, D3DTRANSFORMSTATETYPE st, const D3DMATRIX *m)
+{
+	InterlockedIncrement(&g_xf_sets);
+	if (st == D3DTS_VIEW && m) {
+		if (!g_view_first_seen) {
+			memcpy((void *)g_view_first, m, sizeof g_view_first);
+			g_view_first_seen = 1;
+		}
+		memcpy((void *)g_view, m, sizeof g_view);
+		{
+			const float *f = (const float *)m;
+			int k;
+			for (k = 0; k < g_cur_count; k++) {
+				int same = 1;
+				for (int i = 0; i < 16; i++)
+					if (fabsf_(f[i] - g_cur_views[k][i]) > 0.0005f)
+						same = 0;
+				if (same) {
+					g_cur_n[k]++;
+					break;
+				}
+			}
+			if (k == g_cur_count && g_cur_count < NVIEWS) {
+				memcpy(g_cur_views[g_cur_count], f, 64);
+				g_cur_n[g_cur_count++] = 1;
+			}
+		}
+		InterlockedIncrement(&g_view_sets);
+	}
+	return real_dev_SetTransform(dev, st, m);
+}
+
+static void cam_yaw_update(void)
+{
+	for (int k = 0; k < g_views_count; k++) {
+		const float *v = g_views[k];
+		float fx = v[2], fy = v[6], fz = v[10];   // forward = third column of the D3D view matrix (rows are v[0..], v[4..], v[8..])
+		float uz = v[9];                           // up.z
+		if (fabsf_(fz) < 0.9f && fabsf_(fz) > 0.05f && fabsf_(uz) > 0.5f && fabsf_(fx) + fabsf_(fy) > 0.1f) {
+			g_cam_yaw = atan2f(fy, fx);
+			g_cam_yaw_valid = 1;
+			return;
+		}
+	}
+}
+
 // Once per frame on the game's render thread, which is also its main thread.
 static HRESULT STDMETHODCALLTYPE hk_dev_Present(IDirect3DDevice9 *dev, const RECT *a, const RECT *b, HWND w, const RGNDATA *r)
 {
 	frame_tick();
+	g_view_first_seen = 0;
+	memcpy(g_views, g_cur_views, sizeof g_views);
+	memcpy(g_views_n, g_cur_n, sizeof g_views_n);
+	g_views_count = g_cur_count;
+	g_cur_count = 0;
+	cam_yaw_update();
 	return real_dev_Present(dev, a, b, w, r);
 }
 
@@ -91,6 +163,8 @@ static HRESULT STDMETHODCALLTYPE hk_d3d_CreateDevice(IDirect3D9 *d3d, UINT adapt
 		win_patch_slot(&(*(void ***)*out)[16], (void *)hk_dev_Reset, (void **)&real_dev_Reset);
 	if (SUCCEEDED(hr) && out && *out)
 		win_patch_slot(&(*(void ***)*out)[17], (void *)hk_dev_Present, (void **)&real_dev_Present);
+	if (SUCCEEDED(hr) && out && *out)
+		win_patch_slot(&(*(void ***)*out)[44], (void *)hk_dev_SetTransform, (void **)&real_dev_SetTransform);
 	return hr;
 }
 

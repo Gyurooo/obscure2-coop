@@ -14,15 +14,15 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 1
+#define NET_VERSION 3   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
 
 #pragma pack(push, 1)
 typedef struct { DWORD magic; BYTE type, version; WORD len; DWORD seq; } pkt_hdr;
-typedef struct { pkt_hdr h; DWORD tick; xstate pad; } pkt_pad;      // INPUT (guest -> host) and HOSTPAD (host -> guest)
-typedef struct { pkt_hdr h; DWORD t_ms; } pkt_ping;
+typedef struct { pkt_hdr h; DWORD t_ms; xstate pad; float yaw; DWORD yaw_valid; DWORD delay_ms; float rtt_ms; } pkt_pad;   // t_ms: host timeline stamp      // INPUT (guest -> host) and HOSTPAD (host -> guest)
+typedef struct { pkt_hdr h; DWORD t_ms; DWORD host_ms; } pkt_ping;   // pong: host_ms = the host's clock when it answered
 typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; } ch_state;
 #define MAX_CH 8
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; ch_state ch[MAX_CH]; } pkt_state;
@@ -55,6 +55,38 @@ static volatile LONG g_net_rx, g_net_tx, g_net_bad, g_net_rtt_ms = -1;
 static volatile LONG g_last_input_seq, g_last_hostpad_seq;
 static volatile DWORD g_last_rx_tick;
 static DWORD g_tx_seq;
+static volatile float g_guest_rtt;      // host: the round trip the guest measured
+static float g_rtt_max;                 // guest: the largest of the last 16 round trips (the delay has to cover it)
+
+// Guest: estimate the host's clock. The sample with the smallest round trip among the last 8 is the best one.
+static void clock_sample(const pkt_ping *pp)
+{
+	static int rtts[16], offs[8], nr, no;
+	DWORD t1 = now_ms();
+	int rtt = (int)(t1 - pp->t_ms);
+	if (rtt < 0 || rtt > 5000)
+		return;
+	g_net_rtt_ms = rtt;
+	rtts[nr++ & 15] = rtt;
+	int mx = 0, cnt = nr < 16 ? nr : 16;
+	for (int i = 0; i < cnt; i++)
+		if (rtts[i] > mx)
+			mx = rtts[i];
+	g_rtt_max = (float)mx;
+	int slot = no++ & 7;
+	offs[slot] = (int)((LONG)(pp->host_ms - t1) + rtt / 2);
+	static int offrtt[8];
+	offrtt[slot] = rtt;
+	int best = -1, ncount = no < 8 ? no : 8;
+	for (int i = 0; i < ncount; i++)
+		if (best < 0 || offrtt[i] < offrtt[best])
+			best = i;
+	g_clock_off = offs[best];
+	if (no >= 3 && !g_clock_valid) {
+		g_clock_valid = 1;
+		logf("net: clock synced (host clock = ours %+ld ms, round trip %d ms)", g_clock_off, rtt);
+	}
+}
 
 // The host's controller as the guest's game user 0 (player 1).
 static xstate g_netpad;
@@ -167,11 +199,15 @@ static void net_handle(const char *buf, int n, sid_t from)
 			if (n != sizeof *in || (LONG)(h->seq - (DWORD)g_last_input_seq) <= 0)
 				break;
 			g_last_input_seq = (LONG)h->seq;
+			if (in->yaw_valid) { g_peer_yaw = in->yaw; g_peer_yaw_valid = 1; }
+			ring_push(&g_ring_p2, in->t_ms, &in->pad);
+			g_guest_rtt = in->rtt_ms;
 			vpad_set(g_remote_pad, 1, in->pad.buttons, in->pad.lx, in->pad.ly, in->pad.rx, in->pad.ry, in->pad.lt, in->pad.rt);
 			break;
 		}
 		case PKT_PING: {
 			pkt_ping pong = *(const pkt_ping *)buf;
+			pong.host_ms = now_ms();
 			if (n == sizeof pong)
 				net_send(PKT_PONG, &pong, sizeof pong - sizeof(pkt_hdr));
 			break;
@@ -198,6 +234,10 @@ static void net_handle(const char *buf, int n, sid_t from)
 			if (n == sizeof *in && (LONG)(h->seq - (DWORD)g_last_hostpad_seq) > 0) {
 				g_last_hostpad_seq = (LONG)h->seq;
 				g_netpad = in->pad;
+				ring_push(&g_ring_p1, in->t_ms, &in->pad);
+				if (in->delay_ms >= 20 && in->delay_ms <= 400)
+					g_delay_ms = (LONG)in->delay_ms;
+				if (in->yaw_valid) { g_peer_yaw = in->yaw; g_peer_yaw_valid = 1; }
 				g_netpad_tick = GetTickCount();
 			}
 		} else if (h->type == PKT_STATE) {
@@ -209,7 +249,7 @@ static void net_handle(const char *buf, int n, sid_t from)
 		} else if (h->type == PKT_REQ) {
 			guest_on_req(buf, n);
 		} else if (h->type == PKT_PONG && n == sizeof(pkt_ping)) {
-			g_net_rtt_ms = (LONG)(GetTickCount() - ((const pkt_ping *)buf)->t_ms);
+			clock_sample((const pkt_ping *)buf);
 		}
 	}
 }
@@ -235,7 +275,21 @@ static void net_tick(void)
 		if (g_peer_ok && now - last_pad >= 8) {   // the host's own pad is the guest's player 1
 			pkt_pad hp;
 			local_pad(0, &hp.pad);
-			hp.tick = ++tick;
+			hp.t_ms = now_ms();
+			ring_push(&g_ring_p1, hp.t_ms, &hp.pad);
+			{   // the delay follows the round trip the guest reports: half of it plus a margin; up quickly, down slowly
+				static DWORD last_adapt;
+				if (now - last_adapt >= 100) {
+					last_adapt = now;
+					int target = g_guest_rtt > 0 ? (int)(g_guest_rtt * 0.5f) + 30 : 60;
+					target = target < 40 ? 40 : target > 250 ? 250 : target;
+					int d = (int)g_delay_ms;
+					d += target > d ? ((target - d) > 10 ? 10 : (target - d)) : -((d - target) > 2 ? 2 : (d - target));
+					g_delay_ms = d;
+				}
+			}
+			hp.delay_ms = (DWORD)g_delay_ms;
+			hp.yaw = g_cam_yaw; hp.yaw_valid = (DWORD)g_cam_yaw_valid;
 			net_send(PKT_HOSTPAD, &hp, sizeof hp - sizeof(pkt_hdr));
 			last_pad = now;
 		}
@@ -267,13 +321,18 @@ static void net_tick(void)
 	if (g_peer_ok && now - last_pad >= 8) {   // this PC's controller is the host's player 2
 		pkt_pad in;
 		local_pad(g_local_pad, &in.pad);
-		in.tick = ++tick;
+		in.t_ms = timeline_now();
+		in.delay_ms = 0;
+		in.rtt_ms = g_rtt_max;
+		ring_push(&g_ring_p2, in.t_ms, &in.pad);
+		in.yaw = g_cam_yaw; in.yaw_valid = (DWORD)g_cam_yaw_valid;
 		net_send(PKT_INPUT, &in, sizeof in - sizeof(pkt_hdr));
 		last_pad = now;
 	}
-	if (g_peer_ok && now - last_ping >= 500) {
+	if (g_peer_ok && now - last_ping >= (g_clock_valid ? 500u : 150u)) {
 		pkt_ping p;
-		p.t_ms = now;
+		p.t_ms = now_ms();
+		p.host_ms = 0;
 		net_send(PKT_PING, &p, sizeof p - sizeof(pkt_hdr));
 		last_ping = now;
 	}
@@ -353,6 +412,7 @@ static void net_start(void)
 	if (!g_role)
 		return;
 	g_remote_pad = env_int("OBSCOOP_REMOTE_PAD", 1) & 3;
+	g_remote_pad_idx = g_remote_pad;
 	g_local_pad = env_int("OBSCOOP_LOCAL_PAD", 0) & 3;
 	if (!_stricmp(net, "steam")) {
 		g_use_steam = 1;

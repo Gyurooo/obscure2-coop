@@ -8,6 +8,7 @@
 //            i is the human player i controls (0 = player 1, 1 = player 2)
 
 float sqrtf(float);   // not <math.h>: its logf clashes with ours
+float atan2f(float y, float x);
 
 #define H_TAG 0x14
 #define H_POS 0x23c
@@ -55,7 +56,9 @@ static unsigned player_human(int player)
 	return ctl ? rd32(ctl + 4 + 0x764 * player) : 0;
 }
 
-static volatile LONG g_snd_states, g_rcv_states, g_applied, g_snaps, g_blends, g_skipped_level;
+static float g_stat_sum, g_stat_max;   // guest: how far the host's characters were from this copy at each snapshot
+static LONG g_stat_n;
+static volatile LONG g_snd_states, g_rcv_states, g_applied, g_snaps, g_blends, g_skipped_level, g_timed_corr;
 static volatile LONG g_req_applied;
 
 // ---- host: snapshots ---------------------------------------------------------------------------
@@ -73,7 +76,7 @@ static void host_send_state(void)
 		return;
 	pkt_state p;
 	memset(&p, 0, sizeof p);
-	p.t_ms = now;
+	p.t_ms = now_ms();
 	p.level = rd32(world_obj() + 4);
 	p.n = (DWORD)n;
 	for (int i = 0; i < n; i++) {
@@ -105,6 +108,87 @@ static void guest_on_state(const char *buf, int n)
 	InterlockedIncrement(&g_rcv_states);
 }
 
+
+// ---- guest: where the characters were, to compare a snapshot with the right moment -----------------------------------
+// A snapshot says where the host's character was at host time T. The guest's character is now further along its path,
+// so comparing the two directly would pull it backwards by speed x delay. Compare against the guest's own position at
+// T instead (history, interpolated) and move the current position by that error.
+#define HH 192
+typedef struct { DWORD t; float pos[3]; } hpos;
+static DWORD g_hist_tag[MAX_CH];
+static hpos g_hist[MAX_CH][HH];
+static int g_hist_head[MAX_CH], g_hist_n[MAX_CH];
+
+static int hist_slot(DWORD tag)
+{
+	for (int i = 0; i < MAX_CH; i++)
+		if (g_hist_tag[i] == tag)
+			return i;
+	for (int i = 0; i < MAX_CH; i++)
+		if (!g_hist_tag[i]) {
+			g_hist_tag[i] = tag;
+			return i;
+		}
+	return -1;
+}
+
+static void guest_record_history(void)
+{
+	if (!g_clock_valid)
+		return;
+	unsigned hs[MAX_CH];
+	int n = world_humans(hs, MAX_CH);
+	DWORD t = timeline_now();
+	for (int k = 0; k < n; k++) {
+		int sl = hist_slot(rd32(hs[k] + H_TAG));
+		if (sl < 0)
+			continue;
+		int last = (g_hist_head[sl] + HH - 1) % HH;
+		if (g_hist_n[sl] && (int)(t - g_hist[sl][last].t) < 6)
+			continue;
+		hpos *e = &g_hist[sl][g_hist_head[sl]];
+		e->t = t;
+		memcpy(e->pos, (const void *)(uintptr_t)(hs[k] + H_POS), 12);
+		g_hist_head[sl] = (g_hist_head[sl] + 1) % HH;
+		if (g_hist_n[sl] < HH)
+			g_hist_n[sl]++;
+	}
+}
+
+// A correction moves the character's path from time t onward: shift the history entries after t the same way, or the next
+// snapshot would see the same error again and correct it again.
+static void hist_shift(DWORD tag, DWORD t, float cx, float cy, float cz)
+{
+	int sl = hist_slot(tag);
+	if (sl < 0)
+		return;
+	for (int k = 0; k < g_hist_n[sl]; k++) {
+		hpos *e = &g_hist[sl][(g_hist_head[sl] + HH - 1 - k) % HH];
+		if ((int)(e->t - t) <= 0)
+			break;
+		e->pos[0] += cx; e->pos[1] += cy; e->pos[2] += cz;
+	}
+}
+
+// The guest's own position of this character at host time t (interpolated); 0 if the history does not cover t.
+static int hist_at(DWORD tag, DWORD t, float *out)
+{
+	int sl = hist_slot(tag);
+	if (sl < 0 || g_hist_n[sl] < 2)
+		return 0;
+	for (int k = 0; k < g_hist_n[sl] - 1; k++) {
+		int i = (g_hist_head[sl] + HH - 1 - k) % HH, j = (i + HH - 1) % HH;   // i newer than j
+		if ((int)(g_hist[sl][j].t - t) <= 0 && (int)(t - g_hist[sl][i].t) <= 0) {
+			float span = (float)(int)(g_hist[sl][i].t - g_hist[sl][j].t);
+			float a = span > 0 ? (float)(int)(t - g_hist[sl][j].t) / span : 1.0f;
+			for (int c = 0; c < 3; c++)
+				out[c] = g_hist[sl][j].pos[c] + (g_hist[sl][i].pos[c] - g_hist[sl][j].pos[c]) * a;
+			return 1;
+		}
+	}
+	return 0;
+}
+
 // Writes the host's position and facing into the guest's copy of a character. The character this PC
 // controls (player 2) keeps its own movement unless it is far off; the host's player 1 is pulled in.
 static void guest_apply_state(void)
@@ -131,25 +215,45 @@ static void guest_apply_state(void)
 			float *pos = (float *)(uintptr_t)(hs[k] + H_POS), *dir = (float *)(uintptr_t)(hs[k] + H_DIR);
 			if (IsBadWritePtr(pos, 12) || IsBadWritePtr(dir, 12))
 				break;
-			float dx = st.ch[i].pos[0] - pos[0], dy = st.ch[i].pos[1] - pos[1];
-			float err = sqrtf(dx * dx + dy * dy);
+			// the error is measured against where this copy's character was at the snapshot's time
+			float ref[3] = { pos[0], pos[1], pos[2] };
+			int timed = g_clock_valid && hist_at(st.ch[i].tag, st.t_ms, ref);
+			if (timed)
+				InterlockedIncrement(&g_timed_corr);
+			float ex = st.ch[i].pos[0] - ref[0], ey = st.ch[i].pos[1] - ref[1], ez = st.ch[i].pos[2] - ref[2];
+			float err = sqrtf(ex * ex + ey * ey);
+			// This PC's own character (player 2) answers its own pad, so it runs ahead of the host's copy while it
+			// moves: leave it alone then, pull it in gently once the stick is idle.
 			int local = hs[k] == mine;
-			// This PC's own character (player 2) answers its own pad at once, so it runs ahead of the host's copy while
-			// it moves: leave it alone then, pull it in gently once the stick is idle.
 			int idle = 1;
 			if (local) {
 				xstate lp;
 				local_pad(g_local_pad, &lp);
 				idle = abs(lp.lx) < 4000 && abs(lp.ly) < 4000;
 			}
-			if (err > (local ? 80.0f : 30.0f)) {   // far off (a door, a cutscene, a respawn): snap
-				memcpy(pos, st.ch[i].pos, 12);
+			{
+				static int dbg = -1, dn;
+				if (dbg < 0) { char v[8]; dbg = GetEnvironmentVariableA("OBSCOOP_DEBUG_SYNC", v, sizeof v) ? 1 : 0; }
+				if (dbg && !local && err > 8.0f && (dn++ % 8) == 0 && dn < 4000)
+					logf("corr tag %08x timed %d err %.1f e=(%.1f,%.1f) own_now=(%.1f,%.1f) ref=(%.1f,%.1f) host=(%.1f,%.1f) dT %d", st.ch[i].tag, timed, err, ex, ey,
+						pos[0], pos[1], ref[0], ref[1], st.ch[i].pos[0], st.ch[i].pos[1], (int)(timeline_now() - st.t_ms));
+			}
+			if (!local) {
+				g_stat_sum += err; g_stat_n++;
+				if (err > g_stat_max) g_stat_max = err;
+			}
+			float big = timed ? 30.0f : (local ? 80.0f : 30.0f);
+			if (err > big) {   // far off (a door, a cutscene, a respawn): move by the whole error
+				pos[0] += ex; pos[1] += ey; pos[2] += ez;
+				if (timed)
+					hist_shift(st.ch[i].tag, st.t_ms, ex, ey, ez);
 				memcpy(dir, st.ch[i].dir, 12);
 				InterlockedIncrement(&g_snaps);
-			} else if (!local ? err > 1.0f : (idle ? err > 1.5f : err > 15.0f)) {   // close: pull a quarter of the way each snapshot
-				float k = (local && !idle) ? 0.1f : 0.25f;
-				for (int a = 0; a < 3; a++)
-					pos[a] += (st.ch[i].pos[a] - pos[a]) * k;
+			} else if (!local ? err > (timed ? 0.6f : 1.0f) : (timed ? err > 0.6f : (idle ? err > 1.5f : err > 15.0f))) {
+				float kk = (!timed && local && !idle) ? 0.1f : 0.25f;
+				pos[0] += ex * kk; pos[1] += ey * kk; pos[2] += ez * kk;
+				if (timed)
+					hist_shift(st.ch[i].tag, st.t_ms, ex * kk, ey * kk, ez * kk);
 				InterlockedIncrement(&g_blends);
 			}
 			InterlockedIncrement(&g_applied);
@@ -538,6 +642,44 @@ static void guest_follow_own_player(void)
 	InterlockedIncrement(&g_cam_sets);
 }
 
+
+// Debug (OBSCOOP_DEBUG_SYNC): how each copy's player 1 actually moves versus the stick that was fed in.
+static void guest_debug_p1(void)
+{
+	static int dbg = -1;
+	static DWORD last;
+	static float prev[3], prevh[3];
+	static DWORD prev_t;
+	if (dbg < 0) { char v[8]; dbg = GetEnvironmentVariableA("OBSCOOP_DEBUG_SYNC", v, sizeof v) ? 1 : 0; }
+	if (!dbg || !g_clock_valid)
+		return;
+	DWORD now = GetTickCount();
+	if (now - last < 150)
+		return;
+	last = now;
+	unsigned hs[MAX_CH];
+	int n = world_humans(hs, MAX_CH);
+	unsigned p1 = player_human(0);
+	for (int k = 0; k < n; k++) {
+		if (hs[k] != p1)
+			continue;
+		const float *pos = (const float *)(uintptr_t)(hs[k] + H_POS);
+		float dx = pos[0] - prev[0], dy = pos[1] - prev[1];
+		float sp = sqrtf(dx * dx + dy * dy);
+		xstate raw = g_netpad, fed;
+		memset(&fed, 0, sizeof fed);
+		ring_get(&g_ring_p1, timeline_now() - (DWORD)g_delay_ms, &fed);
+		xstate rm = fed;
+		remap_if_known(&rm);
+		if (sp > 3.0f)
+			logf("p1dbg own move angle %.0f deg (%.0f u) | stick raw (%d,%d) ring (%d,%d) remapped (%d,%d) | yaw peer %.0f own %.0f | camera valid own %ld peer %ld",
+				atan2f(dy, dx) * 57.2958f, sp, raw.lx, raw.ly, fed.lx, fed.ly, rm.lx, rm.ly, g_peer_yaw * 57.2958f, g_cam_yaw * 57.2958f,
+				g_cam_yaw_valid, g_peer_yaw_valid);
+		memcpy(prev, pos, 12);
+		(void)prevh; (void)prev_t;
+	}
+}
+
 // ---- frame tick (Present hook, main thread) --------------------------------------------------------
 
 static void sync_init(void)
@@ -565,6 +707,22 @@ static void frame_tick(void)
 	net_frame();
 	if (!g_peer_ok)
 		return;
+	{   // every 10 s: a line the testers can send along with the log
+		static DWORD last_stat;
+		DWORD now = GetTickCount();
+		if (now - last_stat >= 10000) {
+			last_stat = now;
+			if (g_role == 2)
+				logf("sync stats: host characters off by mean %.1f max %.1f units over %ld snapshots (%ld snaps, %ld blends); rtt %ld ms, "
+					"clock %s, input delay %s %ld ms, camera yaw own %.0f peer %.0f (valid %ld/%ld)",
+					g_stat_n ? g_stat_sum / g_stat_n : 0.0f, g_stat_max, g_stat_n, g_snaps, g_blends, g_net_rtt_ms, g_clock_valid ? "synced" : "unknown",
+					g_delay_on ? "on" : "off", g_delay_ms, g_cam_yaw * 57.2958f, g_peer_yaw * 57.2958f, g_cam_yaw_valid, g_peer_yaw_valid);
+			else
+				logf("sync stats: sent %ld snapshots, %ld requests; guest rtt %.0f ms; camera yaw own %.0f peer %.0f (valid %ld/%ld)", g_snd_states, g_req_sent,
+					g_guest_rtt, g_cam_yaw * 57.2958f, g_peer_yaw * 57.2958f, g_cam_yaw_valid, g_peer_yaw_valid);
+			g_stat_sum = 0; g_stat_max = 0; g_stat_n = 0;
+		}
+	}
 	if (g_role == 1) {
 		if (g_join_pending) {
 			g_join_pending = 0;
@@ -580,14 +738,16 @@ static void frame_tick(void)
 		guest_apply_state();
 		guest_apply_npcs();
 		guest_follow_own_player();
+		guest_record_history();
+		guest_debug_p1();
 	}
 }
 
 static void sync_status(char *reply, size_t replysz)
 {
-	_snprintf(reply, replysz, "sync role %s sent %ld recv %ld applied %ld snaps %ld blends %ld skipped_level %ld req_sent %ld req_applied %ld",
+	_snprintf(reply, replysz, "sync role %s sent %ld recv %ld applied %ld snaps %ld blends %ld skipped_level %ld timed %ld req_sent %ld req_applied %ld",
 		g_role == 1 ? "host" : g_role == 2 ? "guest" : "off", g_snd_states, g_rcv_states, g_applied, g_snaps, g_blends,
-		g_skipped_level, g_req_sent, g_req_applied);
+		g_skipped_level, g_timed_corr, g_req_sent, g_req_applied);
 	size_t l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | prog sent %ld rcv %ld applied %ld | npc sent %ld rcv %ld applied %ld snaps %ld blends %ld unmatched %ld | cam sets %ld", g_prog_chunks_sent, g_prog_chunks_rcv, g_prog_chunks_applied, g_npc_sent, g_npc_rcv,

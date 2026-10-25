@@ -436,9 +436,121 @@ static int g_role;   // 0 off, 1 host, 2 guest (net.c)
 static xstate g_netpad;                 // guest: the host's controller (net.c)
 static volatile DWORD g_netpad_tick;
 static int g_local_pad;
+static int g_remote_pad_idx = 1;   // host: the game user the guest's controller feeds (net.c keeps g_remote_pad in step)
 static volatile LONG g_peer_ok;
 static void net_status(char *reply, size_t replysz);
 static void sync_status(char *reply, size_t replysz);
+
+
+static volatile float g_cam_yaw;
+static volatile LONG g_cam_yaw_valid;
+static volatile float g_peer_yaw;           // the other copy's camera yaw (net.c)
+static volatile LONG g_peer_yaw_valid;
+float sinf(float);
+float cosf(float);
+
+// Stick directions are relative to the camera: stick up = the camera's forward on the ground, stick right = its right.
+// A copy whose camera differs from the sender's must rotate the stick into its own camera frame or the character
+// walks another way (found in the first test over Steam: independent cameras, players in different camera zones).
+static void remap_stick(xstate *s, float src_yaw, float dst_yaw)
+{
+	float d = src_yaw - dst_yaw, c = cosf(d), sn = sinf(d);
+	float sx = (float)s->lx, sy = (float)s->ly;
+	float nx = sx * c - sy * sn, ny = sx * sn + sy * c;
+	if (nx > 32767.f) nx = 32767.f;
+	if (nx < -32768.f) nx = -32768.f;
+	if (ny > 32767.f) ny = 32767.f;
+	if (ny < -32768.f) ny = -32768.f;
+	s->lx = (SHORT)nx;
+	s->ly = (SHORT)ny;
+}
+
+static void remap_if_known(xstate *s)
+{
+	if (g_peer_yaw_valid && g_cam_yaw_valid)
+		remap_stick(s, g_peer_yaw, g_cam_yaw);
+}
+
+
+// ---- shared time and delayed input -------------------------------------------------------------------------------
+// Both copies run the whole game. To keep them in step the host's timeline is the clock: every pad state is stamped
+// with host time, and both copies feed it to the game D milliseconds later (D a little above the network delay), so
+// the same input reaches the same game moment on both sides (door presses, prompts, collisions). The guest estimates
+// the host's clock from ping/pong. D rises with the measured round trip. In menus and loading nothing is delayed.
+static DWORD now_ms(void)
+{
+	static LARGE_INTEGER f;
+	LARGE_INTEGER c;
+	if (!f.QuadPart)
+		QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&c);
+	return (DWORD)(c.QuadPart * 1000 / f.QuadPart);
+}
+static volatile LONG g_clock_off;       // guest: host time minus guest time (ms)
+static volatile LONG g_clock_valid;
+static volatile LONG g_delay_ms = 60;   // D: both sides use the host's value
+static volatile LONG g_delay_on = 0;    // OBSCOOP_INPUT_DELAY=1 turns delayed input on (experimental: not shown to help yet)
+static DWORD timeline_now(void) { return now_ms() + (g_role == 2 ? (DWORD)g_clock_off : 0); }
+
+typedef struct { DWORD t; xstate pad; } padsample;
+#define PRING 256
+typedef struct { padsample s[PRING]; int head; LONG n; } padring;
+static CRITICAL_SECTION g_ring_cs;
+static padring g_ring_p1, g_ring_p2;    // p1: the host's pad (host: own samples, guest: the stream); p2: the guest's pad (host: stream, guest: own)
+
+static void ring_push(padring *r, DWORD t, const xstate *p)
+{
+	EnterCriticalSection(&g_ring_cs);
+	int i = r->head;
+	r->s[i].t = t;
+	r->s[i].pad = *p;
+	r->head = (i + 1) % PRING;
+	if (r->n < PRING)
+		r->n++;
+	// out of order (jitter): bubble the new sample back to its place
+	int cur = i;
+	for (int k = 0; k < 8 && k < r->n - 1; k++) {
+		int prev = (cur + PRING - 1) % PRING;
+		if ((int)(r->s[prev].t - r->s[cur].t) > 0) {
+			padsample tmp = r->s[prev];
+			r->s[prev] = r->s[cur];
+			r->s[cur] = tmp;
+			cur = prev;
+		} else {
+			break;
+		}
+	}
+	LeaveCriticalSection(&g_ring_cs);
+}
+
+// The newest sample stamped at or before t_apply.
+static int ring_get(padring *r, DWORD t_apply, xstate *out)
+{
+	int found = 0;
+	EnterCriticalSection(&g_ring_cs);
+	for (int k = 0; k < r->n; k++) {
+		int i = (r->head + PRING - 1 - k) % PRING;
+		if ((int)(r->s[i].t - t_apply) <= 0) {
+			*out = r->s[i].pad;
+			found = 1;
+			break;
+		}
+	}
+	LeaveCriticalSection(&g_ring_cs);
+	return found;
+}
+
+static int game_in_level(void)
+{
+	unsigned gobj = IsBadReadPtr((void *)0x6c3068, 4) ? 0 : *(volatile unsigned *)0x6c3068;
+	return gobj && !IsBadReadPtr((void *)(uintptr_t)(gobj + 0x310), 4) && *(volatile unsigned *)(uintptr_t)(gobj + 0x310) == 1;
+}
+
+// Delayed input is used only when linked, in a level, and (guest) the clock is known.
+static int delayed_input_on(void)
+{
+	return g_delay_on && g_peer_ok && game_in_level() && (g_role == 1 || g_clock_valid);
+}
 
 // The pad as a player holds it: the virtual pad if set, else the real device unless hidden.
 static DWORD pad_read(DWORD user, void *state)
@@ -457,14 +569,22 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 	load_xinput();
 	if (g_role == 2 && user < 2) {   // guest: user 0 is the host's controller (player 1), user 1 is this PC's (player 2)
 		InterlockedIncrement(&g_polls[user]);
+		int in_level = game_in_level();
+		if (delayed_input_on()) {
+			DWORD t_apply = timeline_now() - (DWORD)g_delay_ms;
+			memset(state, 0, sizeof(xstate));
+			ring_get(user == 0 ? &g_ring_p1 : &g_ring_p2, t_apply, (xstate *)state);
+			if (user == 0)
+				remap_if_known((xstate *)state);   // the host's stick is in the host's camera frame
+			return ERROR_SUCCESS;
+		}
 		if (user == 0) {
-			unsigned gobj = IsBadReadPtr((void *)0x6c3068, 4) ? 0 : *(volatile unsigned *)0x6c3068;
-			int in_level = gobj && !IsBadReadPtr((void *)(uintptr_t)(gobj + 0x310), 4) && *(volatile unsigned *)(uintptr_t)(gobj + 0x310) == 1;
 			if (g_peer_ok && !in_level) {   // menus and loading screens: this PC's own pad, so the friend can start their game
 				memset(state, 0, sizeof(xstate));
 				pad_read((DWORD)g_local_pad, state);
 			} else if (g_peer_ok && GetTickCount() - g_netpad_tick < 500) {
 				memcpy(state, &g_netpad, sizeof(xstate));
+				remap_if_known((xstate *)state);
 			} else if (g_peer_ok) {
 				memset(state, 0, sizeof(xstate));   // connected, the host's pad is idle or the stream is late
 			} else {
@@ -481,11 +601,22 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		return ERROR_DEVICE_NOT_CONNECTED;
 	if (user < 4)
 		InterlockedIncrement(&g_polls[user]);
+	if (g_role == 1 && delayed_input_on() && (user == 0 || (int)user == g_remote_pad_idx)) {
+		DWORD t_apply = timeline_now() - (DWORD)g_delay_ms;
+		memset(state, 0, sizeof(xstate));
+		ring_get(user == 0 ? &g_ring_p1 : &g_ring_p2, t_apply, (xstate *)state);
+		if (user != 0)
+			remap_if_known((xstate *)state);   // the guest's stick is in the guest's camera frame
+		InterlockedIncrement(&g_virtual_reads[user & 3]);
+		return ERROR_SUCCESS;
+	}
 	if (user < 4 && g_vpad_on[user]) {
 		InterlockedIncrement(&g_virtual_reads[user]);
 		EnterCriticalSection(&g_vpad_cs);
 		memcpy(state, &g_vpad[user], sizeof(xstate));
 		LeaveCriticalSection(&g_vpad_cs);
+		if (g_role == 1 && g_peer_ok && (int)user == g_remote_pad_idx)
+			remap_if_known((xstate *)state);   // the guest's stick is in the guest's camera frame
 		return ERROR_SUCCESS;
 	}
 	DWORD r = (real_XInputGetState && !g_hide_real_pads) ? real_XInputGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
@@ -772,6 +903,13 @@ static void vpad_set(int user, int on, unsigned buttons, int lx, int ly, int rx,
 }
 
 static unsigned player_human(int player);   // sync.c
+static volatile float g_view[16];            // window.c: the last view matrix
+static volatile LONG g_view_sets, g_xf_sets;
+static volatile float g_view_first[16];
+static volatile LONG g_view_first_seen;
+#define NVIEWS 12
+static float g_views[NVIEWS][16];
+static LONG g_views_n[NVIEWS], g_views_count;
 #define H_POS 0x23c
 #define H_DIR 0x248
 
@@ -860,6 +998,21 @@ static void handle_command(char *line, char *reply, size_t replysz)
 			pos[0] = v[0]; pos[1] = v[1]; pos[2] = v[2];
 			if (got >= 6) { dir[0] = v[3]; dir[1] = v[4]; dir[2] = 0; }
 			_snprintf(reply, replysz, "ok");
+		}
+	} else if (!strncmp(line, "views", 5)) {
+		size_t l = 0;
+		reply[0] = 0;
+		for (int k = 0; k < g_views_count && l + 120 < replysz; k++)
+			l += _snprintf(reply + l, replysz - l, "#%d x%ld [%.2f %.2f %.2f | %.2f %.2f %.2f | %.2f %.2f %.2f | %.0f %.0f %.0f] ", k, g_views_n[k], g_views[k][0], g_views[k][1],
+				g_views[k][2], g_views[k][4], g_views[k][5], g_views[k][6], g_views[k][8], g_views[k][9], g_views[k][10], g_views[k][12], g_views[k][13], g_views[k][14]);
+	} else if (!strncmp(line, "view", 4)) {
+		_snprintf(reply, replysz, "view sets %ld transforms %ld [%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f]", g_view_sets, g_xf_sets,
+			g_view[0], g_view[1], g_view[2], g_view[3], g_view[4], g_view[5], g_view[6], g_view[7], g_view[8], g_view[9], g_view[10], g_view[11],
+			g_view[12], g_view[13], g_view[14], g_view[15]);
+		{
+			size_t l = strlen(reply);
+			_snprintf(reply + l, replysz - l, " first [%.3f %.3f %.3f | %.3f %.3f %.3f | %.3f %.3f %.3f | %.1f %.1f %.1f]", g_view_first[0], g_view_first[1], g_view_first[2],
+				g_view_first[4], g_view_first[5], g_view_first[6], g_view_first[8], g_view_first[9], g_view_first[10], g_view_first[12], g_view_first[13], g_view_first[14]);
 		}
 	} else if (!strncmp(line, "ping", 4)) {
 		_snprintf(reply, replysz, "pong %lu", GetCurrentProcessId());
@@ -1082,6 +1235,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	InitializeCriticalSection(&g_log_cs);
 	InitializeCriticalSection(&g_vpad_cs);
 	InitializeCriticalSection(&g_keyq_cs);
+	InitializeCriticalSection(&g_ring_cs);
+	{ char v[8]; if (GetEnvironmentVariableA("OBSCOOP_INPUT_DELAY", v, sizeof v) && v[0] == '1') g_delay_on = 1; }
 	GetModuleFileNameA(NULL, g_dir, MAX_PATH);
 	char *slash = strrchr(g_dir, '\\');
 	if (slash)
@@ -1126,7 +1281,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	// environment variable with the full name wins (the one-PC tests use those).
 	{
 		static const char *keys[] = { "ROLE", "NET", "HOST_STEAMID", "REMOTE_PAD", "LOCAL_PAD", "HIDE_REAL_PADS",
-			"BACKGROUND", "VPADS", "MULTI", "UDP", "PEER", "WINDOWED", "CAMERA", "HOST_NAME", "SCAN_ONLY" };
+			"BACKGROUND", "VPADS", "MULTI", "UDP", "PEER", "WINDOWED", "CAMERA", "HOST_NAME", "SCAN_ONLY", "INPUT_DELAY", "DEBUG_SYNC" };
 		char ini[MAX_PATH], v[64], name[64];
 		_snprintf(ini, MAX_PATH, "%s\\obscoop.ini", g_dir);
 		if (GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES) {

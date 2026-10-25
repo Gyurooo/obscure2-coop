@@ -368,6 +368,59 @@ static SOCKET g_link = INVALID_SOCKET;
 static struct sockaddr_in g_link_peer;
 static int g_link_peer_known, g_use_link;
 
+
+// ---- test only: delay, jitter and loss on the plain-UDP link, to behave like the internet ------------------------
+static int g_lag_ms, g_jit_ms, g_loss_pct;
+static double ms_now(void)
+{
+	static LARGE_INTEGER f;
+	LARGE_INTEGER c;
+	if (!f.QuadPart)
+		QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&c);
+	return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+typedef struct { double due; int len; unsigned char data[1500]; } lag_pkt;
+static lag_pkt g_lagq[2048];
+static int g_lag_head, g_lag_tail;
+
+static void link_send_now(const unsigned char *data, int len)
+{
+	if (g_link_peer_known)
+		sendto(g_link, (const char *)data, len, 0, (struct sockaddr *)&g_link_peer, sizeof g_link_peer);
+}
+
+static void link_send(const unsigned char *data, int len)
+{
+	if (!g_lag_ms && !g_jit_ms && !g_loss_pct) {
+		link_send_now(data, len);
+		return;
+	}
+	if (g_loss_pct && (rand() % 100) < g_loss_pct)
+		return;
+	if (len > 1500 || ((g_lag_tail + 1) & 2047) == g_lag_head)
+		return;
+	lag_pkt *p = &g_lagq[g_lag_tail];
+	p->due = ms_now() + g_lag_ms + (g_jit_ms ? (double)(rand() % (g_jit_ms + 1)) : 0.0);
+	p->len = len;
+	memcpy(p->data, data, len);
+	g_lag_tail = (g_lag_tail + 1) & 2047;
+}
+
+static void lag_pump(void)
+{
+	// jitter can reorder: send everything that is due, scanning the whole queue
+	for (int i = g_lag_head; i != g_lag_tail; i = (i + 1) & 2047) {
+		lag_pkt *p = &g_lagq[i];
+		if (p->len > 0 && p->due <= ms_now()) {
+			link_send_now(p->data, p->len);
+			p->len = 0;
+		}
+	}
+	while (g_lag_head != g_lag_tail && g_lagq[g_lag_head].len == 0)
+		g_lag_head = (g_lag_head + 1) & 2047;
+}
+
 static void to_game(const unsigned char *data, int len)
 {
 	if (g_udp == INVALID_SOCKET || !g_game_addr_known)
@@ -379,8 +432,7 @@ static void to_game(const unsigned char *data, int len)
 static void to_peer(const unsigned char *data, int len)
 {
 	if (g_use_link) {
-		if (g_link_peer_known)
-			sendto(g_link, (const char *)data, len, 0, (struct sockaddr *)&g_link_peer, sizeof g_link_peer);
+		link_send(data, len);
 		return;
 	}
 	u64 to = g_role == 1 ? g_peer_id : g_host_id;
@@ -536,6 +588,12 @@ int main(int argc, char **argv)
 	for (int i = 2; i < argc; i++) {
 		if (!strcmp(argv[i], "--udp-link") && i + 1 < argc)
 			link = argv[++i];
+		else if (!strcmp(argv[i], "--lag") && i + 1 < argc)
+			g_lag_ms = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--jitter") && i + 1 < argc)
+			g_jit_ms = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--loss") && i + 1 < argc)
+			g_loss_pct = atoi(argv[++i]);
 		else if (g_role == 2 && !target[0] && !(argv[i][0] >= '0' && argv[i][0] <= '9' && strlen(argv[i]) < 6))
 			target = argv[i];
 		else if (atoi(argv[i]) > 0 && strlen(argv[i]) < 6)
@@ -563,7 +621,7 @@ int main(int argc, char **argv)
 		if (!strncmp(link, "listen:", 7)) {
 			me.sin_port = htons((u_short)atoi(link + 7));
 			bind(g_link, (struct sockaddr *)&me, sizeof me);
-			logf_("udp link: listening on 127.0.0.1:%d", atoi(link + 7));
+			logf_("udp link: listening on 127.0.0.1:%d (lag %d ms, jitter %d ms, loss %d%%)", atoi(link + 7), g_lag_ms, g_jit_ms, g_loss_pct);
 		} else {
 			bind(g_link, (struct sockaddr *)&me, sizeof me);
 			memset(&g_link_peer, 0, sizeof g_link_peer);
@@ -602,6 +660,8 @@ int main(int argc, char **argv)
 			FD_SET(g_link, &rd);
 		struct timeval tv = { 0, 2000 };
 		int sel = select(0, &rd, NULL, NULL, &tv);
+		if (g_use_link)
+			lag_pump();
 		if (!g_use_link)
 			pump_callbacks();
 		if (sel > 0 && FD_ISSET(g_udp, &rd)) {   // the game DLL -> peer
@@ -664,7 +724,7 @@ int main(int argc, char **argv)
 				if (to)
 					send_to(to, "PING", 4, CH_CONTROL, 0);
 			}
-			if (g_linked && now - g_last_peer_rx > 10000) {
+			if (g_linked && (int)(now - g_last_peer_rx) > 10000) {   // signed: g_last_peer_rx may be newer than `now` (taken at the top of the loop)
 				logf_("peer silent for 10 s; link dropped");
 				g_linked = 0;
 				if (g_role == 1)
