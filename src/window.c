@@ -11,6 +11,7 @@ typedef HRESULT(STDMETHODCALLTYPE *d3d_create_device_t)(IDirect3D9 *, UINT, D3DD
 typedef HRESULT(STDMETHODCALLTYPE *dev_reset_t)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *);
 
 static void frame_tick(void);
+static HWND g_game_wnd;   // the game's window, for the title status line
 typedef HRESULT(STDMETHODCALLTYPE *dev_present_t)(IDirect3DDevice9 *, const RECT *, const RECT *, HWND, const RGNDATA *);
 static dev_present_t real_dev_Present;
 static Direct3DCreate9_t real_Direct3DCreate9;
@@ -83,6 +84,7 @@ static HRESULT STDMETHODCALLTYPE hk_d3d_CreateDevice(IDirect3D9 *d3d, UINT adapt
 			(void *)pp->hDeviceWindow, (unsigned long)flags);
 	if (pp)
 		win_adjust(pp, focus);
+	g_game_wnd = (pp && pp->hDeviceWindow) ? pp->hDeviceWindow : focus;
 	HRESULT hr = real_d3d_CreateDevice(d3d, adapter, type, focus, flags, pp, out);
 	logf("windowed: CreateDevice %ux%u -> 0x%08lx", pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0, (unsigned long)hr);
 	if (SUCCEEDED(hr) && out && *out)

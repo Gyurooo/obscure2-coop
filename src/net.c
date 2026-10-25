@@ -376,9 +376,33 @@ static void net_start(void)
 	CloseHandle(CreateThread(NULL, 0, udp_thread, NULL, 0, NULL));
 }
 
+// One line for the window title: who we are and whether we are linked.
+static void net_status_line(char *out, size_t sz)
+{
+	if (!g_role) {
+		_snprintf(out, sz, "co-op off (no role set)");
+	} else if (g_use_steam && !g_steam_ok) {
+		_snprintf(out, sz, "co-op %s: waiting for Steam", g_role == 1 ? "host" : "guest");
+	} else if (!g_peer_ok) {
+		if (g_role == 1)
+			_snprintf(out, sz, "co-op host: waiting for a guest (%s)", g_use_steam ? "Steam" : "UDP");
+		else
+			_snprintf(out, sz, "co-op guest: looking for the host (%d candidate%s)", g_last_candidates, g_last_candidates == 1 ? "" : "s");
+	} else if (g_net_rtt_ms >= 0) {
+		_snprintf(out, sz, "co-op %s: connected, %ld ms", g_role == 1 ? "host" : "guest", g_net_rtt_ms);
+	} else {
+		_snprintf(out, sz, "co-op %s: connected", g_role == 1 ? "host" : "guest");
+	}
+	out[sz - 1] = 0;
+}
+
 static void net_status(char *reply, size_t replysz)
 {
 	_snprintf(reply, replysz, "net role %s via %s peer_ok %ld rx %ld tx %ld bad %ld last_input_seq %ld rtt_ms %ld",
 		g_role == 1 ? "host" : g_role == 2 ? "guest" : "off", g_use_steam ? "steam" : "udp", g_peer_ok, g_net_rx,
 		g_net_tx, g_net_bad, g_last_input_seq, g_net_rtt_ms);
+	size_t l = strlen(reply);
+	if (g_use_steam && l < replysz)
+		_snprintf(reply + l, replysz - l, " steam_ok %ld session_requests %ld accepted %ld refused %ld tx_fail %ld candidates %d", g_steam_ok,
+			g_steam_session_requests, g_steam_accepted, g_steam_refused, g_steam_tx_fail, g_last_candidates);
 }

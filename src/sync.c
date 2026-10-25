@@ -551,6 +551,17 @@ static void frame_tick(void)
 {
 	if (!g_role)
 		return;
+	{
+		static DWORD last_title;
+		DWORD now = GetTickCount();
+		if (g_game_wnd && now - last_title >= 500) {
+			char line[96], title[160];
+			last_title = now;
+			net_status_line(line, sizeof line);
+			_snprintf(title, sizeof title, "Obscure 2 - %s", line);
+			SetWindowTextA(g_game_wnd, title);
+		}
+	}
 	net_frame();
 	if (!g_peer_ok)
 		return;

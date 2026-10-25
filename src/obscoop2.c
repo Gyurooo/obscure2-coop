@@ -431,6 +431,7 @@ static int g_hide_real_pads;   // OBSCOOP_HIDE_REAL_PADS=1: real controllers are
 static xstate g_vpad[4];
 static CRITICAL_SECTION g_vpad_cs;
 
+static int g_seeded_ipt;   // 1 = copied the shipped gamepad input map into the co-op profile, -1 = failed
 static int g_role;   // 0 off, 1 host, 2 guest (net.c)
 static xstate g_netpad;                 // guest: the host's controller (net.c)
 static volatile DWORD g_netpad_tick;
@@ -1103,9 +1104,23 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	}
 	_snprintf(g_profile, MAX_PATH, "%s\\coop_profile", g_data);
 	_snprintf(g_remote, MAX_PATH, "%s\\remote", g_profile);
+	// Seed the input map: the game starts with keyboard controls, but co-op needs the gamepad map. A file
+	// obscoop_o2.ipt next to the exe is copied to the (redirected) cloud save o2.ipt if there is none yet.
+	{
+		char src[MAX_PATH], dst[MAX_PATH];
+		_snprintf(src, MAX_PATH, "%s\\obscoop_o2.ipt", g_dir);
+		_snprintf(dst, MAX_PATH, "%s\\o2.ipt", g_remote);
+		if (GetFileAttributesA(src) != INVALID_FILE_ATTRIBUTES && GetFileAttributesA(dst) == INVALID_FILE_ATTRIBUTES) {
+			CreateDirectoryA(g_profile, NULL);
+			CreateDirectoryA(g_remote, NULL);
+			g_seeded_ipt = CopyFileA(src, dst, TRUE) ? 1 : -1;
+		}
+	}
 	char logpath[MAX_PATH];
 	_snprintf(logpath, MAX_PATH, "%s\\obscoop.log", g_data);
 	g_log = CreateFileA(logpath, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
+	if (g_seeded_ipt)
+		logf("input map: %s the shipped obscoop_o2.ipt to the co-op profile", g_seeded_ipt > 0 ? "copied" : "could not copy");
 	logf("obscoop 0.2 loaded, pid %lu, game dir %s, data dir %s", GetCurrentProcessId(), g_dir, g_data);
 	// Settings: obscoop.ini next to the exe, section [obscoop], key = name without OBSCOOP_. An
 	// environment variable with the full name wins (the one-PC tests use those).
