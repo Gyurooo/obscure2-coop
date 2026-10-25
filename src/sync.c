@@ -384,6 +384,45 @@ static void guest_apply_regions(void)
 	}
 }
 
+
+// Host: the level can also change without a ChangeLevel request (loading a save, a new game). Announce those too,
+// with the arrival door id of the character that player 1's controller record names.
+static volatile LONG g_watch_sent;
+static void host_watch_level(void)
+{
+	unsigned g = game_obj(), w = world_obj();
+	if (!g || !w || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0)
+		return;
+	unsigned lvl = rd32(w + 4);
+	if (!lvl)
+		return;
+	if (!g_last_level) {   // first level of this game: the guest starts there too
+		g_last_level = lvl;
+		return;
+	}
+	if (lvl == g_last_level)
+		return;
+	unsigned obj = rd32(g + 0x318), entry = g_last_entry;
+	if (obj) {
+		for (int i = 0; i < 8; i++) {
+			unsigned rec = obj + 0x1b0c + i * 0x28;
+			if (rd32(rec + 0xc) == 0x43484331) {   // "CHC1": the character player 1 controls
+				entry = rd32(rec + 8);
+				break;
+			}
+		}
+	}
+	logf("host: level is now %c%c%c%c without a ChangeLevel request (load or new game), telling the guest (entry %u)",
+		(char)(lvl >> 24), (char)(lvl >> 16), (char)(lvl >> 8), (char)lvl, entry);
+	g_last_level = lvl;
+	g_last_entry = entry;
+	if (g_peer_ok) {
+		net_send_req(REQ_LEVEL, lvl, entry, 1, NULL);
+		InterlockedIncrement(&g_req_sent);
+		InterlockedIncrement(&g_watch_sent);
+	}
+}
+
 // Host: a guest just connected. Make it load and go to the level the party is in, then send all of the state.
 static void host_welcome_guest(void)
 {
@@ -520,6 +559,7 @@ static void frame_tick(void)
 			g_join_pending = 0;
 			host_welcome_guest();
 		}
+		host_watch_level();
 		host_send_state();
 		host_send_npcs();
 		host_send_progress(0);
