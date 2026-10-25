@@ -24,6 +24,7 @@ typedef int(__fastcall *friend_count_t)(void *self, void *edx, int flags);
 typedef int(__fastcall *friend_rel_t)(void *self, void *edx, sid_t id);
 typedef unsigned char(__fastcall *friend_game_t)(void *self, void *edx, sid_t id, void *info);
 typedef const char *(__fastcall *persona_name_t)(void *self, void *edx);
+typedef const char *(__fastcall *friend_name_t)(void *self, void *edx, sid_t id);
 typedef unsigned char(__fastcall *p2p_send_t)(void *self, void *edx, sid_t id, const void *data, DWORD len, int type, int ch);
 typedef unsigned char(__fastcall *p2p_avail_t)(void *self, void *edx, DWORD *size, int ch);
 typedef unsigned char(__fastcall *p2p_read_t)(void *self, void *edx, void *dst, DWORD cap, DWORD *size, sid_t *from, int ch);
@@ -36,6 +37,7 @@ typedef struct { sid_t game_id; DWORD ip; WORD port, query_port; sid_t lobby; } 
 
 static void *g_suser, *g_sfriends, *g_snet;
 static sid_t g_self_sid;
+static char g_host_name[64];          // guest: the host's Steam name from OBSCOOP_HOST_NAME (optional)
 static sid_t g_host_sid_cfg;          // guest: host Steam id from OBSCOOP_HOST_STEAMID (optional)
 static volatile LONG g_steam_ok, g_steam_session_requests, g_steam_accepted, g_steam_refused;
 static volatile LONG g_steam_tx_fail;
@@ -109,28 +111,61 @@ static int steam_start(void)
 	return id_ok;
 }
 
-// Guest: candidate hosts = the configured id, else friends playing Obscure II (app 254480) right now.
+// Guest: candidate hosts = the configured id; else friends whose Steam name is OBSCOOP_HOST_NAME; else friends
+// playing Obscure II (app 254480) right now. Steam does not always show a friend as playing (a game started from
+// a copy, "appear offline", a hidden game), so the id or the name is the sure way.
 static int steam_find_hosts(sid_t *out, int max)
 {
 	if (g_host_sid_cfg) {
 		out[0] = g_host_sid_cfg;
 		return 1;
 	}
-	int n = 0, in_game = 0, count = ((friend_count_t)vt_of(g_sfriends)[3])(g_sfriends, NULL, 4);
+	if (!g_host_name[0] && getenv("OBSCOOP_TEST_NAME_FRIEND0")) {   // test only: use friend 0's name, never logged
+		sid_t f0 = 0;
+		((friend_by_index_t)vt_of(g_sfriends)[4])(g_sfriends, NULL, &f0, 0, 4);
+		const char *nm = f0 ? ((friend_name_t)vt_of(g_sfriends)[7])(g_sfriends, NULL, f0) : NULL;
+		if (nm)
+			_snprintf(g_host_name, sizeof g_host_name, "%s", nm);
+	}
+	int n = 0, in_game = 0, by_name = 0, count = ((friend_count_t)vt_of(g_sfriends)[3])(g_sfriends, NULL, 4);
 	for (int i = 0; i < count && n < max; i++) {
 		sid_t id = 0;
 		((friend_by_index_t)vt_of(g_sfriends)[4])(g_sfriends, NULL, &id, i, 4);
+		if (!id)
+			continue;
+		if (g_host_name[0]) {
+			const char *nm = ((friend_name_t)vt_of(g_sfriends)[7])(g_sfriends, NULL, id);
+			if (nm && !_stricmp(nm, g_host_name)) {
+				out[n++] = id;
+				by_name++;
+				continue;
+			}
+		}
 		friend_game_info gi;
 		memset(&gi, 0, sizeof gi);
-		if (!id || !((friend_game_t)vt_of(g_sfriends)[8])(g_sfriends, NULL, id, &gi))
+		if (!((friend_game_t)vt_of(g_sfriends)[8])(g_sfriends, NULL, id, &gi))
 			continue;
 		in_game++;
-		if ((gi.game_id & 0xffffff) == 254480)
+		if (!g_host_name[0] && (gi.game_id & 0xffffff) == 254480)
 			out[n++] = id;
 	}
 	static int logged;
 	if (!logged++)
-		logf("steam: friends scan: %d of %d friends in a game, %d in Obscure II", in_game, count, n);
+		logf("steam: friends scan: %d of %d friends in a game, %d matched by name, %d candidates%s", in_game, count, by_name, n,
+			g_host_name[0] ? " (looking for the host by Steam name)" : " (looking for friends playing Obscure II)");
+	return n;
+}
+
+// Host: every Steam friend may start a session (the friend check in the session-request callback still applies).
+static int steam_all_friends(sid_t *out, int max)
+{
+	int n = 0, count = ((friend_count_t)vt_of(g_sfriends)[3])(g_sfriends, NULL, 4);
+	for (int i = 0; i < count && n < max; i++) {
+		sid_t id = 0;
+		((friend_by_index_t)vt_of(g_sfriends)[4])(g_sfriends, NULL, &id, i, 4);
+		if (id)
+			out[n++] = id;
+	}
 	return n;
 }
 

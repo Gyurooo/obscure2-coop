@@ -1126,7 +1126,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	// environment variable with the full name wins (the one-PC tests use those).
 	{
 		static const char *keys[] = { "ROLE", "NET", "HOST_STEAMID", "REMOTE_PAD", "LOCAL_PAD", "HIDE_REAL_PADS",
-			"BACKGROUND", "VPADS", "MULTI", "UDP", "PEER", "WINDOWED", "CAMERA" };
+			"BACKGROUND", "VPADS", "MULTI", "UDP", "PEER", "WINDOWED", "CAMERA", "HOST_NAME", "SCAN_ONLY" };
 		char ini[MAX_PATH], v[64], name[64];
 		_snprintf(ini, MAX_PATH, "%s\\obscoop.ini", g_dir);
 		if (GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES) {

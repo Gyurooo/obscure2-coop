@@ -224,11 +224,10 @@ static void net_tick(void)
 		static DWORD last_accept;
 		if (g_use_steam && !g_peer_ok && now - last_accept >= 2000) {
 			last_accept = now;
-			sid_t ids[16];
-			sid_t saved = g_host_sid_cfg;
-			g_host_sid_cfg = 0;
-			int k = steam_find_hosts(ids, 16);
-			g_host_sid_cfg = saved;
+			// Steam may not show the friend as playing Obscure II, so accept from every friend (the guest's hello
+			// is what starts the link; a session from a stranger is still refused in the callback).
+			sid_t ids[256];
+			int k = steam_all_friends(ids, 256);
 			g_last_candidates = k;
 			for (int i = 0; i < k; i++)
 				steam_accept(ids[i]);
@@ -248,7 +247,10 @@ static void net_tick(void)
 			sid_t hosts[16];
 			int n = steam_find_hosts(hosts, 16);
 			g_last_candidates = n;
-			for (int i = 0; i < n; i++)
+			static int scan_only = -1;
+			if (scan_only < 0)
+				scan_only = getenv("OBSCOOP_SCAN_ONLY") != NULL;   // test: count candidates, contact nobody
+			for (int i = 0; i < n && !scan_only; i++)
 				net_send_to(hosts[i], PKT_HELLO, &hello, 0);
 			static int logged;
 			if (!logged++)
@@ -313,6 +315,19 @@ static void net_frame(void)
 		if (!steam_start())
 			return;
 		g_steam_ok = 1;
+		if (g_role == 1) {   // the host tells the friend this number (or the friend uses the host's Steam name)
+			char path[MAX_PATH];
+			_snprintf(path, MAX_PATH, "%s\\steam_id.txt", g_data);
+			HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+			if (f != INVALID_HANDLE_VALUE) {
+				char line[96];
+				int l = _snprintf(line, sizeof line, "%llu\r\n", (unsigned long long)g_self_sid);
+				DWORD w;
+				WriteFile(f, line, (DWORD)l, &w, NULL);
+				CloseHandle(f);
+			}
+			logf("steam: host Steam ID %llu (written to steam_id.txt; the guest puts it after HOST_STEAMID= in obscoop.ini)", (unsigned long long)g_self_sid);
+		}
 		if (g_host_self_test)
 			g_host_sid_cfg = g_self_sid;
 	}
@@ -333,6 +348,7 @@ static void net_start(void)
 	GetEnvironmentVariableA("OBSCOOP_NET", net, sizeof net);
 	GetEnvironmentVariableA("OBSCOOP_PEER", peer, sizeof peer);
 	GetEnvironmentVariableA("OBSCOOP_HOST_STEAMID", hostid, sizeof hostid);
+	GetEnvironmentVariableA("OBSCOOP_HOST_NAME", g_host_name, sizeof g_host_name);
 	g_role = !_stricmp(role, "host") ? 1 : !_stricmp(role, "guest") ? 2 : 0;
 	if (!g_role)
 		return;
@@ -385,9 +401,15 @@ static void net_status_line(char *out, size_t sz)
 		_snprintf(out, sz, "co-op %s: waiting for Steam", g_role == 1 ? "host" : "guest");
 	} else if (!g_peer_ok) {
 		if (g_role == 1)
-			_snprintf(out, sz, "co-op host: waiting for a guest (%s)", g_use_steam ? "Steam" : "UDP");
+			{
+			if (g_use_steam && g_self_sid)
+				_snprintf(out, sz, "co-op host: waiting for a guest. Your Steam ID: %llu", (unsigned long long)g_self_sid);
+			else
+				_snprintf(out, sz, "co-op host: waiting for a guest (%s)", g_use_steam ? "Steam" : "UDP");
+		}
 		else
-			_snprintf(out, sz, "co-op guest: looking for the host (%d candidate%s)", g_last_candidates, g_last_candidates == 1 ? "" : "s");
+			_snprintf(out, sz, "co-op guest: looking for the host (%d candidate%s%s)", g_last_candidates, g_last_candidates == 1 ? "" : "s",
+				g_host_sid_cfg ? ", by Steam ID" : g_host_name[0] ? ", by Steam name" : "");
 	} else if (g_net_rtt_ms >= 0) {
 		_snprintf(out, sz, "co-op %s: connected, %ld ms", g_role == 1 ? "host" : "guest", g_net_rtt_ms);
 	} else {
