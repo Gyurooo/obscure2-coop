@@ -849,6 +849,38 @@ static int patch_import(HMODULE mod, const char *dll, const char *func, void *ho
 	return 0;
 }
 
+// The game keeps its video and option settings in HKCU\\Software\\MRS\\Obscure2 (VideoAdapter,
+// VideoResolution, VideoDepth, Subtitle, Bloom, Gamma). A test copy must not read or write the
+// player's own values, so that key name is swapped for a private one.
+static LSTATUS(WINAPI *real_RegOpenKeyExA)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY);
+static LSTATUS(WINAPI *real_RegCreateKeyA)(HKEY, LPCSTR, PHKEY);
+
+static const char *reg_map(const char *sub, char *buf, size_t n)
+{
+	static const char real[] = "Software\\MRS\\Obscure2";
+	if (sub && !_stricmp(sub, real)) {
+		_snprintf(buf, n, "%s_coop_test", real);
+		buf[n - 1] = 0;
+		logf("registry %s -> %s", sub, buf);
+		return buf;
+	}
+	return sub;
+}
+
+static LSTATUS WINAPI hk_RegOpenKeyExA(HKEY k, LPCSTR sub, DWORD opt, REGSAM sam, PHKEY out)
+{
+	char b[128];
+	return real_RegOpenKeyExA(k, reg_map(sub, b, sizeof b), opt, sam, out);
+}
+
+static LSTATUS WINAPI hk_RegCreateKeyA(HKEY k, LPCSTR sub, PHKEY out)
+{
+	char b[128];
+	return real_RegCreateKeyA(k, reg_map(sub, b, sizeof b), out);
+}
+
+#include "window.c"
+
 // The game refuses to start while the mutex "obscure2_lock" exists. With OBSCOOP_MULTI=1 this copy
 // gets a private name, so two copies can run on one PC (bot tests).
 static int g_multi;
@@ -873,6 +905,9 @@ static struct hook { const char *dll, *func; void *hook; void **orig; } g_hooks[
 	{ "KERNEL32.dll", "FindFirstFileA", (void *)hk_FindFirstFileA, (void **)&real_FindFirstFileA },
 	{ "KERNEL32.dll", "FindFirstFileExA", (void *)hk_FindFirstFileExA, (void **)&real_FindFirstFileExA },
 	{ "SHELL32.dll", "SHGetFolderPathA", (void *)hk_SHGetFolderPathA, (void **)&real_SHGetFolderPathA },
+	{ "ADVAPI32.dll", "RegOpenKeyExA", (void *)hk_RegOpenKeyExA, (void **)&real_RegOpenKeyExA },
+	{ "ADVAPI32.dll", "RegCreateKeyA", (void *)hk_RegCreateKeyA, (void **)&real_RegCreateKeyA },
+	{ "d3d9.dll", "Direct3DCreate9", (void *)hk_Direct3DCreate9, (void **)&real_Direct3DCreate9 },
 	{ "KERNEL32.dll", "CreateMutexA", (void *)hk_CreateMutexA, (void **)&real_CreateMutexA },
 	{ "USER32.dll", "RegisterClassA", (void *)hk_RegisterClassA, (void **)&real_RegisterClassA },
 	{ "DINPUT8.dll", "DirectInput8Create", (void *)hk_DirectInput8Create, (void **)&real_DirectInput8Create },
@@ -984,7 +1019,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	// environment variable with the full name wins (the one-PC tests use those).
 	{
 		static const char *keys[] = { "ROLE", "NET", "HOST_STEAMID", "REMOTE_PAD", "LOCAL_PAD", "HIDE_REAL_PADS",
-			"BACKGROUND", "VPADS", "MULTI", "UDP", "PEER", "SSAA", "ANISO", "TEXT_SCALE", "SMOOTH_MS", "WIDESCREEN" };
+			"BACKGROUND", "VPADS", "MULTI", "WINDOWED" };
 		char ini[MAX_PATH], v[64], name[64];
 		_snprintf(ini, MAX_PATH, "%s\\obscoop.ini", g_dir);
 		if (GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES) {
