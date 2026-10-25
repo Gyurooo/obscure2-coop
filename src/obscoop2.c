@@ -435,6 +435,7 @@ static int g_role;   // 0 off, 1 host, 2 guest (net.c)
 static xstate g_netpad;                 // guest: the host's controller (net.c)
 static volatile DWORD g_netpad_tick;
 static int g_local_pad;
+static volatile LONG g_peer_ok;
 static void net_status(char *reply, size_t replysz);
 static void sync_status(char *reply, size_t replysz);
 
@@ -456,10 +457,19 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 	if (g_role == 2 && user < 2) {   // guest: user 0 is the host's controller (player 1), user 1 is this PC's (player 2)
 		InterlockedIncrement(&g_polls[user]);
 		if (user == 0) {
-			if (GetTickCount() - g_netpad_tick < 500)
-				memcpy(state, &g_netpad, sizeof(xstate));
-			else
+			unsigned gobj = IsBadReadPtr((void *)0x6c3068, 4) ? 0 : *(volatile unsigned *)0x6c3068;
+			int in_level = gobj && !IsBadReadPtr((void *)(uintptr_t)(gobj + 0x310), 4) && *(volatile unsigned *)(uintptr_t)(gobj + 0x310) == 1;
+			if (g_peer_ok && !in_level) {   // menus and loading screens: this PC's own pad, so the friend can start their game
 				memset(state, 0, sizeof(xstate));
+				pad_read((DWORD)g_local_pad, state);
+			} else if (g_peer_ok && GetTickCount() - g_netpad_tick < 500) {
+				memcpy(state, &g_netpad, sizeof(xstate));
+			} else if (g_peer_ok) {
+				memset(state, 0, sizeof(xstate));   // connected, the host's pad is idle or the stream is late
+			} else {
+				memset(state, 0, sizeof(xstate));   // not connected yet: this PC's own pad drives the menus
+				pad_read((DWORD)g_local_pad, state);
+			}
 			return ERROR_SUCCESS;
 		}
 		memset(state, 0, sizeof(xstate));

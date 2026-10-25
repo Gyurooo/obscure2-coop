@@ -40,6 +40,7 @@ static const char *tag4(unsigned v, char *out)
 
 static volatile LONG g_req_seq;   // number of requests seen, for tests
 static volatile LONG g_req_sent;  // requests forwarded to the guest (host)
+static unsigned g_last_level, g_last_entry, g_last_flag;   // host: the level the party is in, for a joining guest
 static int g_apply_host_req;      // guest: the request being made comes from the host, let it through
 
 typedef void(__fastcall *req3_t)(void *, void *, unsigned, unsigned, unsigned);
@@ -60,6 +61,7 @@ static void __fastcall hk_change_level(void *game, void *edx, unsigned level, un
 	logf("request ChangeLevel level %s (0x%08x) entry %u flag %u [mode %u state %u]", tag4(level, t), level, entry, flag,
 		*(unsigned *)((BYTE *)game + 0x310), *(unsigned *)((BYTE *)game + 0x320));
 	g_change_level(game, edx, level, entry, flag);
+	g_last_level = level; g_last_entry = entry; g_last_flag = flag;
 	if (g_role == 1 && !g_apply_host_req && g_peer_ok) {
 		net_send_req(REQ_LEVEL, level, entry, flag, NULL);
 		InterlockedIncrement(&g_req_sent);

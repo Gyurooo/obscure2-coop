@@ -16,7 +16,7 @@
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
 #define NET_VERSION 1
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
-	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10 };
+	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
 
 #pragma pack(push, 1)
@@ -28,6 +28,9 @@ typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; } ch_s
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; ch_state ch[MAX_CH]; } pkt_state;
 typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; } pkt_req;
 typedef struct { DWORD cls, tag; float pos[3]; float dir[3]; } npc_state;   // cls = the object's vtable address (its class)
+// A copy of part of the progress object (game+0x318): story / world state the guest must share.
+#define REGION_MAX 960
+typedef struct { pkt_hdr h; DWORD level; DWORD off; DWORD len; BYTE data[REGION_MAX]; } pkt_region;
 #define MAX_NPC 24
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; npc_state npc[MAX_NPC]; } pkt_npc;
 #pragma pack(pop)
@@ -35,6 +38,8 @@ typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; npc_state npc[MAX_
 static void guest_on_state(const char *buf, int n);
 static void guest_on_req(const char *buf, int n);
 static void guest_on_npc(const char *buf, int n);
+static void guest_on_region(const char *buf, int n);
+static volatile LONG g_join_pending;   // host: a guest just connected, send it the current state from the main thread
 
 #include "steam.c"
 
@@ -144,6 +149,7 @@ static void net_handle(const char *buf, int n, sid_t from)
 			g_peer = from;
 			g_peer_ok = 1;
 			g_last_input_seq = 0;
+			g_join_pending = 1;
 			logf("net: guest joined (%s)", g_use_steam ? "steam" : "udp");
 		} else if (from != g_peer) {
 			return;
@@ -196,6 +202,8 @@ static void net_handle(const char *buf, int n, sid_t from)
 			}
 		} else if (h->type == PKT_STATE) {
 			guest_on_state(buf, n);
+		} else if (h->type == PKT_REGION) {
+			guest_on_region(buf, n);
 		} else if (h->type == PKT_NPC) {
 			guest_on_npc(buf, n);
 		} else if (h->type == PKT_REQ) {

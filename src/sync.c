@@ -283,6 +283,119 @@ static void guest_apply_npcs(void)
 	}
 }
 
+
+// ---- progress object (story and world state) -----------------------------------------------------
+// The live progress object is *(game + 0x318) (game + 0x31c is a copy kept for saving). Observed layout:
+//   +0x810 pointer (never copied)   +0x814 count, +0x818.. entries of 12 bytes {entity id, state, extra}: the
+//   persistent state of doors and other entities (the story flags)   +0x1b0c.. table of 8 characters   +0x1c4c level
+//   +0x1c50.. counters   +0x1c68 chapter   +0x1cb8.. more state   up to +0x1cd4.
+// The host sends the parts that changed; the guest writes them in once its world is the same level.
+#define PROG_ENT_OFF 0x814
+#define PROG_CHR_OFF 0x1b0c
+#define PROG_END 0x1cd4
+
+static BYTE g_prog_sent[PROG_END];
+static volatile LONG g_prog_sent_valid, g_prog_chunks_sent, g_prog_chunks_rcv, g_prog_chunks_applied;
+
+static void host_send_region(unsigned obj, unsigned off, unsigned len, unsigned level)
+{
+	pkt_region r;
+	memset(&r, 0, sizeof r);
+	r.level = level; r.off = off; r.len = len;
+	memcpy(r.data, (const void *)(uintptr_t)(obj + off), len);
+	net_send(PKT_REGION, &r, (WORD)(12 + len));
+	InterlockedIncrement(&g_prog_chunks_sent);
+}
+
+static void host_send_progress(int force)
+{
+	static DWORD last;
+	DWORD now = GetTickCount();
+	if (!force && now - last < 250)
+		return;
+	last = now;
+	unsigned g = game_obj();
+	unsigned obj = g ? rd32(g + 0x318) : 0;
+	unsigned w = world_obj();
+	if (!obj || !w || !mem_ok((const void *)(uintptr_t)obj, PROG_END))
+		return;
+	unsigned level = rd32(w + 4);
+	unsigned count = rd32(obj + PROG_ENT_OFF);
+	if (count > 380)
+		count = 380;
+	unsigned ent_end = 0x818 + 12 * count;
+	if (force)
+		g_prog_sent_valid = 0;
+	for (unsigned off = PROG_ENT_OFF; off < ent_end; off += REGION_MAX) {
+		unsigned len = ent_end - off < REGION_MAX ? ent_end - off : REGION_MAX;
+		if (!g_prog_sent_valid || memcmp(g_prog_sent + off, (const void *)(uintptr_t)(obj + off), len)) {
+			host_send_region(obj, off, len, level);
+			memcpy(g_prog_sent + off, (const void *)(uintptr_t)(obj + off), len);
+		}
+	}
+	if (!g_prog_sent_valid || memcmp(g_prog_sent + PROG_CHR_OFF, (const void *)(uintptr_t)(obj + PROG_CHR_OFF), PROG_END - PROG_CHR_OFF)) {
+		host_send_region(obj, PROG_CHR_OFF, PROG_END - PROG_CHR_OFF, level);
+		memcpy(g_prog_sent + PROG_CHR_OFF, (const void *)(uintptr_t)(obj + PROG_CHR_OFF), PROG_END - PROG_CHR_OFF);
+	}
+	g_prog_sent_valid = 1;
+}
+
+static CRITICAL_SECTION g_reg_cs;
+static pkt_region g_reg_q[16];
+static int g_reg_head, g_reg_tail;
+
+static void guest_on_region(const char *buf, int n)
+{
+	const pkt_region *r = (const pkt_region *)buf;
+	if (n < (int)(sizeof(pkt_hdr) + 12) || r->len > REGION_MAX || (int)(sizeof(pkt_hdr) + 12 + r->len) != n)
+		return;
+	EnterCriticalSection(&g_reg_cs);
+	if (((g_reg_tail + 1) & 15) != g_reg_head) {
+		memcpy(&g_reg_q[g_reg_tail], buf, n);
+		g_reg_tail = (g_reg_tail + 1) & 15;
+	}
+	LeaveCriticalSection(&g_reg_cs);
+	InterlockedIncrement(&g_prog_chunks_rcv);
+}
+
+// Writes queued regions into the guest's progress object once the world is the same level as the host's.
+static void guest_apply_regions(void)
+{
+	for (;;) {
+		pkt_region r;
+		EnterCriticalSection(&g_reg_cs);
+		if (g_reg_head == g_reg_tail) {
+			LeaveCriticalSection(&g_reg_cs);
+			return;
+		}
+		r = g_reg_q[g_reg_head];
+		LeaveCriticalSection(&g_reg_cs);
+		unsigned g = game_obj(), w = world_obj();
+		if (!g || !w || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0 || rd32(w + 4) != r.level)
+			return;   // keep it queued: the guest is still loading, or in another level
+		EnterCriticalSection(&g_reg_cs);
+		g_reg_head = (g_reg_head + 1) & 15;
+		LeaveCriticalSection(&g_reg_cs);
+		unsigned obj = rd32(g + 0x318);
+		if (!obj || r.off < PROG_ENT_OFF || r.off + r.len > PROG_END || IsBadWritePtr((void *)(uintptr_t)(obj + r.off), r.len))
+			continue;
+		memcpy((void *)(uintptr_t)(obj + r.off), r.data, r.len);
+		InterlockedIncrement(&g_prog_chunks_applied);
+	}
+}
+
+// Host: a guest just connected. Make it load and go to the level the party is in, then send all of the state.
+static void host_welcome_guest(void)
+{
+	logf("join: sending the current state to the guest (level %c%c%c%c)", (char)(g_last_level >> 24), (char)(g_last_level >> 16),
+		(char)(g_last_level >> 8), (char)g_last_level);
+	// The friend starts their own "New game, Two players" first (that choice decides who controls player 2); the
+	// level request waits on the guest until its world exists.
+	if (g_last_level)
+		net_send_req(REQ_LEVEL, g_last_level, g_last_entry, g_last_flag, NULL);
+	host_send_progress(1);
+}
+
 // ---- guest: requests from the host -------------------------------------------------------------
 
 static CRITICAL_SECTION g_req_cs;
@@ -312,6 +425,13 @@ static void guest_apply_requests(void)
 			return;
 		}
 		r = g_req_q[g_req_head];
+		if (r.kind == REQ_LEVEL) {   // a joining guest may still be loading: keep the request until its world exists
+			unsigned g0 = game_obj();
+			if (!g0 || rd32(g0 + 0x310) != 1 || rd32(g0 + 0x320) != 0 || !world_obj()) {
+				LeaveCriticalSection(&g_req_cs);
+				return;
+			}
+		}
 		g_req_head = (g_req_head + 1) & 7;
 		LeaveCriticalSection(&g_req_cs);
 		unsigned g = game_obj();
@@ -383,6 +503,7 @@ static void guest_follow_own_player(void)
 
 static void sync_init(void)
 {
+	InitializeCriticalSection(&g_reg_cs);
 	InitializeCriticalSection(&g_rx_cs);
 	InitializeCriticalSection(&g_req_cs);
 }
@@ -395,10 +516,16 @@ static void frame_tick(void)
 	if (!g_peer_ok)
 		return;
 	if (g_role == 1) {
+		if (g_join_pending) {
+			g_join_pending = 0;
+			host_welcome_guest();
+		}
 		host_send_state();
 		host_send_npcs();
+		host_send_progress(0);
 	} else {
 		guest_apply_requests();
+		guest_apply_regions();
 		guest_apply_state();
 		guest_apply_npcs();
 		guest_follow_own_player();
@@ -412,6 +539,6 @@ static void sync_status(char *reply, size_t replysz)
 		g_skipped_level, g_req_sent, g_req_applied);
 	size_t l = strlen(reply);
 	if (l < replysz)
-		_snprintf(reply + l, replysz - l, " | npc sent %ld rcv %ld applied %ld snaps %ld blends %ld unmatched %ld | cam sets %ld", g_npc_sent, g_npc_rcv,
+		_snprintf(reply + l, replysz - l, " | prog sent %ld rcv %ld applied %ld | npc sent %ld rcv %ld applied %ld snaps %ld blends %ld unmatched %ld | cam sets %ld", g_prog_chunks_sent, g_prog_chunks_rcv, g_prog_chunks_applied, g_npc_sent, g_npc_rcv,
 			g_npc_applied, g_npc_snaps, g_npc_blends, g_npc_unmatched, g_cam_sets);
 }
