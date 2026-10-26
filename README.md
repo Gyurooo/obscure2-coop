@@ -9,7 +9,8 @@ shared-screen off-screen catch-up (0.7). Free look is local (0.8): each copy dro
 other PC, so each player turns only their own camera. The host's state snapshot repeats the host's pad and camera
 angle (protocol 4), so a lost pad packet no longer leaves player 1 sliding on the guest. START on either controller
 pauses and resumes both copies (the guest's START becomes a player-1 pause pulse, not the game's leave dialog), and the
-"Player 2 is joining the game" dialog is auto-accepted after a level load. Enemies, items, saves and the
+"Player 2 is joining the game" dialog is auto-accepted after a level load. Test-only level guard (0.9): the pipe
+`level` command only replays a transition listed in `obscoop_levels.txt`, so a guessed tag cannot crash a test copy. Enemies, items, saves and the
 Steam transport (ported, untested) are not done. Not playable online yet.
 
 - `src/obscoop2.c`: proxy `xinput1_3.dll`. Keeps a test copy away from the real install and saves, offers

@@ -967,6 +967,29 @@ static LONG g_views_n[NVIEWS], g_views_count;
 #define H_POS 0x23c
 #define H_DIR 0x248
 
+// Test-only guard for the pipe "level" command: only a transition the game itself produced
+// (tag, entry, flag), listed in obscoop_levels.txt next to the DLL, may be replayed. A guessed
+// tag tears the world down and crashes the game.
+static int level_allowed(unsigned t, int entry, int flag)
+{
+	FILE *f = fopen("obscoop_levels.txt", "r");
+	if (!f)
+		return 0;
+	char line[128];
+	int ok = 0;
+	while (fgets(line, sizeof line, f)) {
+		char tag[8];
+		int e, fl;
+		if (line[0] == '#' || sscanf(line, "%7s %d %d", tag, &e, &fl) != 3 || strlen(tag) != 4)
+			continue;
+		unsigned v = ((unsigned)(unsigned char)tag[0] << 24) | ((unsigned)(unsigned char)tag[1] << 16) |
+		             ((unsigned)(unsigned char)tag[2] << 8) | (unsigned)(unsigned char)tag[3];
+		if (v == t && e == entry && fl == flag) { ok = 1; break; }
+	}
+	fclose(f);
+	return ok;
+}
+
 static void handle_command(char *line, char *reply, size_t replysz)
 {
 	int user, lx = 0, ly = 0, rx = 0, ry = 0, lt = 0, rt = 0;
@@ -1006,8 +1029,12 @@ static void handle_command(char *line, char *reply, size_t replysz)
 			_snprintf(reply, replysz, "error level <4 char tag> [entry] [flag] (game running?)");
 		} else {
 			unsigned t = ((unsigned)tag[0] << 24) | ((unsigned)tag[1] << 16) | ((unsigned)tag[2] << 8) | (unsigned)tag[3];
-			((void(__fastcall *)(void *, void *, unsigned, unsigned, unsigned))0x4a1c00)((void *)(uintptr_t)g, NULL, t, (unsigned)entry, (unsigned)flag);
-			_snprintf(reply, replysz, "ok");
+			if (!level_allowed(t, entry, flag)) {
+				_snprintf(reply, replysz, "error level %s %d %d not in obscoop_levels.txt (only real transitions)", tag, entry, flag);
+			} else {
+				((void(__fastcall *)(void *, void *, unsigned, unsigned, unsigned))0x4a1c00)((void *)(uintptr_t)g, NULL, t, (unsigned)entry, (unsigned)flag);
+				_snprintf(reply, replysz, "ok");
+			}
 		}
 	} else if (!strncmp(line, "wr ", 3)) {
 		// wr <addr hex> <hex bytes>: test-only memory write into the game process (never used by the mod).
