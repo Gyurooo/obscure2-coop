@@ -14,7 +14,8 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 3   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync
+#define NET_VERSION 4   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+                        // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
@@ -25,7 +26,7 @@ typedef struct { pkt_hdr h; DWORD t_ms; xstate pad; float yaw; DWORD yaw_valid; 
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD host_ms; } pkt_ping;   // pong: host_ms = the host's clock when it answered
 typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; } ch_state;
 #define MAX_CH 8
-typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; ch_state ch[MAX_CH]; } pkt_state;
+typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; xstate hpad; float yaw; DWORD yaw_valid; ch_state ch[MAX_CH]; } pkt_state;
 typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; } pkt_req;
 typedef struct { DWORD cls, tag; float pos[3]; float dir[3]; } npc_state;   // cls = the object's vtable address (its class)
 // A copy of part of the progress object (game+0x318): story / world state the guest must share.
@@ -91,6 +92,7 @@ static void clock_sample(const pkt_ping *pp)
 // The host's controller as the guest's game user 0 (player 1).
 static xstate g_netpad;
 static volatile DWORD g_netpad_tick;
+static DWORD g_last_pad_t;   // host timeline stamp of the newest pad applied (HOSTPAD or STATE)
 
 static sid_t udp_key(const struct sockaddr_in *a)
 {
@@ -234,6 +236,7 @@ static void net_handle(const char *buf, int n, sid_t from)
 			if (n == sizeof *in && (LONG)(h->seq - (DWORD)g_last_hostpad_seq) > 0) {
 				g_last_hostpad_seq = (LONG)h->seq;
 				g_netpad = in->pad;
+				g_last_pad_t = in->t_ms;
 				ring_push(&g_ring_p1, in->t_ms, &in->pad);
 				if (in->delay_ms >= 20 && in->delay_ms <= 400)
 					g_delay_ms = (LONG)in->delay_ms;
@@ -254,6 +257,18 @@ static void net_handle(const char *buf, int n, sid_t from)
 	}
 }
 
+// Test only: OBSCOOP_DROP_HOSTPAD=1 suppresses HOSTPAD on the host, to check that the snapshot's
+// copy of the pad keeps the guest's player 1 animating when the pad stream is lost.
+static int drop_hostpad_test(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		v = GetEnvironmentVariableA("OBSCOOP_DROP_HOSTPAD", NULL, 0) ? 1 : 0;
+		if (v) logf("net: HOSTPAD suppressed (OBSCOOP_DROP_HOSTPAD=1)");
+	}
+	return v;
+}
+
 static void net_tick(void)
 {
 	static DWORD last_hello, last_ping, last_pad, tick;
@@ -272,7 +287,7 @@ static void net_tick(void)
 			for (int i = 0; i < k; i++)
 				steam_accept(ids[i]);
 		}
-		if (g_peer_ok && now - last_pad >= 8) {   // the host's own pad is the guest's player 1
+		if (g_peer_ok && !drop_hostpad_test() && now - last_pad >= 8) {   // the host's own pad is the guest's player 1
 			pkt_pad hp;
 			local_pad(0, &hp.pad);
 			hp.t_ms = now_ms();

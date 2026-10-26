@@ -5,11 +5,15 @@ Sister project of [obscure-coop](https://github.com/Gyurooo/obscure-coop) (Obscu
 
 **Status: early.** Two copies on one PC (UDP loopback) stay in sync for movement, level changes, prompts, subtitles and
 door transitions. An idle second player no longer walks off on its own: while linked the mod disables the game's
-shared-screen off-screen catch-up (0.7). Enemies, items, saves and the Steam transport (ported, untested) are not done.
-Not playable online yet.
+shared-screen off-screen catch-up (0.7). Free look is local (0.8): each copy drops the right stick of the pad from the
+other PC, so each player turns only their own camera. The host's state snapshot repeats the host's pad and camera
+angle (protocol 4), so a lost pad packet no longer leaves player 1 sliding on the guest. Enemies, items, saves and the
+Steam transport (ported, untested) are not done. Not playable online yet.
 
 - `src/obscoop2.c`: proxy `xinput1_3.dll`. Keeps a test copy away from the real install and saves, offers
   virtual pads and keys through a named pipe, and lets two copies run on one PC (`OBSCOOP_MULTI=1`).
+- `src/net.c`, `src/sync.c` also carry the host's pad and camera yaw inside the state snapshot (protocol 4), and
+  the proxy drops the remote pad's right stick so free look stays local.
 - `src/hooks.c`: hooks on the game's level/load/menu requests, and on the character input update so an off-screen
   second character is not walked to the camera target by the local co-op catch-up while two copies are linked.
 - `src/window.c`: `OBSCOOP_WINDOWED=1` puts the game in a normal window (needed for test runs: a fullscreen device is lost and minimised when the game loses the foreground).

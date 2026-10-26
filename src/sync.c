@@ -79,6 +79,10 @@ static void host_send_state(void)
 	p.t_ms = now_ms();
 	p.level = rd32(world_obj() + 4);
 	p.n = (DWORD)n;
+	memset(&p.hpad, 0, sizeof p.hpad);
+	pad_read(0, &p.hpad);   // the host's own controller is the guest's player 1
+	p.yaw = g_cam_yaw;
+	p.yaw_valid = (DWORD)g_cam_yaw_valid;
 	for (int i = 0; i < n; i++) {
 		ch_state *c = &p.ch[i];
 		c->tag = rd32(hs[i] + H_TAG);
@@ -101,6 +105,16 @@ static void guest_on_state(const char *buf, int n)
 {
 	if (n != (int)sizeof(pkt_state))
 		return;
+	// The snapshot repeats the host's pad: if a HOSTPAD packet is lost, player 1 on this copy would keep
+	// its old input and the position corrections would drag it (seen as gliding). Only a newer stamp wins.
+	const pkt_state *st = (const pkt_state *)buf;
+	if ((LONG)(st->t_ms - g_last_pad_t) >= 0) {
+		g_last_pad_t = st->t_ms;
+		g_netpad = st->hpad;
+		g_netpad_tick = GetTickCount();
+		ring_push(&g_ring_p1, st->t_ms, &st->hpad);
+		if (st->yaw_valid) { g_peer_yaw = st->yaw; g_peer_yaw_valid = 1; }
+	}
 	EnterCriticalSection(&g_rx_cs);
 	memcpy(&g_rx_state, buf, sizeof g_rx_state);
 	g_rx_state_new = 1;

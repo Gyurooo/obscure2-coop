@@ -426,6 +426,15 @@ static void load_xinput(void)
 #pragma pack(push, 1)
 typedef struct { DWORD packet; WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } xstate;
 #pragma pack(pop)
+
+// Free look is local. The game applies the right stick of whichever pad XInputGetState returns, so a
+// pad streamed from the other PC would rotate this copy's camera too. Zero the right stick on the
+// remote pad only; each player's own pad keeps its look (the left stick and buttons are untouched).
+static void drop_remote_look(xstate *s)
+{
+	s->rx = 0;
+	s->ry = 0;
+}
 static volatile LONG g_vpad_on[4];
 static int g_hide_real_pads;   // OBSCOOP_HIDE_REAL_PADS=1: real controllers are never shown to this copy
 static xstate g_vpad[4];
@@ -574,8 +583,10 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			DWORD t_apply = timeline_now() - (DWORD)g_delay_ms;
 			memset(state, 0, sizeof(xstate));
 			ring_get(user == 0 ? &g_ring_p1 : &g_ring_p2, t_apply, (xstate *)state);
-			if (user == 0)
+			if (user == 0) {
 				remap_if_known((xstate *)state);   // the host's stick is in the host's camera frame
+				drop_remote_look((xstate *)state);
+			}
 			return ERROR_SUCCESS;
 		}
 		if (user == 0) {
@@ -585,6 +596,7 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			} else if (g_peer_ok && GetTickCount() - g_netpad_tick < 500) {
 				memcpy(state, &g_netpad, sizeof(xstate));
 				remap_if_known((xstate *)state);
+				drop_remote_look((xstate *)state);
 			} else if (g_peer_ok) {
 				memset(state, 0, sizeof(xstate));   // connected, the host's pad is idle or the stream is late
 			} else {
@@ -605,8 +617,10 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		DWORD t_apply = timeline_now() - (DWORD)g_delay_ms;
 		memset(state, 0, sizeof(xstate));
 		ring_get(user == 0 ? &g_ring_p1 : &g_ring_p2, t_apply, (xstate *)state);
-		if (user != 0)
+		if (user != 0) {
 			remap_if_known((xstate *)state);   // the guest's stick is in the guest's camera frame
+			drop_remote_look((xstate *)state);
+		}
 		InterlockedIncrement(&g_virtual_reads[user & 3]);
 		return ERROR_SUCCESS;
 	}
@@ -615,8 +629,10 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		EnterCriticalSection(&g_vpad_cs);
 		memcpy(state, &g_vpad[user], sizeof(xstate));
 		LeaveCriticalSection(&g_vpad_cs);
-		if (g_role == 1 && g_peer_ok && (int)user == g_remote_pad_idx)
+		if (g_role == 1 && g_peer_ok && (int)user == g_remote_pad_idx) {
 			remap_if_known((xstate *)state);   // the guest's stick is in the guest's camera frame
+			drop_remote_look((xstate *)state);
+		}
 		return ERROR_SUCCESS;
 	}
 	DWORD r = (real_XInputGetState && !g_hide_real_pads) ? real_XInputGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
@@ -980,6 +996,19 @@ static void handle_command(char *line, char *reply, size_t replysz)
 				}
 			}
 		}
+	} else if (!strncmp(line, "cam", 3)) {
+		unsigned g0 = *(volatile unsigned *)0x6c3068;
+		unsigned w = g0 ? *(unsigned *)(g0 + 0x378) : 0;
+		unsigned cm = w ? *(unsigned *)(w + 0x1764) : 0;
+		unsigned tgt = cm ? *(unsigned *)(cm + 0x17c) : 0;
+		_snprintf(reply, replysz, "cam yaw own %.1f valid %ld peer %.1f valid %ld target %x",
+		          g_cam_yaw * 57.2958f, g_cam_yaw_valid, g_peer_yaw * 57.2958f, g_peer_yaw_valid, tgt);
+	} else if (!strncmp(line, "padshow", 7)) {
+		EnterCriticalSection(&g_vpad_cs);
+		_snprintf(reply, replysz, "netpad %d,%d,%d,%d age %lu peer %d | vpad1 %d,%d,%d,%d on %ld", g_netpad.lx, g_netpad.ly,
+		          g_netpad.rx, g_netpad.ry, (unsigned long)(GetTickCount() - g_netpad_tick), (int)g_peer_ok,
+		          g_vpad[1].lx, g_vpad[1].ly, g_vpad[1].rx, g_vpad[1].ry, g_vpad_on[1]);
+		LeaveCriticalSection(&g_vpad_cs);
 	} else if (!strncmp(line, "sync", 4)) {
 		sync_status(reply, replysz);
 	} else if (!strncmp(line, "net", 3)) {
