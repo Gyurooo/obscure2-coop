@@ -7,7 +7,9 @@ Sister project of [obscure-coop](https://github.com/Gyurooo/obscure-coop) (Obscu
 door transitions. An idle second player no longer walks off on its own: while linked the mod disables the game's
 shared-screen off-screen catch-up (0.7). Free look is local (0.8): each copy drops the right stick of the pad from the
 other PC, so each player turns only their own camera. The host's state snapshot repeats the host's pad and camera
-angle (protocol 4), so a lost pad packet no longer leaves player 1 sliding on the guest. Enemies, items, saves and the
+angle (protocol 4), so a lost pad packet no longer leaves player 1 sliding on the guest. START on either controller
+pauses and resumes both copies (the guest's START becomes a player-1 pause pulse, not the game's leave dialog), and the
+"Player 2 is joining the game" dialog is auto-accepted after a level load. Enemies, items, saves and the
 Steam transport (ported, untested) are not done. Not playable online yet.
 
 - `src/obscoop2.c`: proxy `xinput1_3.dll`. Keeps a test copy away from the real install and saves, offers

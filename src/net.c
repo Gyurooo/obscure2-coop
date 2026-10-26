@@ -22,7 +22,7 @@ enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 
 
 #pragma pack(push, 1)
 typedef struct { DWORD magic; BYTE type, version; WORD len; DWORD seq; } pkt_hdr;
-typedef struct { pkt_hdr h; DWORD t_ms; xstate pad; float yaw; DWORD yaw_valid; DWORD delay_ms; float rtt_ms; } pkt_pad;   // t_ms: host timeline stamp      // INPUT (guest -> host) and HOSTPAD (host -> guest)
+typedef struct { pkt_hdr h; DWORD t_ms; xstate pad; float yaw; DWORD yaw_valid; DWORD delay_ms; float rtt_ms; DWORD in_level; } pkt_pad;   // t_ms: host timeline stamp      // INPUT (guest -> host) and HOSTPAD (host -> guest)
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD host_ms; } pkt_ping;   // pong: host_ms = the host's clock when it answered
 typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; } ch_state;
 #define MAX_CH 8
@@ -54,6 +54,7 @@ static sid_t g_peer;
 static volatile LONG g_peer_ok;
 static volatile LONG g_net_rx, g_net_tx, g_net_bad, g_net_rtt_ms = -1;
 static volatile LONG g_last_input_seq, g_last_hostpad_seq;
+static DWORD g_last_guest_buttons;   // host: edge detection for the guest's START (pause request)
 static volatile DWORD g_last_rx_tick;
 static DWORD g_tx_seq;
 static volatile float g_guest_rtt;      // host: the round trip the guest measured
@@ -201,6 +202,11 @@ static void net_handle(const char *buf, int n, sid_t from)
 			if (n != sizeof *in || (LONG)(h->seq - (DWORD)g_last_input_seq) <= 0)
 				break;
 			g_last_input_seq = (LONG)h->seq;
+			// START from the guest pauses both copies: pulse player 1's START, which the game and the
+			// HOSTPAD stream both see. Only while the guest is in a level.
+			if (in->in_level && (in->pad.buttons & 0x0010) && !(g_last_guest_buttons & 0x0010) && game_in_level())
+				g_pause_pulse_until = GetTickCount() + 120;
+			g_last_guest_buttons = in->pad.buttons;
 			if (in->yaw_valid) { g_peer_yaw = in->yaw; g_peer_yaw_valid = 1; }
 			ring_push(&g_ring_p2, in->t_ms, &in->pad);
 			g_guest_rtt = in->rtt_ms;
@@ -290,6 +296,7 @@ static void net_tick(void)
 		if (g_peer_ok && !drop_hostpad_test() && now - last_pad >= 8) {   // the host's own pad is the guest's player 1
 			pkt_pad hp;
 			local_pad(0, &hp.pad);
+			hp.in_level = 1;
 			hp.t_ms = now_ms();
 			ring_push(&g_ring_p1, hp.t_ms, &hp.pad);
 			{   // the delay follows the round trip the guest reports: half of it plus a margin; up quickly, down slowly
@@ -336,6 +343,7 @@ static void net_tick(void)
 	if (g_peer_ok && now - last_pad >= 8) {   // this PC's controller is the host's player 2
 		pkt_pad in;
 		local_pad(g_local_pad, &in.pad);
+		in.in_level = (DWORD)game_in_level();
 		in.t_ms = timeline_now();
 		in.delay_ms = 0;
 		in.rtt_ms = g_rtt_max;

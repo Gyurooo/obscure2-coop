@@ -435,6 +435,22 @@ static void drop_remote_look(xstate *s)
 	s->rx = 0;
 	s->ry = 0;
 }
+
+// Player 2's START is the game's "leave the game" key. Online the host turns a START from the guest
+// into a START pulse on player 1 (both copies pause, since pause is shared); drop it from the remote
+// pad so the leave dialog never opens.
+static void drop_remote_start(xstate *s)
+{
+	s->buttons &= ~0x0010;
+}
+
+static volatile DWORD g_pause_pulse_until;   // host: keep START on player 1 until this tick (guest asked to pause)
+static volatile DWORD g_accept_at, g_accept_until;   // host: pulse A on player 1 to accept the join dialog
+static int accept_pulse_on(void)
+{
+	DWORD n = GetTickCount();
+	return (LONG)(n - g_accept_at) >= 0 && (LONG)(n - g_accept_until) < 0;
+}
 static volatile LONG g_vpad_on[4];
 static int g_hide_real_pads;   // OBSCOOP_HIDE_REAL_PADS=1: real controllers are never shown to this copy
 static xstate g_vpad[4];
@@ -564,13 +580,23 @@ static int delayed_input_on(void)
 // The pad as a player holds it: the virtual pad if set, else the real device unless hidden.
 static DWORD pad_read(DWORD user, void *state)
 {
+	DWORD r;
 	if (user < 4 && g_vpad_on[user]) {
 		EnterCriticalSection(&g_vpad_cs);
 		memcpy(state, &g_vpad[user], sizeof(xstate));
 		LeaveCriticalSection(&g_vpad_cs);
-		return ERROR_SUCCESS;
+		r = ERROR_SUCCESS;
+	} else {
+		r = (real_XInputGetState && !g_hide_real_pads) ? real_XInputGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
 	}
-	return (real_XInputGetState && !g_hide_real_pads) ? real_XInputGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
+	// A guest START is turned into a short START on player 1, so the pause menu opens on both copies.
+	if (r == ERROR_SUCCESS && g_role == 1 && user == 0) {
+		if ((LONG)(GetTickCount() - g_pause_pulse_until) < 0)
+			((xstate *)state)->buttons |= 0x0010;
+		if (accept_pulse_on())
+			((xstate *)state)->buttons |= 0x1000;   // accept the 'player 2 is joining' dialog after a load
+	}
+	return r;
 }
 
 DWORD WINAPI XInputGetState(DWORD user, void *state)
@@ -586,6 +612,8 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			if (user == 0) {
 				remap_if_known((xstate *)state);   // the host's stick is in the host's camera frame
 				drop_remote_look((xstate *)state);
+			} else {
+				drop_remote_start((xstate *)state);
 			}
 			return ERROR_SUCCESS;
 		}
@@ -607,6 +635,8 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		}
 		memset(state, 0, sizeof(xstate));
 		pad_read((DWORD)g_local_pad, state);
+		if (g_peer_ok && in_level)
+			drop_remote_start((xstate *)state);   // START pauses both copies; it must not open "player 2 is leaving"
 		return ERROR_SUCCESS;
 	}
 	if (g_role == 2)
@@ -620,6 +650,7 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		if (user != 0) {
 			remap_if_known((xstate *)state);   // the guest's stick is in the guest's camera frame
 			drop_remote_look((xstate *)state);
+			drop_remote_start((xstate *)state);
 		}
 		InterlockedIncrement(&g_virtual_reads[user & 3]);
 		return ERROR_SUCCESS;
@@ -629,9 +660,16 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		EnterCriticalSection(&g_vpad_cs);
 		memcpy(state, &g_vpad[user], sizeof(xstate));
 		LeaveCriticalSection(&g_vpad_cs);
+		if (g_role == 1 && user == 0) {
+			if ((LONG)(GetTickCount() - g_pause_pulse_until) < 0)
+				((xstate *)state)->buttons |= 0x0010;   // virtual pad 0 is also the host's player 1
+			if (accept_pulse_on())
+				((xstate *)state)->buttons |= 0x1000;
+		}
 		if (g_role == 1 && g_peer_ok && (int)user == g_remote_pad_idx) {
 			remap_if_known((xstate *)state);   // the guest's stick is in the guest's camera frame
 			drop_remote_look((xstate *)state);
+			drop_remote_start((xstate *)state);
 		}
 		return ERROR_SUCCESS;
 	}

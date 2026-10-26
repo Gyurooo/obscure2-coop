@@ -62,6 +62,10 @@ static void __fastcall hk_change_level(void *game, void *edx, unsigned level, un
 		*(unsigned *)((BYTE *)game + 0x310), *(unsigned *)((BYTE *)game + 0x320));
 	g_change_level(game, edx, level, entry, flag);
 	g_last_level = level; g_last_entry = entry; g_last_flag = flag;
+	if (g_role == 1 && g_peer_ok) {   // after a load the game asks "player 2 is joining"; accept it once
+		g_accept_at = GetTickCount() + 4500; g_accept_until = g_accept_at + 150;
+		logf("join dialog: auto-accept pulse in 4.5 s");
+	}
 	if (g_role == 1 && !g_apply_host_req && g_peer_ok) {
 		net_send_req(REQ_LEVEL, level, entry, flag, NULL);
 		InterlockedIncrement(&g_req_sent);
@@ -73,6 +77,10 @@ static void __fastcall hk_load_progress(void *game, void *edx, unsigned arg)
 	InterlockedIncrement(&g_req_seq);
 	logf("request LoadProgress arg %u [mode %u]", arg, *(unsigned *)((BYTE *)game + 0x310));
 	g_load_progress(game, edx, arg);
+	if (g_role == 1 && g_peer_ok) {
+		g_accept_at = GetTickCount() + 4500; g_accept_until = g_accept_at + 150;
+		logf("join dialog: auto-accept pulse in 4.5 s");
+	}
 	if (g_role == 1 && !g_apply_host_req && g_peer_ok) {
 		net_send_req(REQ_LOAD_PROGRESS, arg, 0, 0, NULL);
 		InterlockedIncrement(&g_req_sent);
