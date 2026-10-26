@@ -101,6 +101,26 @@ static void __fastcall hk_to_menu(void *game, void *edx)
 	}
 }
 
+// Online each player has their own camera, so the second character is often off the other
+// player's screen. Obscure II's local co-op reacts to that: the character update (FUN_004de4f0)
+// sets human+0x884 ("off-screen in the other view") and human+0x880 ("off-screen in this view"),
+// and the input update (FUN_004cf940) then walks the character to the camera target at 200 u/s,
+// ignoring the player's pad while it runs. Clear both flags just before the input update so each
+// player keeps control of their own character; the character update recomputes them every frame.
+typedef void(__fastcall *input_update_t)(void *, void *, int);
+static input_update_t g_input_update;
+
+static void __fastcall hk_input_update(void *self, void *edx, int dt)
+{
+	unsigned ch = *(unsigned *)((BYTE *)self + 4);
+	if (ch && !IsBadWritePtr((void *)(uintptr_t)(ch + 0x880), 8)) {
+		*(unsigned *)(uintptr_t)(ch + 0x880) = 0;
+		*(unsigned *)(uintptr_t)(ch + 0x884) = 0;
+	}
+	if (g_input_update)
+		g_input_update(self, edx, dt);
+}
+
 static void install_request_hooks(void)
 {
 	static const BYTE p_change[6] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08 };
@@ -111,4 +131,7 @@ static void install_request_hooks(void)
 	g_load_progress = (req1_t)hook_entry((BYTE *)0x4a1ba0, p_prog, 9, (void *)hk_load_progress, "LoadProgress (0x4a1ba0)");
 	g_load_name = (req1_t)hook_entry((BYTE *)0x4a1bd0, p_name, 6, (void *)hk_load_name, "LoadByName (0x4a1bd0)");
 	g_to_menu = (req0_t)hook_entry((BYTE *)0x4a1c30, p_menu, 10, (void *)hk_to_menu, "ToMenu (0x4a1c30)");
+	static const BYTE p_input[6] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x3c };
+	g_input_update = (input_update_t)hook_entry((BYTE *)0x4cf940, p_input, 6, (void *)hk_input_update,
+		"CharacterControllerInput update (0x4cf940)");
 }
