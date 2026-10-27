@@ -3,15 +3,14 @@
 Online co-op for Obscure II (Steam, app 254480, build 215294), built on the game's own local co-op.
 Sister project of [obscure-coop](https://github.com/Gyurooo/obscure-coop) (Obscure 1).
 
-**Status: early.** Two copies on one PC (UDP loopback) stay in sync for movement, level changes, prompts, subtitles and
-door transitions. An idle second player no longer walks off on its own: while linked the mod disables the game's
-shared-screen off-screen catch-up (0.7). Free look is local (0.8): each copy drops the right stick of the pad from the
-other PC, so each player turns only their own camera. The host's state snapshot repeats the host's pad and camera
-angle (protocol 4), so a lost pad packet no longer leaves player 1 sliding on the guest. START on either controller
-pauses and resumes both copies (the guest's START becomes a player-1 pause pulse, not the game's leave dialog), and the
-"Player 2 is joining the game" dialog is auto-accepted after a level load. Test-only level guard (0.9): the pipe
-`level` command only replays a transition listed in `obscoop_levels.txt`, so a guessed tag cannot crash a test copy. Enemies, items, saves and the
-Steam transport (ported, untested) are not done. Not playable online yet.
+**Status: prototype (1.0).** Two copies on one PC (UDP loopback) stay in sync for movement, level changes, prompts,
+subtitles, door transitions, saves, items and health. A save loads on both copies (the guest's own save load now
+changes the level); a dead player 1 hands the host pad to the alive partner; the 44-item inventory and every change are
+mirrored to the guest; each character's life is in the state snapshot and applied on the guest. The host's snapshot
+repeats the host's pad and camera angle (protocol 4); START on either controller pauses both copies; the "Player 2 is
+joining" dialog is auto-accepted; free look is local; the test-only level guard (0.9) refuses guessed level tags. An
+idle second player no longer walks off (0.7 catch-up hook). The Steam transport is ported but still untested;
+unattached AI controllers expose no character health. Not playable online yet (loopback tested).
 
 - `src/obscoop2.c`: proxy `xinput1_3.dll`. Keeps a test copy away from the real install and saves, offers
   virtual pads and keys through a named pipe, and lets two copies run on one PC (`OBSCOOP_MULTI=1`).

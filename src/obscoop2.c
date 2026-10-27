@@ -599,6 +599,27 @@ static DWORD pad_read(DWORD user, void *state)
 	return r;
 }
 
+static unsigned player_human(int player);   // sync.c
+
+// A character whose life reached 0 is dead: the host's pad must feed the alive partner,
+// otherwise the survivor is uncontrollable after a death (found in the I100 death test).
+static int p1_down(void)
+{
+	unsigned h = player_human(0);
+	return h && *(float *)(uintptr_t)(h + 0x320) <= 0.0f;
+}
+
+static void merge_pad(xstate *dst, const xstate *src)
+{
+	dst->buttons |= src->buttons;
+	if (src->lt > dst->lt) dst->lt = src->lt;
+	if (src->rt > dst->rt) dst->rt = src->rt;
+	if (src->lx) dst->lx = src->lx;
+	if (src->ly) dst->ly = src->ly;
+	if (src->rx) dst->rx = src->rx;
+	if (src->ry) dst->ry = src->ry;
+}
+
 DWORD WINAPI XInputGetState(DWORD user, void *state)
 {
 	load_xinput();
@@ -645,8 +666,19 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		InterlockedIncrement(&g_polls[user]);
 	if (g_role == 1 && delayed_input_on() && (user == 0 || (int)user == g_remote_pad_idx)) {
 		DWORD t_apply = timeline_now() - (DWORD)g_delay_ms;
+		int down = p1_down();
+		if (user == 0 && down) {
+			memset(state, 0, sizeof(xstate));
+			return ERROR_SUCCESS;
+		}
 		memset(state, 0, sizeof(xstate));
 		ring_get(user == 0 ? &g_ring_p1 : &g_ring_p2, t_apply, (xstate *)state);
+		if (user != 0 && down) {
+			xstate own;
+			memset(&own, 0, sizeof own);
+			ring_get(&g_ring_p1, t_apply, &own);
+			merge_pad((xstate *)state, &own);
+		}
 		if (user != 0) {
 			remap_if_known((xstate *)state);   // the guest's stick is in the guest's camera frame
 			drop_remote_look((xstate *)state);
@@ -656,9 +688,17 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		return ERROR_SUCCESS;
 	}
 	if (user < 4 && g_vpad_on[user]) {
+		int down = g_role == 1 && p1_down();
 		InterlockedIncrement(&g_virtual_reads[user]);
 		EnterCriticalSection(&g_vpad_cs);
+		if (user == 0 && down) {
+			memset(state, 0, sizeof(xstate));
+			LeaveCriticalSection(&g_vpad_cs);
+			return ERROR_SUCCESS;
+		}
 		memcpy(state, &g_vpad[user], sizeof(xstate));
+		if (g_role == 1 && user != 0 && down && g_vpad_on[0])
+			merge_pad((xstate *)state, &g_vpad[0]);
 		LeaveCriticalSection(&g_vpad_cs);
 		if (g_role == 1 && user == 0) {
 			if ((LONG)(GetTickCount() - g_pause_pulse_until) < 0)
@@ -957,6 +997,7 @@ static void vpad_set(int user, int on, unsigned buttons, int lx, int ly, int rx,
 }
 
 static unsigned player_human(int player);   // sync.c
+
 static volatile float g_view[16];            // window.c: the last view matrix
 static volatile LONG g_view_sets, g_xf_sets;
 static volatile float g_view_first[16];
@@ -1092,6 +1133,24 @@ static void handle_command(char *line, char *reply, size_t replysz)
 			pos[0] = v[0]; pos[1] = v[1]; pos[2] = v[2];
 			if (got >= 6) { dir[0] = v[3]; dir[1] = v[4]; dir[2] = 0; }
 			_snprintf(reply, replysz, "ok");
+		}
+	} else if (!strncmp(line, "life ", 5)) {
+		// life <0|1> <value>: call the character's own SetLife (vtable +0x24), the same path as the
+		// CharacterSetLife script command. Test-only, used for the death/swap test.
+		int pl = 0; float life = 0;
+		if (sscanf(line + 5, "%d %f", &pl, &life) != 2 || pl < 0 || pl > 1) {
+			_snprintf(reply, replysz, "error life <0|1> <value>");
+		} else {
+			unsigned h = player_human(pl);
+			if (!h) {
+				_snprintf(reply, replysz, "error life: no character (in game?)");
+			} else {
+				void **vt = *(void ***)(uintptr_t)h;
+				// The CharacterSetLife handler passes a delta (requested life minus the current life at +0x320).
+				float cur = *(float *)(uintptr_t)(h + 0x320);
+				((void(__thiscall *)(void *, float))vt[9])((void *)(uintptr_t)h, life - cur);
+				_snprintf(reply, replysz, "ok life %d %.1f (delta %.1f)", pl, life, life - cur);
+			}
 		}
 	} else if (!strncmp(line, "views", 5)) {
 		size_t l = 0;

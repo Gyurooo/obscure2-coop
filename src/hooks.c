@@ -42,6 +42,7 @@ static volatile LONG g_req_seq;   // number of requests seen, for tests
 static volatile LONG g_req_sent;  // requests forwarded to the guest (host)
 static unsigned g_last_level, g_last_entry, g_last_flag;   // host: the level the party is in, for a joining guest
 static int g_apply_host_req;      // guest: the request being made comes from the host, let it through
+static volatile DWORD g_guest_load_until; // guest: its own save load may change the level for this window
 
 typedef void(__fastcall *req3_t)(void *, void *, unsigned, unsigned, unsigned);
 typedef void(__fastcall *req1_t)(void *, void *, unsigned);
@@ -54,8 +55,9 @@ static void __fastcall hk_change_level(void *game, void *edx, unsigned level, un
 {
 	char t[5];
 	InterlockedIncrement(&g_req_seq);
-	if (g_role == 2 && g_peer_ok && !g_apply_host_req) {   // guest: only the host changes levels
-		logf("guest: own ChangeLevel %s dropped (the host decides)", tag4(level, t));
+	if (g_role == 2 && g_peer_ok && !g_apply_host_req &&
+	    (LONG)(GetTickCount() - g_guest_load_until) >= 0) {   // guest: only the host changes levels,
+		logf("guest: own ChangeLevel %s dropped (the host decides)", tag4(level, t));   // except its own save load
 		return;
 	}
 	logf("request ChangeLevel level %s (0x%08x) entry %u flag %u [mode %u state %u]", tag4(level, t), level, entry, flag,
@@ -76,6 +78,10 @@ static void __fastcall hk_load_progress(void *game, void *edx, unsigned arg)
 {
 	InterlockedIncrement(&g_req_seq);
 	logf("request LoadProgress arg %u [mode %u]", arg, *(unsigned *)((BYTE *)game + 0x310));
+	if (g_role == 2 && !g_apply_host_req) {   // the guest's own save load: let its ChangeLevel through
+		g_guest_load_until = GetTickCount() + 5000;
+		logf("guest: own save load, allowing its ChangeLevel for 5 s");
+	}
 	g_load_progress(game, edx, arg);
 	if (g_role == 1 && g_peer_ok) {
 		g_accept_at = GetTickCount() + 4500; g_accept_until = g_accept_at + 150;

@@ -60,8 +60,49 @@ static float g_stat_sum, g_stat_max;   // guest: how far the host's characters w
 static LONG g_stat_n;
 static volatile LONG g_snd_states, g_rcv_states, g_applied, g_snaps, g_blends, g_skipped_level, g_timed_corr;
 static volatile LONG g_req_applied;
+static volatile LONG g_item_applied;
 
 // ---- host: snapshots ---------------------------------------------------------------------------
+
+// ---- host: inventory mirror -------------------------------------------------------------------
+// The save's inventory object (world+0x1790, vtable 0x665844) holds a count at +4 and 16-byte
+// entries at +8. It is not part of the character or progress packets, so mirror it when it changes.
+static DWORD g_item_last_count, g_item_last_hash;
+static void host_send_item(void)
+{
+	static DWORD last;
+	DWORD now = GetTickCount();
+	if (now - last < 250) return;
+	last = now;
+	unsigned w = world_obj();
+	unsigned inv = w ? rd32(w + 0x1790) : 0;
+	if (!inv) return;
+	DWORD count = rd32(inv + 4);
+	if (count > ITEM_MAX) count = ITEM_MAX;
+	DWORD h = count * 2654435761u;
+	for (DWORD i = 0; i < count * 4; i++) h = h * 31 + rd32(inv + 8 + i * 4);
+	if (count == g_item_last_count && h == g_item_last_hash) return;
+	pkt_item p;
+	memset(&p, 0, sizeof p);
+	p.level = rd32(w + 4);
+	p.count = count;
+	for (DWORD i = 0; i < count * 4; i++) p.data[i] = rd32(inv + 8 + i * 4);
+	net_send(PKT_ITEM, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	g_item_last_count = count; g_item_last_hash = h;
+}
+
+static void guest_on_item(const char *buf, int n)
+{
+	if (n < (int)(sizeof(pkt_item) - sizeof(((pkt_item *)0)->data))) return;
+	const pkt_item *p = (const pkt_item *)buf;
+	unsigned w = world_obj();
+	unsigned inv = w ? rd32(w + 0x1790) : 0;
+	if (!inv || p->level != rd32(w + 4)) return;
+	DWORD count = p->count; if (count > ITEM_MAX) count = ITEM_MAX;
+	for (DWORD i = 0; i < count * 4; i++) *(DWORD *)(uintptr_t)(inv + 8 + i * 4) = p->data[i];
+	*(DWORD *)(uintptr_t)(inv + 4) = count;
+	InterlockedIncrement(&g_item_applied);
+}
 
 static void host_send_state(void)
 {
@@ -70,6 +111,7 @@ static void host_send_state(void)
 	if (now - last < 16)
 		return;
 	last = now;
+	host_send_item();
 	unsigned hs[MAX_CH];
 	int n = world_humans(hs, MAX_CH);
 	if (n <= 0)
@@ -90,6 +132,7 @@ static void host_send_state(void)
 		memcpy(c->dir, (const void *)(uintptr_t)(hs[i] + H_DIR), sizeof c->dir);
 		c->s220 = rd32(hs[i] + 0x220);
 		c->s278 = rd32(hs[i] + 0x278);
+		c->life = rd32(hs[i] + 0x320);
 	}
 	net_send(PKT_STATE, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
 	InterlockedIncrement(&g_snd_states);
@@ -229,6 +272,7 @@ static void guest_apply_state(void)
 			float *pos = (float *)(uintptr_t)(hs[k] + H_POS), *dir = (float *)(uintptr_t)(hs[k] + H_DIR);
 			if (IsBadWritePtr(pos, 12) || IsBadWritePtr(dir, 12))
 				break;
+			*(DWORD *)(uintptr_t)(hs[k] + 0x320) = st.ch[i].life;   // health from the host
 			// the error is measured against where this copy's character was at the snapshot's time
 			float ref[3] = { pos[0], pos[1], pos[2] };
 			int timed = g_clock_valid && hist_at(st.ch[i].tag, st.t_ms, ref);
