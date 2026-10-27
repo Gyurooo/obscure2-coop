@@ -671,6 +671,7 @@ static int g_reg_head, g_reg_tail;
 static void guest_on_region(const char *buf, int n)
 {
 	const pkt_region *r = (const pkt_region *)buf;
+	int stashed = 0;
 	if (n < (int)(sizeof(pkt_hdr) + 12) || r->len > REGION_MAX || (int)(sizeof(pkt_hdr) + 12 + r->len) != n)
 		return;
 	EnterCriticalSection(&g_reg_cs);
@@ -678,7 +679,19 @@ static void guest_on_region(const char *buf, int n)
 		memcpy(&g_reg_q[g_reg_tail], buf, n);
 		g_reg_tail = (g_reg_tail + 1) & 15;
 	}
+	if (r->off == PROG_CHR_OFF && r->len >= 0x140) {   // the host's party, for the next level change (hk_party_table)
+		memcpy(g_host_party, r->data, 0x140);
+		g_host_party_level = r->level;
+		InterlockedExchange(&g_host_party_valid, 1);
+		stashed = 1;
+	}
 	LeaveCriticalSection(&g_reg_cs);
+	if (stashed) {
+		char lv[5], ch[5];
+		unsigned first;
+		memcpy(&first, g_host_party, sizeof first);
+		logf("guest: host party stored at level %s: first character %s", tag4(r->level, lv), tag4(first, ch));
+	}
 	InterlockedIncrement(&g_prog_chunks_rcv);
 }
 
@@ -741,6 +754,7 @@ static void host_watch_level(void)
 	g_last_level = lvl;
 	g_last_entry = entry;
 	if (g_peer_ok) {
+		host_send_progress(1);   // the party table must reach the guest before the level change it belongs to
 		net_send_req(REQ_LEVEL, lvl, entry, 1, NULL);
 		InterlockedIncrement(&g_req_sent);
 		InterlockedIncrement(&g_watch_sent);
@@ -754,9 +768,9 @@ static void host_welcome_guest(void)
 		(char)(g_last_level >> 8), (char)g_last_level);
 	// The friend starts their own "New game, Two players" first (that choice decides who controls player 2); the
 	// level request waits on the guest until its world exists.
+	host_send_progress(1);   // the party table has to reach the guest before the level request
 	if (g_last_level)
 		net_send_req(REQ_LEVEL, g_last_level, g_last_entry, g_last_flag, NULL);
-	host_send_progress(1);
 }
 
 // ---- guest: requests from the host -------------------------------------------------------------
