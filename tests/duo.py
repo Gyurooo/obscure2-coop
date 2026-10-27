@@ -6,7 +6,7 @@ Owner files are snapshotted before and diffed after (runs2/snapshot.sh)."""
 import os, subprocess, sys, shutil, time
 L = os.environ.get('OBSCOOP_TEST_ROOT', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 R = os.path.dirname(os.path.abspath(__file__))
-dll = L + r'\obscure2-coop-repo\build\xinput1_3.dll'
+dll = os.environ.get('OBSCOOP_DLL', L + r'\obscure2-coop-repo\build\xinput1_3.dll')
 BASH = r'C:\Program Files\Git\bin\bash.exe'
 
 def sh(args, **kw):
