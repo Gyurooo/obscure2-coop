@@ -14,9 +14,10 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 5   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 6   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
+                        // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
@@ -33,8 +34,12 @@ typedef struct { DWORD cls, tag; float pos[3]; float dir[3]; } npc_state;   // c
 // A copy of part of the progress object (game+0x318): story / world state the guest must share.
 #define REGION_MAX 960
 typedef struct { pkt_hdr h; DWORD level; DWORD off; DWORD len; BYTE data[REGION_MAX]; } pkt_region;
-#define ITEM_MAX 64
-typedef struct { pkt_hdr h; DWORD level; DWORD count; DWORD data[ITEM_MAX * 4]; } pkt_item;   // inventory: count + 16-byte entries
+#define ITEM_MAX 99     // the game's inventory holds up to 99 entries (FUN_004b0430 / FUN_004b07e0)
+#define ITEM_CHUNK 32   // entries per packet: 32*32 + 32 bytes header = 1056, under the Steam transport's 1200-byte rule
+// The inventory object (world+0x1790) is count at +4 and entries at +8, stride 0x20 (FUN_004b04a0: entry = obj+8+i*0x20).
+// One entry is 32 bytes: +0 flags, +4 tag, +8 id, +0xc ammo, +0x10 (float, grenade count). Send whole entries, in
+// chunks: off = first entry in this packet, count = entries here, total = the inventory's count.
+typedef struct { pkt_hdr h; DWORD level; DWORD off; DWORD count; DWORD total; DWORD data[ITEM_CHUNK * 8]; } pkt_item;
 #define SAVE_CHUNK 512
 typedef struct { pkt_hdr h; char name[32]; DWORD off; DWORD len; BYTE data[SAVE_CHUNK]; } pkt_save;
 typedef struct { pkt_hdr h; char name[32]; DWORD off; } pkt_save_ack;

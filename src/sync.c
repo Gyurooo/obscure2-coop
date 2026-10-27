@@ -224,9 +224,16 @@ static void guest_on_save(const char *buf, int n)
 // ---- host: snapshots ---------------------------------------------------------------------------
 
 // ---- host: inventory mirror -------------------------------------------------------------------
-// The save's inventory object (world+0x1790, vtable 0x665844) holds a count at +4 and 16-byte
-// entries at +8. It is not part of the character or progress packets, so mirror it when it changes.
+// The save's inventory object (world+0x1790, vtable 0x665844) holds a count at +4 and 32-byte entries
+// at +8 (entry = obj + 8 + i*0x20; FUN_004b04a0 returns exactly that address). It is not part of the
+// character or progress packets, so mirror it when it changes. One entry is 8 dwords: flags, tag, id,
+// ammo, then a float at +0x10 that FUN_004b0300 turns into the ammo of a DYNA/FLBG weapon. The old
+// packet assumed 16-byte entries and copied only count*16 bytes, which truncated the guest's inventory
+// after entry ~22 and left DYNA/FLBA (indices 28/23) with no entry to build from (TASK6_FINDINGS).
+#define ITEM_RESEND_MS 1000       // repeat the mirror at this rate: a lost chunk, or a guest whose world is not
+                                  // ready yet, still converges (the inventory is a few KB, the cost is small)
 static DWORD g_item_last_count, g_item_last_hash;
+static DWORD g_item_sent_at;
 static void host_send_item(void)
 {
 	static DWORD last;
@@ -239,27 +246,71 @@ static void host_send_item(void)
 	DWORD count = rd32(inv + 4);
 	if (count > ITEM_MAX) count = ITEM_MAX;
 	DWORD h = count * 2654435761u;
-	for (DWORD i = 0; i < count * 4; i++) h = h * 31 + rd32(inv + 8 + i * 4);
-	if (count == g_item_last_count && h == g_item_last_hash) return;
-	pkt_item p;
-	memset(&p, 0, sizeof p);
-	p.level = rd32(w + 4);
-	p.count = count;
-	for (DWORD i = 0; i < count * 4; i++) p.data[i] = rd32(inv + 8 + i * 4);
-	net_send(PKT_ITEM, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	for (DWORD i = 0; i < count * 8; i++) h = h * 31 + rd32(inv + 8 + i * 4);   // whole 32-byte entries
+	if (count == g_item_last_count && h == g_item_last_hash && now - g_item_sent_at < ITEM_RESEND_MS)
+		return;   // unchanged and repeated a moment ago
 	g_item_last_count = count; g_item_last_hash = h;
+	g_item_sent_at = now;
+	pkt_item p;
+	for (DWORD off = 0; off < count; off += ITEM_CHUNK) {
+		DWORD n = count - off < ITEM_CHUNK ? count - off : ITEM_CHUNK;
+		const void *src = (const void *)(uintptr_t)(inv + 8 + off * 0x20);
+		memset(&p, 0, sizeof p);
+		p.level = rd32(w + 4);
+		p.off = off; p.count = n; p.total = count;
+		if (mem_ok(src, n * 0x20))
+			memcpy(p.data, src, n * 0x20);
+		net_send(PKT_ITEM, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	}
+	if (count == 0) {   // an emptied inventory is still a state the guest must take
+		memset(&p, 0, sizeof p);
+		p.level = rd32(w + 4);
+		net_send(PKT_ITEM, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	}
 }
+
+// The guest assembles the chunks in a shadow copy and writes the inventory only when every chunk of
+// one total is present: a lost or late datagram must not leave a half-mirrored inventory (that is what
+// hid DYNA/FLBA from weapon_object).
+static BYTE g_item_shadow[ITEM_MAX * 0x20];
+static unsigned g_item_inv;      // the inventory object the assembly is for
+static DWORD g_item_total, g_item_have;   // entries expected, bitmask of chunks received
+static int g_item_parts;                  // chunks per total
 
 static void guest_on_item(const char *buf, int n)
 {
-	if (n < (int)(sizeof(pkt_item) - sizeof(((pkt_item *)0)->data))) return;
+	if (n != (int)sizeof(pkt_item)) return;   // n is the whole datagram, header included (see net_handle)
 	const pkt_item *p = (const pkt_item *)buf;
 	unsigned w = world_obj();
 	unsigned inv = w ? rd32(w + 0x1790) : 0;
 	if (!inv || p->level != rd32(w + 4)) return;
-	DWORD count = p->count; if (count > ITEM_MAX) count = ITEM_MAX;
-	for (DWORD i = 0; i < count * 4; i++) *(DWORD *)(uintptr_t)(inv + 8 + i * 4) = p->data[i];
-	*(DWORD *)(uintptr_t)(inv + 4) = count;
+	DWORD total = p->total;
+	if (total > ITEM_MAX || p->count > ITEM_CHUNK || p->off % ITEM_CHUNK || p->off + p->count > total)
+		return;
+	if (inv != g_item_inv) {   // a new world's inventory: drop any partial assembly
+		g_item_inv = inv; g_item_total = 0; g_item_have = 0; g_item_parts = 0;
+	}
+	if (total == 0) {
+		*(DWORD *)(uintptr_t)(inv + 4) = 0;
+		g_item_total = 0; g_item_have = 0; g_item_parts = 0;
+		InterlockedIncrement(&g_item_applied);
+		return;
+	}
+	if (total != g_item_total) {
+		g_item_total = total; g_item_have = 0;
+		g_item_parts = (int)((total + ITEM_CHUNK - 1) / ITEM_CHUNK);
+	}
+	if (p->off == 0)   // every send starts here: a repeated first chunk starts a fresh assembly
+		g_item_have = 0;
+	memcpy(g_item_shadow + p->off * 0x20, p->data, p->count * 0x20);
+	g_item_have |= 1u << (p->off / ITEM_CHUNK);
+	if (g_item_have != (1u << g_item_parts) - 1)
+		return;   // still waiting for a chunk
+	if (IsBadWritePtr((void *)(uintptr_t)(inv + 8), total * 0x20))
+		return;   // the world went away between the pointer read and now
+	memcpy((void *)(uintptr_t)(inv + 8), g_item_shadow, total * 0x20);
+	*(DWORD *)(uintptr_t)(inv + 4) = total;
+	g_item_total = 0; g_item_have = 0; g_item_parts = 0;
 	InterlockedIncrement(&g_item_applied);
 }
 
@@ -455,8 +506,8 @@ static unsigned weapon_object(unsigned tag)
 	if (!mgr || !inv)
 		return 0;
 	unsigned n = rd32(inv + 4), entry = 0;
-	if (n > 64)
-		n = 64;
+	if (n > ITEM_MAX)
+		n = ITEM_MAX;
 	for (unsigned i = 0; i < n && !entry; i++)
 		if (rd32(inv + 8 + i * 0x20 + 4) == tag)          // entry: +0 flags, +4 tag, +0xc ammo
 			entry = inv + 8 + i * 0x20;

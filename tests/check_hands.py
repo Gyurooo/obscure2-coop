@@ -67,6 +67,29 @@ def inv(m):
     return m.u32(i + 4) if i else None
 
 
+def inv_entries(m):
+    """Every inventory entry as (index, first 16 bytes hex, decoded tag). Entries are 32 bytes
+    (FUN_004b04a0: entry = inv + 8 + index*0x20; tag at entry+4)."""
+    w = world(m)
+    i = m.u32(w + 0x1790) if w else 0
+    n = m.u32(i + 4) if i else 0
+    out = []
+    for k in range(min(n or 0, 99)):
+        e = i + 8 + k * 0x20
+        b = m.read(e, 16) or b'\0' * 16
+        out.append((k, b.hex(), tag(m.u32(e + 4))))
+    return n, out
+
+
+def dump_inv(mh, mg):
+    """Dumps both inventories: index, 16-byte hex of the entry, and its decoded tag."""
+    for name, m in (('host', mh), ('guest', mg)):
+        n, es = inv_entries(m)
+        print('%s inventory: count %s (%d entries of 16 hex bytes, stride 0x20)' % (name, n, len(es)))
+        for k, hx, t in es:
+            print('  %s [%2d] %s  tag=%s' % (name, k, hx, t))
+
+
 def held(x):
     c = x['cur']
     return x['slots'][c] if isinstance(c, int) and 0 <= c < 4 else '?'
@@ -93,6 +116,8 @@ for x in hh:
         bad.append((x['tag'], x['slots'], x['cur'], y['slots'], y['cur']))
 if checked == 0:
     print('hands: NO character exists on both copies')
+if bad:
+    dump_inv(mh, mg)
 assert bad == [], 'held weapons differ: %r' % (bad,)
 assert any(any(s != '-' for s in x['slots']) for x in hh), 'host has no weapon in any hand either'
 print('hands OK (%d characters checked)' % checked)
