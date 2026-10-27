@@ -3,7 +3,7 @@
 Online co-op for Obscure II (Steam, app 254480, build 215294), built on the game's own local co-op.
 Sister project of [obscure-coop](https://github.com/Gyurooo/obscure-coop) (Obscure 1).
 
-**Status: prototype (1.0).** Two copies on one PC (UDP loopback) stay in sync for movement, level changes, prompts,
+**Status: prototype (1.1).** Two copies on one PC (UDP loopback) stay in sync for movement, level changes, prompts,
 subtitles, door transitions, saves, items and health. A save loads on both copies (the guest's own save load now
 changes the level); a dead player 1 hands the host pad to the alive partner; the 44-item inventory and every change are
 mirrored to the guest; each character's life is in the state snapshot and applied on the guest. The host's snapshot
@@ -28,3 +28,10 @@ unattached AI controllers expose no character health. Not playable online yet (l
 No game files are shipped. MIT license.
 
 Research notes: [coop-anything games/obscure-2](https://github.com/cranebeaker/coop-anything).
+
+1.1 (2.1): player 2 is attached to the second input controller after a save load on both copies (the game may still
+be in one-player mode, so the partner can remain AI); the installer (install.ps1 / INSTALL.txt) is included; the
+save-file transfer (PKT_SAVE/PKT_SAVE_ACK) is present but only advances one chunk, so it is unreleased. Known gaps:
+the 2P mode after load, world item pickup, attack animation, item usage, destructibles (windows), enemy AI health
+(not exposed by the game). Tests: save/items/health pass on both loopback copies; the death/partner-control check
+fails for the 1P-mode reason.

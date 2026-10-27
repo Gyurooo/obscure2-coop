@@ -17,7 +17,7 @@
 #define NET_VERSION 4   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
-	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12 };
+	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
 
 #pragma pack(push, 1)
@@ -34,12 +34,17 @@ typedef struct { DWORD cls, tag; float pos[3]; float dir[3]; } npc_state;   // c
 typedef struct { pkt_hdr h; DWORD level; DWORD off; DWORD len; BYTE data[REGION_MAX]; } pkt_region;
 #define ITEM_MAX 64
 typedef struct { pkt_hdr h; DWORD level; DWORD count; DWORD data[ITEM_MAX * 4]; } pkt_item;   // inventory: count + 16-byte entries
+#define SAVE_CHUNK 512
+typedef struct { pkt_hdr h; char name[32]; DWORD off; DWORD len; BYTE data[SAVE_CHUNK]; } pkt_save;
+typedef struct { pkt_hdr h; char name[32]; DWORD off; } pkt_save_ack;
 #define MAX_NPC 24
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; npc_state npc[MAX_NPC]; } pkt_npc;
 #pragma pack(pop)
 
 static void guest_on_state(const char *buf, int n);
 static void guest_on_item(const char *buf, int n);
+static void guest_on_save(const char *buf, int n);
+static void host_on_save_ack(const char *buf, int n);
 static void guest_on_req(const char *buf, int n);
 static void guest_on_npc(const char *buf, int n);
 static void guest_on_region(const char *buf, int n);
@@ -252,7 +257,11 @@ static void net_handle(const char *buf, int n, sid_t from)
 				if (in->yaw_valid) { g_peer_yaw = in->yaw; g_peer_yaw_valid = 1; }
 				g_netpad_tick = GetTickCount();
 			}
-		} else if (h->type == PKT_ITEM) {
+		} else if (h->type == PKT_SAVE) {
+		guest_on_save(buf, n);
+	} else if (h->type == PKT_SAVE_ACK) {
+		host_on_save_ack(buf, n);
+	} else if (h->type == PKT_ITEM) {
 		guest_on_item(buf, n);
 	} else if (h->type == PKT_STATE) {
 			guest_on_state(buf, n);

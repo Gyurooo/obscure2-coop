@@ -83,6 +83,74 @@ static void attach_player2(void)
 	if (h2) *(DWORD *)(uintptr_t)c1 = h2;
 }
 
+// ---- save-file transfer (host -> guest) --------------------------------------------------------
+// The guest starts from the host's campaign save: the host sends Save\game0..9.sav in 512-byte
+// chunks; the guest writes them and acks each chunk; a lost chunk is retried after 250 ms.
+static DWORD g_save_file, g_save_off, g_save_sent, g_save_wait, g_save_len;
+static int g_save_active;
+
+static void save_path(char *out, size_t n, const char *name)
+{
+	char exe[MAX_PATH];
+	GetModuleFileNameA(NULL, exe, sizeof exe);
+	char *slash = strrchr(exe, '\\');
+	if (slash) *slash = 0;
+	_snprintf(out, n, "%s\\Save\\%s", exe, name);
+}
+
+static void host_send_saves(void)
+{
+	if (!g_peer_ok) { g_save_active = 0; return; }
+	if (!g_save_active) { g_save_active = 1; g_save_file = 0; g_save_off = 0; g_save_sent = 0; g_save_wait = 0; }
+	if (g_save_file > 9) { g_save_active = 0; return; }
+	DWORD now = GetTickCount();
+	if (g_save_wait && now - g_save_wait < 250) return;
+	if (g_save_sent != g_save_off) return;   // waiting for the ack
+	char name[32]; _snprintf(name, sizeof name, "game%u.sav", (unsigned)g_save_file);
+	char path[MAX_PATH]; save_path(path, sizeof path, name);
+	HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	if (f == INVALID_HANDLE_VALUE) { g_save_file++; g_save_off = 0; g_save_sent = 0; g_save_wait = 0; return; }
+	pkt_save p; memset(&p, 0, sizeof p);
+	_snprintf(p.name, sizeof p.name, "%s", name);
+	p.off = g_save_off;
+	SetFilePointer(f, g_save_off, NULL, FILE_BEGIN);
+	DWORD got = 0; ReadFile(f, p.data, SAVE_CHUNK, &got, NULL); CloseHandle(f);
+	p.len = got; g_save_len = got;
+	net_send(PKT_SAVE, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	g_save_wait = now; g_save_sent = g_save_off;
+}
+
+static void host_on_save_ack(const char *buf, int n)
+{
+	if (n < (int)(sizeof(pkt_save_ack) - sizeof(((pkt_save_ack *)0)->name))) return;
+	const pkt_save_ack *a = (const pkt_save_ack *)buf;
+	if (!g_save_active || g_save_file > 9) return;
+	char name[32]; _snprintf(name, sizeof name, "game%u.sav", (unsigned)g_save_file);
+	if (strcmp(a->name, name) || a->off != g_save_off) return;
+	g_save_off += g_save_len;
+	if (g_save_len < SAVE_CHUNK) { g_save_file++; g_save_off = 0; }
+	g_save_sent = g_save_off; g_save_wait = 0;
+}
+
+static void guest_on_save(const char *buf, int n)
+{
+	if (n < (int)(sizeof(pkt_save) - sizeof(((pkt_save *)0)->data))) return;
+	const pkt_save *p = (const pkt_save *)buf;
+	if (strncmp(p->name, "game", 4) || strstr(p->name, "..") || p->len > SAVE_CHUNK) return;
+	char path[MAX_PATH]; save_path(path, sizeof path, p->name);
+	char dir[MAX_PATH]; _snprintf(dir, sizeof dir, "%s", path);
+        char *slash = strrchr(dir, '\\'); if (slash) *slash = 0;
+	CreateDirectoryA(dir, NULL);
+	HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
+	if (f == INVALID_HANDLE_VALUE) return;
+	SetFilePointer(f, p->off, NULL, FILE_BEGIN);
+	DWORD wrote = 0; WriteFile(f, p->data, p->len, &wrote, NULL); CloseHandle(f);
+	pkt_save_ack a; memset(&a, 0, sizeof a);
+	_snprintf(a.name, sizeof a.name, "%s", p->name);
+	a.off = p->off;
+	net_send(PKT_SAVE_ACK, &a, (WORD)(sizeof a - sizeof(pkt_hdr)));
+}
+
 // ---- host: snapshots ---------------------------------------------------------------------------
 
 // ---- host: inventory mirror -------------------------------------------------------------------
@@ -809,6 +877,7 @@ static void frame_tick(void)
 			host_welcome_guest();
 		}
 		host_watch_level();
+		host_send_saves();
 		host_send_state();
 		host_send_npcs();
 		host_send_progress(0);
