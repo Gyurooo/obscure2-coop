@@ -62,6 +62,27 @@ static volatile LONG g_snd_states, g_rcv_states, g_applied, g_snaps, g_blends, g
 static volatile LONG g_req_applied;
 static volatile LONG g_item_applied;
 
+// A save load starts the game with only player 1 attached: the second input controller's character
+// pointer is 0, so the partner is AI and the guest's pad controls nothing. Re-attach the second human
+// to the second input controller after a load (both copies do this).
+static void attach_player2(void)
+{
+	static DWORD last;
+	DWORD now = GetTickCount();
+	if (now - last < 500) return;
+	last = now;
+	unsigned w = world_obj();
+	unsigned ctl = w ? rd32(w + 0x1748) : 0;
+	unsigned mgr = w ? rd32(w + 0x175c) : 0;
+	if (!ctl || !mgr) return;
+	unsigned c1 = ctl + 4 + 0x764;
+	if (rd32(c1)) return;
+	unsigned n = rd32(mgr + 4), arr = rd32(mgr + 0xc);
+	if (n < 2) return;
+	unsigned h2 = rd32(arr + 4);
+	if (h2) *(DWORD *)(uintptr_t)c1 = h2;
+}
+
 // ---- host: snapshots ---------------------------------------------------------------------------
 
 // ---- host: inventory mirror -------------------------------------------------------------------
@@ -111,6 +132,7 @@ static void host_send_state(void)
 	if (now - last < 16)
 		return;
 	last = now;
+	attach_player2();
 	host_send_item();
 	unsigned hs[MAX_CH];
 	int n = world_humans(hs, MAX_CH);
@@ -791,6 +813,7 @@ static void frame_tick(void)
 		host_send_npcs();
 		host_send_progress(0);
 	} else {
+		attach_player2();
 		guest_apply_requests();
 		guest_apply_regions();
 		guest_apply_state();
