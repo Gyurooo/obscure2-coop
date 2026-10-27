@@ -1,11 +1,11 @@
 #!/bin/sh
 # One-command live test: start the host+guest copies on a DLL, put both in save 01 (I100), run checks, stop.
 # Usage (from the repo/worktree root, Git Bash):  sh tests/run_pair.sh <dll> [check_script.py ...]
-# Example: sh tests/run_pair.sh /c/Users/gyuro/AppData/Local/Temp/b3.dll check_party.py check_items.py
+# Example: sh tests/run_pair.sh <path to your built xinput1_3.dll> check_party.py check_items.py
 # Never leaves a game running: the stop step always runs. Prints each check's output verbatim.
 DLL=$(cygpath -w "$1"); shift
-export OBSCOOP_TEST_ROOT=/c/Users/gyuro/coop-anything-obscure/local OBSCOOP_DLL="$DLL"
-PY=/c/Users/gyuro/AppData/Local/Python/bin/python
+export OBSCOOP_TEST_ROOT="${OBSCOOP_TEST_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}" OBSCOOP_DLL="$DLL"
+PY="${PYTHON:-python}"
 cd "$(dirname "$0")" || exit 2
 $PY -I duo.py start | tail -1
 $PY -I duo_start_game.py | tail -1 | cut -c1-100

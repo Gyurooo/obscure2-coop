@@ -1,6 +1,6 @@
 """Start one copy into save 01: new 2P at the main menu, then pause -> Load a saved game -> slot 01 -> YES."""
 import sys, os, time, struct
-sys.path.insert(0, r'C:\Users\gyuro\coop-anything-obscure\local\runs')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bot, peek
 pid = int(sys.argv[1]); p = bot.Pipe(pid); m = peek.Proc(pid)
 def gobj():

@@ -1,6 +1,6 @@
 # HANDS_FINDINGS — the live (in-hand) weapon state and why the guest's hands are empty
 
-Research for TASK5. Decompile line numbers are in `C:\Users\gyuro\coop-anything-obscure\local\decomp2\Obscure2.exe.c`;
+Research for TASK5. Decompile line numbers are in `<test root>\decomp2\Obscure2.exe.c`;
 addresses are from `Obscure2.exe.functions.tsv` and from `i686-w64-mingw32-objdump -d` on the shipped
 `Obscure2.exe` (build 215294, image base 0x400000). Mod line numbers are `src/`.
 Labels: **OBSERVED** = visible in the decompile/disassembly/mod source; **DERIVED** = follows from the cited

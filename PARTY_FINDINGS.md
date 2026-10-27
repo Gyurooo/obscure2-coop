@@ -5,7 +5,7 @@ Labels: **OBSERVED** = directly visible in the decompile/mod source/save file/no
 from cited code but was not proven by a live read; **GUESS** = plausible, not proven; **UNKNOWN** = not
 determined here.
 
-Decompile line numbers are in `C:\Users\gyuro\coop-anything-obscure\local\decomp2\Obscure2.exe.c`; addresses
+Decompile line numbers are in `<test root>\decomp2\Obscure2.exe.c`; addresses
 are from `Obscure2.exe.functions.tsv`. Mod line numbers are in this repo.
 
 ---

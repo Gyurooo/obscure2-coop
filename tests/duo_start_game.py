@@ -4,7 +4,7 @@ Waits for the main menu (game+0x310 == 4), presses New game -> Two players, wait
 "2 player mode" notice (mode 2), confirms it, then waits until a level is up (mode 1, two humans)
 and skips the intro movie on both copies. Usage: python -I duo_start_game.py [timeout]"""
 import sys, os, time
-sys.path.insert(0, r'C:\Users\gyuro\coop-anything-obscure\local\runs')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bot, peek
 R = os.path.dirname(os.path.abspath(__file__))
 hp = int(open(R + r'\duo_host.pid').read()); gp = int(open(R + r'\duo_guest.pid').read())
