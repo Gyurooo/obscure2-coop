@@ -222,6 +222,7 @@ static void host_send_state(void)
 		memcpy(c->dir, (const void *)(uintptr_t)(hs[i] + H_DIR), sizeof c->dir);
 		c->s220 = rd32(hs[i] + 0x220);
 		c->s278 = rd32(hs[i] + 0x278);
+		c->anim = rd32(hs[i] + 0x2dc);
 		c->life = rd32(hs[i] + 0x320);
 	}
 	net_send(PKT_STATE, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
@@ -363,6 +364,7 @@ static void guest_apply_state(void)
 			if (IsBadWritePtr(pos, 12) || IsBadWritePtr(dir, 12))
 				break;
 			*(DWORD *)(uintptr_t)(hs[k] + 0x320) = st.ch[i].life;   // health from the host
+			*(DWORD *)(uintptr_t)(hs[k] + 0x2dc) = st.ch[i].anim;   // death/animation state from the host
 			// the error is measured against where this copy's character was at the snapshot's time
 			float ref[3] = { pos[0], pos[1], pos[2] };
 			int timed = g_clock_valid && hist_at(st.ch[i].tag, st.t_ms, ref);
@@ -729,11 +731,8 @@ static void guest_apply_requests(void)
 		if (!g)
 			continue;
 		r.name[sizeof r.name - 1] = 0;
-		// A load the guest already started itself (its menu gets the host's pad presses too) must not run twice.
-		if ((r.kind == REQ_LOAD_PROGRESS || r.kind == REQ_LOAD_NAME) && (rd32(g + 0x310) == 1 || rd32(g + 0x320) != 0)) {
-			logf("guest: host load request ignored (already in game or loading, mode %u state %u)", rd32(g + 0x310), rd32(g + 0x320));
-			continue;
-		}
+		// The host's load must apply even when the guest is already in its own game: this is what
+		// makes the guest load the host's save automatically and keeps parties/items in step.
 		g_apply_host_req = 1;
 		switch (r.kind) {
 		case REQ_LEVEL:

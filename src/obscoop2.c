@@ -655,7 +655,13 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			return ERROR_SUCCESS;
 		}
 		memset(state, 0, sizeof(xstate));
-		pad_read((DWORD)g_local_pad, state);
+		if (g_vpad_on[g_local_pad]) {
+			EnterCriticalSection(&g_vpad_cs);
+			memcpy(state, &g_vpad[g_local_pad], sizeof(xstate));
+			LeaveCriticalSection(&g_vpad_cs);
+		} else {
+			pad_read((DWORD)g_local_pad, state);
+		}
 		if (g_peer_ok && in_level)
 			drop_remote_start((xstate *)state);   // START pauses both copies; it must not open "player 2 is leaving"
 		return ERROR_SUCCESS;

@@ -24,7 +24,7 @@ enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 
 typedef struct { DWORD magic; BYTE type, version; WORD len; DWORD seq; } pkt_hdr;
 typedef struct { pkt_hdr h; DWORD t_ms; xstate pad; float yaw; DWORD yaw_valid; DWORD delay_ms; float rtt_ms; DWORD in_level; } pkt_pad;   // t_ms: host timeline stamp      // INPUT (guest -> host) and HOSTPAD (host -> guest)
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD host_ms; } pkt_ping;   // pong: host_ms = the host's clock when it answered
-typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; DWORD life; } ch_state;   // life = character+0x320
+typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; DWORD life; DWORD anim; } ch_state;   // anim = character+0x2dc (death/animation state)   // life = character+0x320
 #define MAX_CH 8
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; xstate hpad; float yaw; DWORD yaw_valid; ch_state ch[MAX_CH]; } pkt_state;
 typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; } pkt_req;
@@ -136,6 +136,12 @@ static void net_send(BYTE type, void *pkt, WORD payload)
 static int local_pad(int user, xstate *out)
 {
 	memset(out, 0, sizeof *out);
+	if (user >= 0 && user < 4 && g_vpad_on[user]) {   // tests and bots: the virtual pad is this PC's own pad
+		EnterCriticalSection(&g_vpad_cs);
+		memcpy(out, &g_vpad[user], sizeof *out);
+		LeaveCriticalSection(&g_vpad_cs);
+		return 1;
+	}
 	load_xinput();
 	return pad_read((DWORD)user, out) == ERROR_SUCCESS;
 }
