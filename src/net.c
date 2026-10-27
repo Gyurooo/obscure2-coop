@@ -45,6 +45,7 @@ static void guest_on_state(const char *buf, int n);
 static void guest_on_item(const char *buf, int n);
 static void guest_on_save(const char *buf, int n);
 static void host_on_save_ack(const char *buf, int n);
+static void host_save_begin(void);
 static void guest_on_req(const char *buf, int n);
 static void guest_on_npc(const char *buf, int n);
 static void guest_on_region(const char *buf, int n);
@@ -208,6 +209,7 @@ static void net_handle(const char *buf, int n, sid_t from)
 		switch (h->type) {
 		case PKT_HELLO: {
 			pkt_hdr w;
+			host_save_begin();   // (re)send every save file to this guest
 			net_send(PKT_WELCOME, &w, 0);
 			break;
 		}
@@ -237,6 +239,9 @@ static void net_handle(const char *buf, int n, sid_t from)
 		case PKT_BYE:
 			host_drop_guest("bye");
 			break;
+		case PKT_SAVE_ACK:
+			host_on_save_ack(buf, n);
+			break;
 		}
 	} else if (g_role == 2) {
 		if (!g_peer_ok) {
@@ -265,8 +270,6 @@ static void net_handle(const char *buf, int n, sid_t from)
 			}
 		} else if (h->type == PKT_SAVE) {
 		guest_on_save(buf, n);
-	} else if (h->type == PKT_SAVE_ACK) {
-		host_on_save_ack(buf, n);
 	} else if (h->type == PKT_ITEM) {
 		guest_on_item(buf, n);
 	} else if (h->type == PKT_STATE) {

@@ -85,9 +85,13 @@ static void attach_player2(void)
 
 // ---- save-file transfer (host -> guest) --------------------------------------------------------
 // The guest starts from the host's campaign save: the host sends Save\game0..9.sav in 512-byte
-// chunks; the guest writes them and acks each chunk; a lost chunk is retried after 250 ms.
-static DWORD g_save_file, g_save_off, g_save_sent, g_save_wait, g_save_len;
-static int g_save_active;
+// chunks; the guest writes them and acks each chunk; a chunk that is not acked is retransmitted
+// after 250 ms. The ack arrives on the network thread while the frame thread sends, so all of the
+// transfer state is guarded by g_save_cs.
+#define SAVE_RETRY_MS 250
+static CRITICAL_SECTION g_save_cs;
+static DWORD g_save_file, g_save_off, g_save_len, g_save_waiting;
+static int g_save_active, g_save_pending;
 
 static void save_path(char *out, size_t n, const char *name)
 {
@@ -98,44 +102,109 @@ static void save_path(char *out, size_t n, const char *name)
 	_snprintf(out, n, "%s\\Save\\%s", exe, name);
 }
 
+// Host: send all of the saves again from the first file. Called from the welcome path, so a guest
+// that reconnects (or missed chunks) gets a clean transfer.
+static void host_save_begin(void)
+{
+	EnterCriticalSection(&g_save_cs);
+	g_save_active = 1;
+	g_save_file = 0;
+	g_save_off = 0;
+	g_save_len = 0;
+	g_save_pending = 0;
+	g_save_waiting = 0;
+	LeaveCriticalSection(&g_save_cs);
+}
+
 static void host_send_saves(void)
 {
-	if (!g_peer_ok) { g_save_active = 0; return; }
-	if (!g_save_active) { g_save_active = 1; g_save_file = 0; g_save_off = 0; g_save_sent = 0; g_save_wait = 0; }
-	if (g_save_file > 9) { g_save_active = 0; return; }
+	EnterCriticalSection(&g_save_cs);
+	if (!g_peer_ok) {   // the guest is gone; the next welcome starts the transfer again
+		g_save_active = 0;
+		g_save_pending = 0;
+		LeaveCriticalSection(&g_save_cs);
+		return;
+	}
+	if (!g_save_active) {
+		LeaveCriticalSection(&g_save_cs);
+		return;
+	}
+	if (g_save_file > 9) {   // everything was acked (or skipped); wait for the next welcome
+		g_save_active = 0;
+		g_save_pending = 0;
+		LeaveCriticalSection(&g_save_cs);
+		return;
+	}
 	DWORD now = GetTickCount();
-	if (g_save_wait && now - g_save_wait < 250) return;
-	if (g_save_sent != g_save_off) return;   // waiting for the ack
-	char name[32]; _snprintf(name, sizeof name, "game%u.sav", (unsigned)g_save_file);
+	if (g_save_pending && now - g_save_waiting < SAVE_RETRY_MS) {   // in flight: give the ack its 250 ms
+		LeaveCriticalSection(&g_save_cs);
+		return;
+	}
+	DWORD file = g_save_file, off = g_save_off;   // an unacked chunk is retransmitted as it is: off stays put
+	LeaveCriticalSection(&g_save_cs);
+	char name[32]; _snprintf(name, sizeof name, "game%u.sav", (unsigned)file);
 	char path[MAX_PATH]; save_path(path, sizeof path, name);
 	HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-	if (f == INVALID_HANDLE_VALUE) { g_save_file++; g_save_off = 0; g_save_sent = 0; g_save_wait = 0; return; }
+	if (f == INVALID_HANDLE_VALUE) {   // no such save on this host: skip it
+		EnterCriticalSection(&g_save_cs);
+		if (g_save_active && g_save_file == file && g_save_off == off) {
+			g_save_file++;
+			g_save_off = 0;
+			g_save_len = 0;
+			g_save_pending = 0;
+		}
+		LeaveCriticalSection(&g_save_cs);
+		return;
+	}
 	pkt_save p; memset(&p, 0, sizeof p);
 	_snprintf(p.name, sizeof p.name, "%s", name);
-	p.off = g_save_off;
-	SetFilePointer(f, g_save_off, NULL, FILE_BEGIN);
+	p.off = off;
+	SetFilePointer(f, off, NULL, FILE_BEGIN);
 	DWORD got = 0; ReadFile(f, p.data, SAVE_CHUNK, &got, NULL); CloseHandle(f);
-	p.len = got; g_save_len = got;
-	net_send(PKT_SAVE, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
-	g_save_wait = now; g_save_sent = g_save_off;
+	p.len = got;
+	EnterCriticalSection(&g_save_cs);
+	// Mark the chunk in flight BEFORE sending it: a loopback ack can come back before sendto()
+	// returns, and it must not be overwritten by the state update that follows the send.
+	int send = g_save_active && g_save_file == file && g_save_off == off;
+	if (send) {
+		g_save_len = got;
+		g_save_pending = 1;
+		g_save_waiting = now;
+	}
+	LeaveCriticalSection(&g_save_cs);
+	if (send)
+		net_send(PKT_SAVE, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
 }
 
 static void host_on_save_ack(const char *buf, int n)
 {
-	if (n < (int)(sizeof(pkt_save_ack) - sizeof(((pkt_save_ack *)0)->name))) return;
+	if (n != (int)sizeof(pkt_save_ack)) return;
 	const pkt_save_ack *a = (const pkt_save_ack *)buf;
-	if (!g_save_active || g_save_file > 9) return;
+	char acked[sizeof a->name + 1];
+	memcpy(acked, a->name, sizeof a->name);
+	acked[sizeof a->name] = 0;
+	EnterCriticalSection(&g_save_cs);
 	char name[32]; _snprintf(name, sizeof name, "game%u.sav", (unsigned)g_save_file);
-	if (strcmp(a->name, name) || a->off != g_save_off) return;
-	g_save_off += g_save_len;
-	if (g_save_len < SAVE_CHUNK) { g_save_file++; g_save_off = 0; }
-	g_save_sent = g_save_off; g_save_wait = 0;
+	// Only the ack for the chunk that is actually in flight advances the transfer; a stale or
+	// duplicated ack (wrong file or offset) is ignored.
+	if (g_save_active && g_save_pending && g_save_file <= 9 && a->off == g_save_off && !strcmp(acked, name)) {
+		g_save_off += g_save_len;
+		if (g_save_len < SAVE_CHUNK) {   // short (or empty) chunk: this file is done
+			g_save_file++;
+			g_save_off = 0;
+		}
+		g_save_len = 0;
+		g_save_pending = 0;
+		g_save_waiting = 0;
+	}
+	LeaveCriticalSection(&g_save_cs);
 }
 
 static void guest_on_save(const char *buf, int n)
 {
-	if (n < (int)(sizeof(pkt_save) - sizeof(((pkt_save *)0)->data))) return;
+	if (n != (int)sizeof(pkt_save)) return;   // a short packet must not make us read past data[]
 	const pkt_save *p = (const pkt_save *)buf;
+	if (!memchr(p->name, 0, sizeof p->name)) return;
 	if (strncmp(p->name, "game", 4) || strstr(p->name, "..") || p->len > SAVE_CHUNK) return;
 	char path[MAX_PATH]; save_path(path, sizeof path, p->name);
 	char dir[MAX_PATH]; _snprintf(dir, sizeof dir, "%s", path);
@@ -145,6 +214,7 @@ static void guest_on_save(const char *buf, int n)
 	if (f == INVALID_HANDLE_VALUE) return;
 	SetFilePointer(f, p->off, NULL, FILE_BEGIN);
 	DWORD wrote = 0; WriteFile(f, p->data, p->len, &wrote, NULL); CloseHandle(f);
+	if (wrote != p->len) return;   // not acked: the host retransmits this chunk
 	pkt_save_ack a; memset(&a, 0, sizeof a);
 	_snprintf(a.name, sizeof a.name, "%s", p->name);
 	a.off = p->off;
@@ -834,6 +904,7 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_reg_cs);
 	InitializeCriticalSection(&g_rx_cs);
 	InitializeCriticalSection(&g_req_cs);
+	InitializeCriticalSection(&g_save_cs);
 }
 
 static void frame_tick(void)
