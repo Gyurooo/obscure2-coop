@@ -148,6 +148,7 @@ static int __fastcall hk_party_table(void *game, void *edx, int flag, unsigned l
 // player keeps control of their own character; the character update recomputes them every frame.
 typedef void(__fastcall *input_update_t)(void *, void *, int);
 static input_update_t g_input_update;
+static void guest_weapons_frame(void);   // sync.c: the guest's held weapons, applied in the game's own update
 
 static void __fastcall hk_input_update(void *self, void *edx, int dt)
 {
@@ -156,6 +157,7 @@ static void __fastcall hk_input_update(void *self, void *edx, int dt)
 		*(unsigned *)(uintptr_t)(ch + 0x880) = 0;
 		*(unsigned *)(uintptr_t)(ch + 0x884) = 0;
 	}
+	guest_weapons_frame();
 	if (g_input_update)
 		g_input_update(self, edx, dt);
 }

@@ -14,8 +14,9 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 4   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 5   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
+                        // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
@@ -24,7 +25,7 @@ enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 
 typedef struct { DWORD magic; BYTE type, version; WORD len; DWORD seq; } pkt_hdr;
 typedef struct { pkt_hdr h; DWORD t_ms; xstate pad; float yaw; DWORD yaw_valid; DWORD delay_ms; float rtt_ms; DWORD in_level; } pkt_pad;   // t_ms: host timeline stamp      // INPUT (guest -> host) and HOSTPAD (host -> guest)
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD host_ms; } pkt_ping;   // pong: host_ms = the host's clock when it answered
-typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; DWORD life; DWORD anim; } ch_state;   // anim = character+0x2dc (death/animation state)   // life = character+0x320
+typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; DWORD life; DWORD anim; DWORD wep[4]; DWORD wcur; } ch_state;   // anim = character+0x2dc (death/animation state)   // life = character+0x320   // wep = the tags in the 4 live weapon slots (character+0x704 + i*4 -> weapon+0x10), wcur = character+0x714
 #define MAX_CH 8
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; xstate hpad; float yaw; DWORD yaw_valid; ch_state ch[MAX_CH]; } pkt_state;
 typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; } pkt_req;

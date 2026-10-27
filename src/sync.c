@@ -294,6 +294,11 @@ static void host_send_state(void)
 		c->s278 = rd32(hs[i] + 0x278);
 		c->anim = rd32(hs[i] + 0x2dc);
 		c->life = rd32(hs[i] + 0x320);
+		for (int s = 0; s < 4; s++) {
+			unsigned wp = rd32(hs[i] + 0x704 + 4 * s);   // the live weapon object in slot s
+			c->wep[s] = wp ? rd32(wp + 0x10) : 0;        // its tag, 0 = empty slot
+		}
+		c->wcur = rd32(hs[i] + 0x714);                   // the slot in the hand
 	}
 	net_send(PKT_STATE, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
 	InterlockedIncrement(&g_snd_states);
@@ -407,6 +412,165 @@ static int hist_at(DWORD tag, DWORD t, float *out)
 	return 0;
 }
 
+// ---- guest: the weapons in the characters' hands --------------------------------------------------
+// The live weapon state is on the character itself: +0x704 + i*4 is the object in slot i (the object
+// carries its 4-character tag at +0x10, 0 = empty slot) and +0x714 is the slot in the hand. None of it is
+// in the 0x140-byte record block, so the host sends the four tags per character in ch_state and the guest
+// makes its hands match with the game's own functions (HANDS_FINDINGS.md section 2):
+//   0x4b0980  __stdcall(tag) -> the world entity carrying a weapon tag
+//   0x45cdd0  entity factory, ECX = *(world+0x1768): constructs the class for a tag
+//   0x4b0300  ECX = inventory entry, fills the entity from the entry (tag, id, ammo) - what the inventory
+//             pass (FUN_004b05a0) does right after the factory
+//   0x5544c0  ECX = *(world+0x1768)+0x18, takes the entity: registers it in the world's entity list
+//   0x4dc870  the game's equip, ECX = human, takes (weapon object, slot): owner, slot, selected index, show
+// The apply runs in the input-update hook (the game's own update), not in the Present hook: the factory
+// loads weapon assets, and doing that inside Present stopped the guest dead in the first live attempt.
+typedef unsigned(__stdcall *find_weapon_t)(unsigned tag);
+typedef void *(__fastcall *new_weapon_t)(void *mgr, void *edx, unsigned tag);
+typedef void(__fastcall *fill_weapon_t)(void *entry, void *edx, void *ent);
+typedef void(__fastcall *list_weapon_t)(void *list, void *edx, void *ent);
+typedef void(__fastcall *ent_call1_t)(void *ent, void *edx, int arg);
+typedef int(__fastcall *equip_weapon_t)(void *human, void *edx, void *weapon, int slot);
+
+static int code_ok(unsigned addr, const BYTE *prologue, int len)
+{
+	return mem_ok((const void *)(uintptr_t)addr, len) && !memcmp((const void *)(uintptr_t)addr, prologue, len);
+}
+
+// A character's weapon object in the world, found or built the way the game's inventory pass builds it.
+static unsigned weapon_object(unsigned tag)
+{
+	static const BYTE p_find[6] = { 0x55, 0x8b, 0xec, 0xa1, 0x68, 0x30 };
+	static const BYTE p_new[6] = { 0x55, 0x8b, 0xec, 0x6a, 0xff, 0x68 };
+	static const BYTE p_fill[6] = { 0x55, 0x8b, 0xec, 0x8b, 0x01, 0x8b };
+	static const BYTE p_add[6] = { 0x55, 0x8b, 0xec, 0x56, 0x57, 0x8b };
+	char t[5];
+	if (!code_ok(0x4b0980, p_find, 6) || !code_ok(0x45cdd0, p_new, 6) ||
+	    !code_ok(0x4b0300, p_fill, 6) || !code_ok(0x5544c0, p_add, 6))
+		return 0;
+	unsigned obj = ((find_weapon_t)0x4b0980)(tag);
+	if (obj)
+		return obj;
+	unsigned w = world_obj(), mgr = w ? rd32(w + 0x1768) : 0, inv = w ? rd32(w + 0x1790) : 0;
+	if (!mgr || !inv)
+		return 0;
+	unsigned n = rd32(inv + 4), entry = 0;
+	if (n > 64)
+		n = 64;
+	for (unsigned i = 0; i < n && !entry; i++)
+		if (rd32(inv + 8 + i * 0x20 + 4) == tag)          // entry: +0 flags, +4 tag, +0xc ammo
+			entry = inv + 8 + i * 0x20;
+	if (!entry) {
+		logf("guest: weapon %s has no object and no inventory entry", tag4(tag, t));
+		return 0;
+	}
+	obj = (unsigned)(uintptr_t)((new_weapon_t)0x45cdd0)((void *)(uintptr_t)mgr, NULL, tag);
+	if (!obj || IsBadWritePtr((void *)(uintptr_t)obj, 0x120)) {
+		logf("guest: could not make weapon %s", tag4(tag, t));
+		return 0;
+	}
+	unsigned vt = rd32(obj);
+	unsigned v8 = vt ? rd32(vt + 8) : 0, v84 = vt ? rd32(vt + 0x84) : 0;
+	if (!v8 || !v84 || IsBadReadPtr((const void *)(uintptr_t)v8, 1) || IsBadReadPtr((const void *)(uintptr_t)v84, 1)) {
+		logf("guest: weapon %s has no usable vtable", tag4(tag, t));
+		return 0;
+	}
+	*(DWORD *)(uintptr_t)(obj + 0x28) = 0;
+	((ent_call1_t)v8)((void *)(uintptr_t)obj, NULL, 0);                  // the game's vtable+8(0)
+	((fill_weapon_t)0x4b0300)((void *)(uintptr_t)entry, NULL, (void *)(uintptr_t)obj);   // tag, id, ammo from the inventory
+	((ent_call1_t)v84)((void *)(uintptr_t)obj, NULL, 0);                 // the game's vtable+0x84(0)
+	*(DWORD *)(uintptr_t)(obj + 0xa8) = 1;
+	((list_weapon_t)0x5544c0)((void *)(uintptr_t)(mgr + 0x18), NULL, (void *)(uintptr_t)obj);   // register it
+	logf("guest: made weapon %s (object %p) from the inventory entry", tag4(tag, t), (void *)(uintptr_t)obj);
+	return obj;
+}
+
+static unsigned g_wep_seen[MAX_CH][4], g_wep_seen_cur[MAX_CH];   // guest: what the last apply reported
+static DWORD g_wep_at[MAX_CH][4];                                // guest: and when, to retry a failure later
+
+// Makes one character's four live slots and the selected slot match the host's.
+static void weapons_for(int k, unsigned h, const ch_state *c)
+{
+	static const BYTE p_equip[6] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x0c };
+	unsigned got[4];
+	int same = 1;
+	if (IsBadReadPtr((const void *)(uintptr_t)h, 0x718))
+		return;
+	for (int s = 0; s < 4; s++) {
+		unsigned wp = rd32(h + 0x704 + 4 * s);
+		got[s] = wp ? rd32(wp + 0x10) : 0;
+		if (got[s] != c->wep[s])
+			same = 0;
+	}
+	if (same && (c->wcur >= 4 || rd32(h + 0x714) == c->wcur))
+		return;   // already like the host
+	char t1[5], t2[5];
+	DWORD now = GetTickCount();
+	for (int s = 0; s < 4; s++) {
+		unsigned want = c->wep[s];
+		if (!want || want == got[s])
+			continue;   // only fill a gap; a slot the host has empty is left alone
+		if (g_wep_seen[k][s] == want && (LONG)(now - g_wep_at[k][s]) < 5000)
+			continue;   // tried this one just now
+		g_wep_seen[k][s] = want;
+		g_wep_at[k][s] = now;
+		unsigned obj = weapon_object(want);
+		if (!obj) {
+			logf("guest: %s slot %d needs weapon %s, none in this world", tag4(rd32(h + H_TAG), t1), s, tag4(want, t2));
+			continue;
+		}
+		if (!code_ok(0x4dc870, p_equip, 6))
+			return;
+		if (!((equip_weapon_t)0x4dc870)((void *)(uintptr_t)h, NULL, (void *)(uintptr_t)obj, s)) {
+			logf("guest: %s slot %d weapon %s refused by the game (object %p)", tag4(rd32(h + H_TAG), t1), s,
+				tag4(want, t2), (void *)(uintptr_t)obj);
+			continue;
+		}
+		logf("guest: %s slot %d = weapon %s (object %p)", tag4(rd32(h + H_TAG), t1), s, tag4(want, t2),
+			(void *)(uintptr_t)obj);
+	}
+	// Put the host's weapon in the hand and show it, exactly as the game does after restoring a save
+	// (FUN_004f1b80: +0x714 = record+0x24, then the weapon's vtable+0xcc).
+	if (c->wcur < 4 && rd32(h + 0x714) != c->wcur) {
+		unsigned wp = rd32(h + 0x704 + 4 * c->wcur);
+		unsigned vt = wp ? rd32(wp) : 0, show = vt ? rd32(vt + 0xcc) : 0;
+		if (wp && show && !IsBadReadPtr((const void *)(uintptr_t)show, 1)) {
+			*(DWORD *)(uintptr_t)(h + 0x714) = c->wcur;
+			if (g_wep_seen_cur[k] != c->wcur) {
+				g_wep_seen_cur[k] = c->wcur;
+				logf("guest: %s holds weapon %s (slot %d)", tag4(rd32(h + H_TAG), t1), tag4(c->wep[c->wcur], t2), c->wcur);
+			}
+			((void(__fastcall *)(void *, void *))show)((void *)(uintptr_t)wp, NULL);   // draw it
+		}
+	}
+}
+
+// guest: the snapshot loop asks for a hands sync; the input-update hook (the game's own update) does it.
+static LONG g_weap_pending;
+static ch_state g_weap_want[MAX_CH];
+static int g_weap_want_n;
+static int g_weap_said;
+
+static void guest_weapons_frame(void)
+{
+	if (g_role != 2 || !g_weap_pending)
+		return;
+	g_weap_pending = 0;
+	unsigned g = game_obj();
+	if (!g || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0)
+		return;   // not in game or a request is pending
+	unsigned hs[MAX_CH];
+	int n = world_humans(hs, MAX_CH), wn = g_weap_want_n > MAX_CH ? MAX_CH : g_weap_want_n;
+	for (int i = 0; i < wn; i++) {
+		for (int k = 0; k < n; k++) {
+			if (rd32(hs[k] + H_TAG) != g_weap_want[i].tag)
+				continue;
+			weapons_for(k, hs[k], &g_weap_want[i]);
+			break;
+		}
+	}
+}
+
 // Writes the host's position and facing into the guest's copy of a character. The character this PC
 // controls (player 2) keeps its own movement unless it is far off; the host's player 1 is pulled in.
 static void guest_apply_state(void)
@@ -479,6 +643,14 @@ static void guest_apply_state(void)
 			InterlockedIncrement(&g_applied);
 			break;
 		}
+	}
+	// The hands are synced in the game's own input update, not here in Present (see weapons_for).
+	{
+		int wn = (int)st.n > MAX_CH ? MAX_CH : (int)st.n;
+		for (int i = 0; i < wn; i++)
+			g_weap_want[i] = st.ch[i];
+		g_weap_want_n = wn;
+		g_weap_pending = 1;
 	}
 }
 
