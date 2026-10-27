@@ -86,12 +86,18 @@ static void attach_player2(void)
 // ---- save-file transfer (host -> guest) --------------------------------------------------------
 // The guest starts from the host's campaign save: the host sends Save\game0..9.sav in 512-byte
 // chunks; the guest writes them and acks each chunk; a chunk that is not acked is retransmitted
-// after 250 ms. The ack arrives on the network thread while the frame thread sends, so all of the
-// transfer state is guarded by g_save_cs.
+// after 250 ms. Several chunks are in flight at once (SAVE_WINDOW): stop-and-wait moved one chunk
+// per round trip, so 400 KB took 150 s over a 60 ms relay link and never finished inside the test.
+// The ack arrives on the network thread while the frame thread sends, so all of the transfer state
+// is guarded by g_save_cs.
 #define SAVE_RETRY_MS 250
+#define SAVE_WINDOW 16
+typedef struct { DWORD off, len, sent_at; int sent, acked; BYTE data[SAVE_CHUNK]; } save_chunk;
 static CRITICAL_SECTION g_save_cs;
-static DWORD g_save_file, g_save_off, g_save_len, g_save_waiting;
-static int g_save_active, g_save_pending;
+static DWORD g_save_file, g_save_next;   // the file being sent and the next offset to read
+static int g_save_eof;                   // the file's last (short or empty) chunk has been queued
+static int g_save_active, g_save_n;      // transfer running; chunks in the window, in send order
+static save_chunk g_save_win[SAVE_WINDOW];
 
 static void save_path(char *out, size_t n, const char *name)
 {
@@ -109,71 +115,86 @@ static void host_save_begin(void)
 	EnterCriticalSection(&g_save_cs);
 	g_save_active = 1;
 	g_save_file = 0;
-	g_save_off = 0;
-	g_save_len = 0;
-	g_save_pending = 0;
-	g_save_waiting = 0;
+	g_save_next = 0;
+	g_save_eof = 0;
+	g_save_n = 0;
 	LeaveCriticalSection(&g_save_cs);
 }
 
 static void host_send_saves(void)
 {
 	EnterCriticalSection(&g_save_cs);
-	if (!g_peer_ok) {   // the guest is gone; the next welcome starts the transfer again
+	if (!g_peer_ok || !g_save_active) {   // the guest is gone; the next welcome starts the transfer again
 		g_save_active = 0;
-		g_save_pending = 0;
-		LeaveCriticalSection(&g_save_cs);
-		return;
-	}
-	if (!g_save_active) {
+		g_save_n = 0;
 		LeaveCriticalSection(&g_save_cs);
 		return;
 	}
 	if (g_save_file > 9) {   // everything was acked (or skipped); wait for the next welcome
 		g_save_active = 0;
-		g_save_pending = 0;
+		g_save_n = 0;
 		LeaveCriticalSection(&g_save_cs);
 		return;
 	}
 	DWORD now = GetTickCount();
-	if (g_save_pending && now - g_save_waiting < SAVE_RETRY_MS) {   // in flight: give the ack its 250 ms
-		LeaveCriticalSection(&g_save_cs);
-		return;
-	}
-	DWORD file = g_save_file, off = g_save_off;   // an unacked chunk is retransmitted as it is: off stays put
-	LeaveCriticalSection(&g_save_cs);
-	char name[32]; _snprintf(name, sizeof name, "game%u.sav", (unsigned)file);
-	char path[MAX_PATH]; save_path(path, sizeof path, name);
-	HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-	if (f == INVALID_HANDLE_VALUE) {   // no such save on this host: skip it
-		EnterCriticalSection(&g_save_cs);
-		if (g_save_active && g_save_file == file && g_save_off == off) {
+	// Advance over every chunk at the head that was acked. The file is done when a chunk shorter than
+	// SAVE_CHUNK (its last one, possibly empty) has been acked.
+	while (g_save_n > 0 && g_save_win[0].acked) {
+		int end = g_save_win[0].len < SAVE_CHUNK;
+		memmove(&g_save_win[0], &g_save_win[1], sizeof g_save_win[0] * (g_save_n - 1));
+		g_save_n--;
+		if (end) {
 			g_save_file++;
-			g_save_off = 0;
-			g_save_len = 0;
-			g_save_pending = 0;
+			g_save_next = 0;
+			g_save_eof = 0;
+			g_save_n = 0;
 		}
-		LeaveCriticalSection(&g_save_cs);
-		return;
 	}
-	pkt_save p; memset(&p, 0, sizeof p);
-	_snprintf(p.name, sizeof p.name, "%s", name);
-	p.off = off;
-	SetFilePointer(f, off, NULL, FILE_BEGIN);
-	DWORD got = 0; ReadFile(f, p.data, SAVE_CHUNK, &got, NULL); CloseHandle(f);
-	p.len = got;
-	EnterCriticalSection(&g_save_cs);
-	// Mark the chunk in flight BEFORE sending it: a loopback ack can come back before sendto()
-	// returns, and it must not be overwritten by the state update that follows the send.
-	int send = g_save_active && g_save_file == file && g_save_off == off;
-	if (send) {
-		g_save_len = got;
-		g_save_pending = 1;
-		g_save_waiting = now;
+	while (g_save_n < SAVE_WINDOW && g_save_file <= 9 && !g_save_eof) {
+		char name[32]; _snprintf(name, sizeof name, "game%u.sav", (unsigned)g_save_file);
+		char path[MAX_PATH]; save_path(path, sizeof path, name);
+		HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+		if (f == INVALID_HANDLE_VALUE) {
+			if (g_save_n > 0)   // a file cannot vanish in the middle of its window; try again next frame
+				break;
+			g_save_file++;      // no such save on this host: skip it
+			g_save_next = 0;
+			g_save_eof = 0;
+			continue;
+		}
+		save_chunk *c = &g_save_win[g_save_n];
+		DWORD got = 0;
+		SetFilePointer(f, g_save_next, NULL, FILE_BEGIN);
+		ReadFile(f, c->data, SAVE_CHUNK, &got, NULL);
+		CloseHandle(f);
+		c->off = g_save_next;
+		c->len = got;
+		c->sent = 0;
+		c->acked = 0;
+		g_save_next += got;
+		// A short read is the file's last chunk; a 0-byte chunk at an exact multiple of SAVE_CHUNK says
+		// "end of file" so its ack completes the file.
+		if (got < SAVE_CHUNK)
+			g_save_eof = 1;
+		g_save_n++;
+	}
+	// Send what was never sent; retransmit the rest when its 250 ms are up. The slot exists before the
+	// send, so an ack that comes back before sendto() returns cannot be lost.
+	for (int i = 0; i < g_save_n; i++) {
+		save_chunk *c = &g_save_win[i];
+		if (c->acked || (c->sent && now - c->sent_at < SAVE_RETRY_MS))
+			continue;
+		pkt_save p; memset(&p, 0, sizeof p);
+		_snprintf(p.name, sizeof p.name, "game%u.sav", (unsigned)g_save_file);
+		p.off = c->off;
+		p.len = c->len;
+		if (c->len)
+			memcpy(p.data, c->data, c->len);
+		c->sent = 1;
+		c->sent_at = now;
+		net_send(PKT_SAVE, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
 	}
 	LeaveCriticalSection(&g_save_cs);
-	if (send)
-		net_send(PKT_SAVE, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
 }
 
 static void host_on_save_ack(const char *buf, int n)
@@ -184,18 +205,15 @@ static void host_on_save_ack(const char *buf, int n)
 	memcpy(acked, a->name, sizeof a->name);
 	acked[sizeof a->name] = 0;
 	EnterCriticalSection(&g_save_cs);
-	char name[32]; _snprintf(name, sizeof name, "game%u.sav", (unsigned)g_save_file);
-	// Only the ack for the chunk that is actually in flight advances the transfer; a stale or
-	// duplicated ack (wrong file or offset) is ignored.
-	if (g_save_active && g_save_pending && g_save_file <= 9 && a->off == g_save_off && !strcmp(acked, name)) {
-		g_save_off += g_save_len;
-		if (g_save_len < SAVE_CHUNK) {   // short (or empty) chunk: this file is done
-			g_save_file++;
-			g_save_off = 0;
-		}
-		g_save_len = 0;
-		g_save_pending = 0;
-		g_save_waiting = 0;
+	// Mark the chunk it acknowledges; a stale or duplicated ack (wrong file or offset) is ignored.
+	if (g_save_active && g_save_file <= 9) {
+		char name[32]; _snprintf(name, sizeof name, "game%u.sav", (unsigned)g_save_file);
+		if (!strcmp(acked, name))
+			for (int i = 0; i < g_save_n; i++)
+				if (g_save_win[i].off == a->off && !g_save_win[i].acked) {
+					g_save_win[i].acked = 1;
+					break;
+				}
 	}
 	LeaveCriticalSection(&g_save_cs);
 }
@@ -947,6 +965,40 @@ static void guest_apply_regions(void)
 
 // Host: the level can also change without a ChangeLevel request (loading a save, a new game). Announce those too,
 // with the arrival door id of the character that player 1's controller record names.
+// PKT_REQ is one datagram with no ack: a lost level request would leave the guest in the old level for good, so
+// a request is repeated every 250 ms for 1.5 s (the guest drops the duplicates) and each repeat is preceded by
+// the progress block the party table arrives in.
+#define REQ_REPEAT_MS 250
+#define REQ_REPEAT_FOR 1500
+static DWORD g_req_rep_until, g_req_rep_at, g_req_rep_level, g_req_rep_entry, g_req_rep_flag;
+
+static void host_level_request_repeat(unsigned level, unsigned entry, unsigned flag)
+{
+	DWORD now = GetTickCount();
+	g_req_rep_level = level;
+	g_req_rep_entry = entry;
+	g_req_rep_flag = flag;
+	g_req_rep_until = now + REQ_REPEAT_FOR;
+	g_req_rep_at = now;
+}
+
+static void host_repeat_tick(void)
+{
+	if (!g_peer_ok || !g_req_rep_until)
+		return;
+	DWORD now = GetTickCount();
+	if ((LONG)(now - g_req_rep_until) >= 0) {   // the repeat window is over
+		g_req_rep_until = 0;
+		return;
+	}
+	if (now - g_req_rep_at < REQ_REPEAT_MS)
+		return;
+	g_req_rep_at = now;
+	host_send_progress(1);   // the party table must reach the guest before the level change it belongs to
+	net_send_req(REQ_LEVEL, g_req_rep_level, g_req_rep_entry, g_req_rep_flag, NULL);
+	InterlockedIncrement(&g_req_sent);
+}
+
 static volatile LONG g_watch_sent;
 static void host_watch_level(void)
 {
@@ -980,6 +1032,7 @@ static void host_watch_level(void)
 		host_send_progress(1);   // the party table must reach the guest before the level change it belongs to
 		net_send_req(REQ_LEVEL, lvl, entry, 1, NULL);
 		InterlockedIncrement(&g_req_sent);
+		host_level_request_repeat(lvl, entry, 1);
 		InterlockedIncrement(&g_watch_sent);
 	}
 }
@@ -992,8 +1045,11 @@ static void host_welcome_guest(void)
 	// The friend starts their own "New game, Two players" first (that choice decides who controls player 2); the
 	// level request waits on the guest until its world exists.
 	host_send_progress(1);   // the party table has to reach the guest before the level request
-	if (g_last_level)
+	if (g_last_level) {
 		net_send_req(REQ_LEVEL, g_last_level, g_last_entry, g_last_flag, NULL);
+		InterlockedIncrement(&g_req_sent);
+		host_level_request_repeat(g_last_level, g_last_entry, g_last_flag);
+	}
 }
 
 // ---- guest: requests from the host -------------------------------------------------------------
@@ -1001,12 +1057,29 @@ static void host_welcome_guest(void)
 static CRITICAL_SECTION g_req_cs;
 static pkt_req g_req_q[8];
 static int g_req_head, g_req_tail;
+static DWORD g_lvl_req_done_a, g_lvl_req_done_b, g_lvl_req_done_at;   // the last level request this copy applied
 
 static void guest_on_req(const char *buf, int n)
 {
 	if (n != (int)sizeof(pkt_req))
 		return;
+	const pkt_req *r = (const pkt_req *)buf;
 	EnterCriticalSection(&g_req_cs);
+	if (r->kind == REQ_LEVEL) {
+		// The host repeats a level request because PKT_REQ is not reliable: skip the copies (one already
+		// waiting in the queue, or one applied a moment ago) so the guest changes level once.
+		DWORD now = GetTickCount();
+		if (g_lvl_req_done_at && r->a == g_lvl_req_done_a && r->b == g_lvl_req_done_b &&
+		    now - g_lvl_req_done_at < 2500) {
+			LeaveCriticalSection(&g_req_cs);
+			return;
+		}
+		for (int i = g_req_head; i != g_req_tail; i = (i + 1) & 7)
+			if (g_req_q[i].kind == REQ_LEVEL && g_req_q[i].a == r->a && g_req_q[i].b == r->b) {
+				LeaveCriticalSection(&g_req_cs);
+				return;
+			}
+	}
 	if (((g_req_tail + 1) & 7) != g_req_head) {
 		memcpy(&g_req_q[g_req_tail], buf, sizeof(pkt_req));
 		g_req_tail = (g_req_tail + 1) & 7;
@@ -1033,6 +1106,11 @@ static void guest_apply_requests(void)
 			}
 		}
 		g_req_head = (g_req_head + 1) & 7;
+		if (r.kind == REQ_LEVEL) {   // remember it: the host's repeats of this one are dropped
+			g_lvl_req_done_a = r.a;
+			g_lvl_req_done_b = r.b;
+			g_lvl_req_done_at = GetTickCount();
+		}
 		LeaveCriticalSection(&g_req_cs);
 		unsigned g = game_obj();
 		if (!g)
@@ -1184,6 +1262,7 @@ static void frame_tick(void)
 			host_welcome_guest();
 		}
 		host_watch_level();
+		host_repeat_tick();
 		host_send_saves();
 		host_send_state();
 		host_send_npcs();

@@ -55,6 +55,7 @@ static req3_t g_change_level;
 static req1_t g_load_progress, g_load_name;
 static req0_t g_to_menu;
 static party_t g_party_table;
+static void host_level_request_repeat(unsigned level, unsigned entry, unsigned flag);   // sync.c
 
 static void __fastcall hk_change_level(void *game, void *edx, unsigned level, unsigned entry, unsigned flag)
 {
@@ -76,6 +77,7 @@ static void __fastcall hk_change_level(void *game, void *edx, unsigned level, un
 	if (g_role == 1 && !g_apply_host_req && g_peer_ok) {
 		net_send_req(REQ_LEVEL, level, entry, flag, NULL);
 		InterlockedIncrement(&g_req_sent);
+		host_level_request_repeat(level, entry, flag);   // PKT_REQ is not reliable: repeat it for a moment
 	}
 }
 
