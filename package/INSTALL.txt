@@ -1,5 +1,5 @@
-Obscure II online co-op 1.3 - install
-=====================================
+Obscure II online co-op - install
+================================
 
 What it is
   A mod that lets two people play Obscure II's campaign together over the internet, each on their own

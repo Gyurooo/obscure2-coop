@@ -1,5 +1,5 @@
-Obscure II online co-op 1.3
-===========================
+Obscure II online co-op
+=======================
 (version 1.3 - the host and the guest must run the same version)
 
 What it is
