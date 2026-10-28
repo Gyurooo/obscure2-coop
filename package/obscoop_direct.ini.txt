@@ -1,0 +1,21 @@
+[obscoop]
+; Direct Steam link, no relay. Rename this file to obscoop.ini in the game folder (replace the shipped
+; one) and start the game both sides from Steam's Play button, or run the start_*_direct.bat files.
+; Both players must be Steam friends.
+;
+; This PC is the GUEST (player 2). For the host, write ROLE=host and drop the HOST_* lines.
+ROLE=guest
+NET=steam
+
+; How to find the host - use ONE of these:
+;  HOST_STEAMID = the host's 17-digit Steam ID. The host sees it in the window title ("co-op host:
+;                 waiting for a guest. Your Steam ID: 7656...") and in steam_id.txt next to its exe.
+;  HOST_NAME    = the host's Steam name exactly as it appears in your friends list (any capitals).
+; Leave both empty and the mod looks for a Steam friend who is playing Obscure II right now.
+HOST_STEAMID=
+HOST_NAME=
+
+LOCAL_PAD=0
+HIDE_REAL_PADS=0
+WINDOWED=1
+CAMERA=own

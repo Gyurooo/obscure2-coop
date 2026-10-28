@@ -1,0 +1,46 @@
+Obscure II online co-op 1.3 - install
+=====================================
+
+What it is
+  A mod that lets two people play Obscure II's campaign together over the internet, each on their own
+  PC and their own screen. It uses the game's own two-player mode, so the game plays exactly as the
+  split-screen co-op does; the second player is simply on the other PC.
+  No game files are included. You need Obscure II from Steam (app 254480).
+
+Before you start
+  - BOTH players must install the SAME version (the number in this zip's name, also the first line of
+    README.txt). A host and a guest on different versions refuse each other.
+  - Close the game before installing.
+  - Steam must be running and both players must be Steam friends.
+
+Install
+  1. Unpack the whole zip into a folder of its own (the Desktop is fine). Do NOT unpack it into the
+     game folder: the installer keeps a backup of the file it replaces.
+  2. Right-click install.ps1 -> "Run with PowerShell".
+     Type the folder that has Obscure2.exe, usually
+       C:\Program Files (x86)\Steam\steamapps\common\Obscure II
+     If Windows refuses to run the script, open PowerShell in the unpacked folder and run
+       powershell -ExecutionPolicy Bypass -File .\install.ps1 "C:\...\Obscure II"
+  3. The installer says what it does, line by line:
+       - it checks Obscure2.exe and REFUSES to install on anything but the Steam build 215294
+         (a widescreen patch, a crack or a repack changes the exe and the mod would not work);
+       - it backs up an xinput1_3.dll that is already there (xinput1_3.dll.bak) and never overwrites
+         an existing backup;
+       - it warns if d3d9.dll is next to the exe (DXVK / ReShade): the mod is untested with those;
+       - it copies the mod files into the game folder;
+       - it switches the campaign saves to real two-player (each patched save gets a .1p.bak copy);
+       - it writes obscoop_install.txt, the list of everything it touched.
+  Do the same on the other PC.
+
+Start the game
+  Use the .bat files in the game folder (they are described in README.txt):
+    host           start_host_steam.bat      guest           start_guest_steam.bat
+    (no relay)     start_host_direct.bat      (no relay)      start_guest_direct.bat
+  Both players start at the MAIN MENU. The host loads a save; the guest follows automatically.
+
+Uninstall
+  Right-click uninstall.ps1 -> "Run with PowerShell" and give the game folder. It restores the backups
+  and removes only the files the installer added (it reads obscoop_install.txt). Your saves go back to
+  the state they were in before the install.
+  The mod's own obscoop.log, obscoop_levels.txt and coop_profile\ folder are left in place; delete them
+  if you want the folder perfectly clean.
