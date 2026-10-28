@@ -872,6 +872,31 @@ static void host_send_region(unsigned obj, unsigned off, unsigned len, unsigned 
 	InterlockedIncrement(&g_prog_chunks_sent);
 }
 
+// TEST ONLY (OBSCOOP_TEST_DELAY_PROGRESS_MS=<ms>): holding the party block back makes the level request win
+// the race against it, which is what exercises the guest's "wait for the host party" branch. Off unless set.
+static DWORD g_test_prog_hold_ms, g_test_prog_hold_until;
+static int g_test_prog_held;
+
+static void test_delay_progress_init(void)
+{
+	char v[16];
+	if (GetEnvironmentVariableA("OBSCOOP_TEST_DELAY_PROGRESS_MS", v, sizeof v))
+		g_test_prog_hold_ms = (DWORD)strtoul(v, NULL, 10);
+	if (g_test_prog_hold_ms)
+		logf("host: TEST OBSCOOP_TEST_DELAY_PROGRESS_MS=%lu: the party block is held back after a level request",
+			(unsigned long)g_test_prog_hold_ms);
+}
+
+static void test_hold_party(void)
+{
+	if (!g_test_prog_hold_ms || g_role != 1)
+		return;
+	g_test_prog_hold_until = GetTickCount() + g_test_prog_hold_ms;
+	g_test_prog_held = 1;
+	logf("host: TEST holding the party block back for %lu ms (the level request goes now)",
+		(unsigned long)g_test_prog_hold_ms);
+}
+
 static void host_send_progress(int force)
 {
 	static DWORD last;
@@ -898,6 +923,13 @@ static void host_send_progress(int force)
 			memcpy(g_prog_sent + off, (const void *)(uintptr_t)(obj + off), len);
 		}
 	}
+	if (g_test_prog_held && (LONG)(now - g_test_prog_hold_until) < 0)
+		return;   // TEST ONLY: no party block yet, the guest has to wait for it
+	if (g_test_prog_held) {
+		logf("host: TEST delay over after %lu ms, sending the party block",
+			(unsigned long)(now - (g_test_prog_hold_until - g_test_prog_hold_ms)));
+		g_test_prog_held = 0;
+	}
 	if (!g_prog_sent_valid || memcmp(g_prog_sent + PROG_CHR_OFF, (const void *)(uintptr_t)(obj + PROG_CHR_OFF), PROG_END - PROG_CHR_OFF)) {
 		host_send_region(obj, PROG_CHR_OFF, PROG_END - PROG_CHR_OFF, level);
 		memcpy(g_prog_sent + PROG_CHR_OFF, (const void *)(uintptr_t)(obj + PROG_CHR_OFF), PROG_END - PROG_CHR_OFF);
@@ -905,9 +937,63 @@ static void host_send_progress(int force)
 	g_prog_sent_valid = 1;
 }
 
+#define REG_Q_SIZE 64   // a level request now waits for the party table, so more progress packets can queue up
 static CRITICAL_SECTION g_reg_cs;
-static pkt_region g_reg_q[16];
+static pkt_region g_reg_q[REG_Q_SIZE];
 static int g_reg_head, g_reg_tail;
+
+// The host's 8 character records (progress + 0x1b0c) as they arrive in PKT_REGION, one slot per recent level.
+// Keying them by level (instead of one "latest" stash) means a reordered packet for the level the guest is
+// leaving cannot overwrite the table of the level it is going to, and a table that arrives before its level
+// request is still usable (PARTY_FINDINGS 4.8). All of it is written by the UDP thread (guest_on_region) and
+// read by the main thread (the level change and the request queue) under g_reg_cs, so a copy is never torn.
+#define PARTY_SLOTS 4
+static BYTE g_party_tab[PARTY_SLOTS][0x140];
+static unsigned g_party_lvl[PARTY_SLOTS];
+static int g_party_next;
+
+// Caller holds g_reg_cs.
+static int party_slot(unsigned level)
+{
+	for (int i = 0; i < PARTY_SLOTS; i++)
+		if (g_party_lvl[i] == level)
+			return i;
+	return -1;
+}
+
+// Caller holds g_reg_cs.
+static void party_store(unsigned level, const BYTE *tab)
+{
+	int i = party_slot(level);
+	if (i < 0) {
+		i = g_party_next;
+		g_party_next = (g_party_next + 1) % PARTY_SLOTS;
+		g_party_lvl[i] = level;
+	}
+	memcpy(g_party_tab[i], tab, 0x140);
+}
+
+static int guest_party_ready(unsigned level)
+{
+	int ok;
+	EnterCriticalSection(&g_reg_cs);
+	ok = party_slot(level) >= 0;
+	LeaveCriticalSection(&g_reg_cs);
+	return ok;
+}
+
+static int guest_party_copy(unsigned level, BYTE *out)
+{
+	int i, ok = 0;
+	EnterCriticalSection(&g_reg_cs);
+	i = party_slot(level);
+	if (i >= 0) {
+		memcpy(out, g_party_tab[i], 0x140);
+		ok = 1;
+	}
+	LeaveCriticalSection(&g_reg_cs);
+	return ok;
+}
 
 static void guest_on_region(const char *buf, int n)
 {
@@ -916,21 +1002,19 @@ static void guest_on_region(const char *buf, int n)
 	if (n < (int)(sizeof(pkt_hdr) + 12) || r->len > REGION_MAX || (int)(sizeof(pkt_hdr) + 12 + r->len) != n)
 		return;
 	EnterCriticalSection(&g_reg_cs);
-	if (((g_reg_tail + 1) & 15) != g_reg_head) {
+	if (((g_reg_tail + 1) & (REG_Q_SIZE - 1)) != g_reg_head) {
 		memcpy(&g_reg_q[g_reg_tail], buf, n);
-		g_reg_tail = (g_reg_tail + 1) & 15;
+		g_reg_tail = (g_reg_tail + 1) & (REG_Q_SIZE - 1);
 	}
-	if (r->off == PROG_CHR_OFF && r->len >= 0x140) {   // the host's party, for the next level change (hk_party_table)
-		memcpy(g_host_party, r->data, 0x140);
-		g_host_party_level = r->level;
-		InterlockedExchange(&g_host_party_valid, 1);
+	if (r->off == PROG_CHR_OFF && r->len >= 0x140) {   // the host's party, for the level change (hk_party_table)
+		party_store(r->level, r->data);
 		stashed = 1;
 	}
 	LeaveCriticalSection(&g_reg_cs);
 	if (stashed) {
 		char lv[5], ch[5];
 		unsigned first;
-		memcpy(&first, g_host_party, sizeof first);
+		memcpy(&first, r->data, sizeof first);
 		logf("guest: host party stored at level %s: first character %s", tag4(r->level, lv), tag4(first, ch));
 	}
 	InterlockedIncrement(&g_prog_chunks_rcv);
@@ -952,7 +1036,7 @@ static void guest_apply_regions(void)
 		if (!g || !w || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0 || rd32(w + 4) != r.level)
 			return;   // keep it queued: the guest is still loading, or in another level
 		EnterCriticalSection(&g_reg_cs);
-		g_reg_head = (g_reg_head + 1) & 15;
+		g_reg_head = (g_reg_head + 1) & (REG_Q_SIZE - 1);
 		LeaveCriticalSection(&g_reg_cs);
 		unsigned obj = rd32(g + 0x318);
 		if (!obj || r.off < PROG_ENT_OFF || r.off + r.len > PROG_END || IsBadWritePtr((void *)(uintptr_t)(obj + r.off), r.len))
@@ -966,10 +1050,11 @@ static void guest_apply_regions(void)
 // Host: the level can also change without a ChangeLevel request (loading a save, a new game). Announce those too,
 // with the arrival door id of the character that player 1's controller record names.
 // PKT_REQ is one datagram with no ack: a lost level request would leave the guest in the old level for good, so
-// a request is repeated every 250 ms for 1.5 s (the guest drops the duplicates) and each repeat is preceded by
-// the progress block the party table arrives in.
+// a request is repeated every 250 ms for 3.5 s (the guest drops the duplicates) and each repeat is preceded by
+// the progress block the party table arrives in. The window covers the guest's wait for that table
+// (REQ_LEVEL_PARTY_WAIT in guest_apply_requests).
 #define REQ_REPEAT_MS 250
-#define REQ_REPEAT_FOR 1500
+#define REQ_REPEAT_FOR 3500
 static DWORD g_req_rep_until, g_req_rep_at, g_req_rep_level, g_req_rep_entry, g_req_rep_flag;
 
 static void host_level_request_repeat(unsigned level, unsigned entry, unsigned flag)
@@ -1029,6 +1114,7 @@ static void host_watch_level(void)
 	g_last_level = lvl;
 	g_last_entry = entry;
 	if (g_peer_ok) {
+		test_hold_party();
 		host_send_progress(1);   // the party table must reach the guest before the level change it belongs to
 		net_send_req(REQ_LEVEL, lvl, entry, 1, NULL);
 		InterlockedIncrement(&g_req_sent);
@@ -1044,6 +1130,7 @@ static void host_welcome_guest(void)
 		(char)(g_last_level >> 8), (char)g_last_level);
 	// The friend starts their own "New game, Two players" first (that choice decides who controls player 2); the
 	// level request waits on the guest until its world exists.
+	test_hold_party();
 	host_send_progress(1);   // the party table has to reach the guest before the level request
 	if (g_last_level) {
 		net_send_req(REQ_LEVEL, g_last_level, g_last_entry, g_last_flag, NULL);
@@ -1056,21 +1143,25 @@ static void host_welcome_guest(void)
 
 static CRITICAL_SECTION g_req_cs;
 static pkt_req g_req_q[8];
+static DWORD g_req_seen[8];   // when each queued request was first seen (the party wait is measured from it)
 static int g_req_head, g_req_tail;
 static DWORD g_lvl_req_done_a, g_lvl_req_done_b, g_lvl_req_done_at;   // the last level request this copy applied
+#define REQ_LEVEL_PARTY_WAIT 3000   // how long a level request may wait for the host's party table
+#define REQ_LEVEL_DONE_MS 4500      // the host repeats a level request for REQ_REPEAT_FOR: ignore the copies longer
+static unsigned g_lvl_defer_level;  // the level request currently waiting for the host party (0 = none)
 
 static void guest_on_req(const char *buf, int n)
 {
 	if (n != (int)sizeof(pkt_req))
 		return;
 	const pkt_req *r = (const pkt_req *)buf;
+	DWORD now = GetTickCount();
 	EnterCriticalSection(&g_req_cs);
 	if (r->kind == REQ_LEVEL) {
 		// The host repeats a level request because PKT_REQ is not reliable: skip the copies (one already
 		// waiting in the queue, or one applied a moment ago) so the guest changes level once.
-		DWORD now = GetTickCount();
 		if (g_lvl_req_done_at && r->a == g_lvl_req_done_a && r->b == g_lvl_req_done_b &&
-		    now - g_lvl_req_done_at < 2500) {
+		    now - g_lvl_req_done_at < REQ_LEVEL_DONE_MS) {
 			LeaveCriticalSection(&g_req_cs);
 			return;
 		}
@@ -1082,6 +1173,7 @@ static void guest_on_req(const char *buf, int n)
 	}
 	if (((g_req_tail + 1) & 7) != g_req_head) {
 		memcpy(&g_req_q[g_req_tail], buf, sizeof(pkt_req));
+		g_req_seen[g_req_tail] = now;
 		g_req_tail = (g_req_tail + 1) & 7;
 	}
 	LeaveCriticalSection(&g_req_cs);
@@ -1090,19 +1182,56 @@ static void guest_on_req(const char *buf, int n)
 // Runs on the main thread (frame hook): the game's state machine is not thread-safe.
 static void guest_apply_requests(void)
 {
+	int looked_at = 0;
 	for (;;) {
 		pkt_req r;
+		DWORD seen = 0, waited = 0;
+		int party_missing = 0;
 		EnterCriticalSection(&g_req_cs);
 		if (g_req_head == g_req_tail) {
 			LeaveCriticalSection(&g_req_cs);
 			return;
 		}
+		if (looked_at++ >= 8) {   // a deferred level request was moved to the tail: stop after one pass
+			LeaveCriticalSection(&g_req_cs);
+			return;
+		}
 		r = g_req_q[g_req_head];
+		seen = g_req_seen[g_req_head];
 		if (r.kind == REQ_LEVEL) {   // a joining guest may still be loading: keep the request until its world exists
 			unsigned g0 = game_obj();
 			if (!g0 || rd32(g0 + 0x310) != 1 || rd32(g0 + 0x320) != 0 || !world_obj()) {
+				g_req_seen[g_req_head] = GetTickCount();   // the party wait starts when the guest can act
 				LeaveCriticalSection(&g_req_cs);
 				return;
+			}
+			waited = GetTickCount() - seen;
+			// The world is rebuilt from the progress character table during state 4, so the host's party
+			// (PKT_REGION) has to be here first or the guest spawns its own and a late table never reaches
+			// the rebuilt world (PARTY_FINDINGS 4.8). Wait for it, but not forever.
+			if (g_role == 2 && !guest_party_ready(r.a)) {
+				if (waited < REQ_LEVEL_PARTY_WAIT) {
+					// Keep it queued so the stash can still arrive. Move it behind the other kinds so
+					// they are not blocked by the wait; if it is the only request, leave it at the head.
+					int only_one = ((g_req_head + 1) & 7) == g_req_tail;
+					if (!only_one) {
+						g_req_head = (g_req_head + 1) & 7;
+						g_req_q[g_req_tail] = r;
+						g_req_seen[g_req_tail] = seen;
+						g_req_tail = (g_req_tail + 1) & 7;
+					}
+					LeaveCriticalSection(&g_req_cs);
+					if (g_lvl_defer_level != r.a) {
+						char lv[5];
+						g_lvl_defer_level = r.a;
+						logf("guest: level request %s deferred waiting for the party (up to %d ms)",
+							tag4(r.a, lv), REQ_LEVEL_PARTY_WAIT);
+					}
+					if (only_one)
+						return;
+					continue;
+				}
+				party_missing = 1;   // the fallback is the old behaviour: change level with our own party
 			}
 		}
 		g_req_head = (g_req_head + 1) & 7;
@@ -1112,6 +1241,15 @@ static void guest_apply_requests(void)
 			g_lvl_req_done_at = GetTickCount();
 		}
 		LeaveCriticalSection(&g_req_cs);
+		if (r.kind == REQ_LEVEL && g_lvl_defer_level == r.a) {
+			char lv[5];
+			g_lvl_defer_level = 0;
+			if (party_missing)
+				logf("guest: level request %s released after %u ms: no host party for it, the guest keeps its own",
+					tag4(r.a, lv), waited);
+			else
+				logf("guest: level request %s released after %u ms: host party arrived", tag4(r.a, lv), waited);
+		}
 		unsigned g = game_obj();
 		if (!g)
 			continue;
@@ -1216,6 +1354,7 @@ static void guest_debug_p1(void)
 
 static void sync_init(void)
 {
+	test_delay_progress_init();
 	InitializeCriticalSection(&g_reg_cs);
 	InitializeCriticalSection(&g_rx_cs);
 	InitializeCriticalSection(&g_req_cs);

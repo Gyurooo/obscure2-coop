@@ -43,9 +43,6 @@ static volatile LONG g_req_sent;  // requests forwarded to the guest (host)
 static unsigned g_last_level, g_last_entry, g_last_flag;   // host: the level the party is in, for a joining guest
 static int g_apply_host_req;      // guest: the request being made comes from the host, let it through
 static volatile DWORD g_guest_load_until; // guest: its own save load may change the level for this window
-static BYTE g_host_party[0x140];  // guest: the host's 8 character records (progress + 0x1b0c), from PKT_REGION
-static unsigned g_host_party_level;   // guest: the level those records belong to
-static volatile LONG g_host_party_valid;
 
 typedef void(__fastcall *req3_t)(void *, void *, unsigned, unsigned, unsigned);
 typedef void(__fastcall *req1_t)(void *, void *, unsigned);
@@ -56,6 +53,7 @@ static req1_t g_load_progress, g_load_name;
 static req0_t g_to_menu;
 static party_t g_party_table;
 static void host_level_request_repeat(unsigned level, unsigned entry, unsigned flag);   // sync.c
+static int guest_party_copy(unsigned level, BYTE *out);   // sync.c: the host's party table for this level
 
 static void __fastcall hk_change_level(void *game, void *edx, unsigned level, unsigned entry, unsigned flag)
 {
@@ -125,17 +123,20 @@ static void __fastcall hk_to_menu(void *game, void *edx)
 // The level change (state 4) starts by writing the guest's live party into the progress table and moving
 // its records to the new level; the world is torn down and rebuilt right after that. Put the host's
 // character table back between the two so the rebuilt world spawns the host's party (PARTY_FINDINGS 3.1).
+// The table is copied through guest_party_copy, which checks and copies under the stash's lock: the UDP
+// thread may be storing a newer one at the same time.
 static int __fastcall hk_party_table(void *game, void *edx, int flag, unsigned level, unsigned entry, int *weapons)
 {
 	int r = g_party_table(game, edx, flag, level, entry, weapons);
 	// g_apply_host_req is already cleared here: the game runs the level change on a later frame than the request.
-	if (g_role == 2 && g_host_party_valid && g_host_party_level == level) {
+	if (g_role == 2) {
 		unsigned obj = *(unsigned *)((BYTE *)game + 0x318);
-		if (obj && !IsBadWritePtr((void *)(uintptr_t)(obj + 0x1b0c), 0x140)) {
+		BYTE party[0x140];
+		if (obj && !IsBadWritePtr((void *)(uintptr_t)(obj + 0x1b0c), 0x140) && guest_party_copy(level, party)) {
 			char lv[5], ch[5];
 			unsigned first;
-			memcpy((void *)(uintptr_t)(obj + 0x1b0c), g_host_party, 0x140);
-			memcpy(&first, g_host_party, sizeof first);
+			memcpy((void *)(uintptr_t)(obj + 0x1b0c), party, 0x140);
+			memcpy(&first, party, sizeof first);
 			logf("guest: host party applied at level %s: first character %s", tag4(level, lv), tag4(first, ch));
 		}
 	}
