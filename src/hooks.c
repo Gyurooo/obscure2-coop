@@ -190,6 +190,43 @@ static void __fastcall hk_game_update(void *game, void *edx, int dt)
 		g_game_update(game, edx, dt);
 }
 
+// ---- world item pickup (sync.c: pickup_local_collect / peer_apply_pickups) -----------------------
+// An item entity is identified by its class tag at +0x10 (a 4-character tag; the map is "MAP\0")
+// and its per-entity id at +4. The tags below are the ones the 28 CToeItem* constructors write
+// (ITEMS_FINDINGS.md section 1).
+static int item_class_tag(unsigned t)
+{
+	static const unsigned tags[] = {
+		0x41434944, 0x42415454, 0x424b504b, 0x424c4541, 0x4341424f, 0x43524f57, 0x454e4452,
+		0x474c5943, 0x4943414d, 0x49434500, 0x4943524e, 0x49445343, 0x4a454d4d, 0x4a455252,
+		0x4a554241, 0x4b455900, 0x4c564552, 0x4d415000, 0x4d454449, 0x50415353, 0x53455255,
+		0x534f4441, 0x53544154, 0x53545249, 0x53595249, 0x57454c44
+	};
+	for (unsigned i = 0; i < sizeof tags / sizeof tags[0]; i++)
+		if (tags[i] == t)
+			return 1;
+	return 0;
+}
+
+static void pickup_local_collect(unsigned item, unsigned ch);   // defined in sync.c
+
+// FUN_004ddad0(character): collects the entity in character+0x73c by calling its vtable slot 26.
+// It is the single character-side entry point of every world item pickup (ITEMS_FINDINGS 3.3).
+typedef void(__fastcall *char_collect_t)(void *, void *);
+static char_collect_t g_char_collect;
+
+static void __fastcall hk_char_collect(void *ch, void *edx)
+{
+	if (ch && (g_role == 1 || g_role == 2) && g_peer_ok) {
+		unsigned item = *(unsigned *)((BYTE *)ch + 0x73c);
+		if (item && !IsBadReadPtr((void *)(uintptr_t)item, 0xac) && item_class_tag(*(unsigned *)(uintptr_t)(item + 0x10)) &&
+			*(int *)(uintptr_t)(item + 0xa8) == 0)
+			pickup_local_collect(item, (unsigned)(uintptr_t)ch);
+	}
+	if (g_char_collect)
+		g_char_collect(ch, edx);
+}
+
 static void install_request_hooks(void)
 {
 	static const BYTE p_change[6] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08 };
@@ -208,4 +245,7 @@ static void install_request_hooks(void)
 	static const BYTE p_update[6] = { 0x55, 0x8b, 0xec, 0x56, 0x8b, 0xf1 };
 	g_game_update = (game_update_t)hook_entry((BYTE *)0x4a5f20, p_update, 6, (void *)hk_game_update,
 		"game update (0x4a5f20)");
+	static const BYTE p_collect[9] = { 0x56, 0x8b, 0xf1, 0x8b, 0x8e, 0x3c, 0x07, 0x00, 0x00 };
+	g_char_collect = (char_collect_t)hook_entry((BYTE *)0x4ddad0, p_collect, 9, (void *)hk_char_collect,
+		"character collect (0x4ddad0)");
 }

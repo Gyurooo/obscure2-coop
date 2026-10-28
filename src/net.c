@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 8   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 9   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -22,9 +22,10 @@
                         //    load a transferred save with the game's own menu path)
                         // 8: PKT_SAVES_DONE names the save file that just completed (and says when all of them have); the
                         //    transfer sends the file the host's load named (o2.sav too), not only game0..9.sav
+                        // 9: PKT_PICKUP: a placed world item collected on one copy is collected on the other (both directions)
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
-	PKT_SAVES_DONE = 15 };
+	PKT_SAVES_DONE = 15, PKT_PICKUP = 16 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
 
 #pragma pack(push, 1)
@@ -52,6 +53,9 @@ typedef struct { pkt_hdr h; char name[32]; DWORD off; } pkt_save_ack;
 typedef struct { pkt_hdr h; DWORD all; char name[32]; } pkt_saves_done;
 #define MAX_NPC 24
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; npc_state npc[MAX_NPC]; } pkt_npc;
+// A placed world item collected on one copy: the other copy collects the same level entity through the
+// game's own item collect method (class tag at item+0x10, id at item+4, position at item+0x6c).
+typedef struct { pkt_hdr h; DWORD level; DWORD cls; DWORD id; float pos[3]; DWORD ch_tag; } pkt_pickup;
 #pragma pack(pop)
 
 static void guest_on_state(const char *buf, int n);
@@ -64,6 +68,7 @@ static void host_save_begin(void);
 static void guest_on_req(const char *buf, int n);
 static void guest_on_npc(const char *buf, int n);
 static void guest_on_region(const char *buf, int n);
+static void peer_on_pickup(const char *buf, int n);
 static volatile LONG g_join_pending;   // host: a guest just connected, send it the current state from the main thread
 
 #include "steam.c"
@@ -257,6 +262,9 @@ static void net_handle(const char *buf, int n, sid_t from)
 		case PKT_SAVE_ACK:
 			host_on_save_ack(buf, n);
 			break;
+		case PKT_PICKUP:
+			peer_on_pickup(buf, n);
+			break;
 		}
 	} else if (g_role == 2) {
 		if (!g_peer_ok) {
@@ -290,6 +298,8 @@ static void net_handle(const char *buf, int n, sid_t from)
 		guest_on_saves_done(buf, n);
 	} else if (h->type == PKT_ITEM) {
 		guest_on_item(buf, n);
+	} else if (h->type == PKT_PICKUP) {
+		peer_on_pickup(buf, n);
 	} else if (h->type == PKT_STATE) {
 			guest_on_state(buf, n);
 		} else if (h->type == PKT_REGION) {

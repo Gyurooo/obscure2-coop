@@ -25,6 +25,8 @@ case "$DLLARG" in
 esac
 DLL=$(cygpath -w "$DLLARG"); shift
 export OBSCOOP_TEST_ROOT="${OBSCOOP_TEST_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}" OBSCOOP_DLL="$DLL"
+# The save slot both copies load (and that check_pickup.py reports): OBSCOOP_SLOT=0..9, default 01.
+export SAVE_SLOT="${SAVE_SLOT:-${OBSCOOP_SLOT:-0}}"
 PY="${PYTHON:-python}"
 cd "$(dirname "$0")" || exit 2
 START=$($PY -I duo.py start | tail -1)

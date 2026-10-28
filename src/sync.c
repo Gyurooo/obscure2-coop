@@ -600,6 +600,191 @@ static void guest_on_item(const char *buf, int n)
 	InterlockedIncrement(&g_item_applied);
 }
 
+// ---- world item pickup (both directions) ---------------------------------------------------------
+// A placed world item (a CToeItem entity in the level's CToeManager) is collected by a character on one
+// copy; the other copy must collect the same entity through the game's own collect method so it
+// disappears there too. The item is identified by its class tag (+0x10) and id (+4).
+//
+// Hook (hooks.c): FUN_004ddad0, the character-side collect call, fires after the ~500 ms pickup
+// animation with the target entity in character+0x73c. The hook sends when the item is not collected
+// yet. Both roles send: the host's own player and the guest's own player (player 2 on the host copy)
+// each collect on their own copy, and the other copy applies. An applied pickup calls the item's
+// virtual slot 26 (vtable+0x68, the same call FUN_004ddad0 makes) directly, so it never reaches the
+// hook again: no echo. g_pickup_applying is a second guard in case that path ever calls the hook.
+static volatile LONG g_pickup_sent, g_pickup_rcv, g_pickup_applied, g_pickup_skipped, g_pickup_missing;
+static volatile LONG g_pickup_applying;
+
+static void pickup_local_collect(unsigned item, unsigned ch)
+{
+	if (g_pickup_applying || !item || !ch)
+		return;
+	if (!g_peer_ok)
+		return;
+	unsigned w = world_obj();
+	if (!w || rd32(item + 0xa8) != 0)
+		return;
+	pkt_pickup p;
+	memset(&p, 0, sizeof p);
+	p.level = rd32(w + 4);
+	p.cls = rd32(item + 0x10);
+	p.id = rd32(item + 4);
+	p.ch_tag = rd32(ch + H_TAG);
+	if (mem_ok((const void *)(uintptr_t)(item + 0x6c), 12))
+		memcpy(p.pos, (const void *)(uintptr_t)(item + 0x6c), sizeof p.pos);
+	net_send(PKT_PICKUP, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	InterlockedIncrement(&g_pickup_sent);
+	char c[5], i[5], lv[5], ct[5];
+	logf("%s: item pickup sent: class %s id %s at (%.1f, %.1f, %.1f) by %s [level %s]",
+		g_role == 2 ? "guest" : "host", tag4(p.cls, c), tag4(p.id, i), p.pos[0], p.pos[1], p.pos[2],
+		tag4(p.ch_tag, ct), tag4(p.level, lv));
+}
+
+static CRITICAL_SECTION g_pick_cs;
+static pkt_pickup g_pick_q[8];
+static DWORD g_pick_t[8];
+static int g_pick_head, g_pick_tail;
+
+static void peer_on_pickup(const char *buf, int n)
+{
+	if (n != (int)sizeof(pkt_pickup))
+		return;
+	EnterCriticalSection(&g_pick_cs);
+	if (((g_pick_tail + 1) & 7) != g_pick_head) {
+		memcpy(&g_pick_q[g_pick_tail], buf, sizeof(pkt_pickup));
+		g_pick_t[g_pick_tail] = GetTickCount();
+		g_pick_tail = (g_pick_tail + 1) & 7;
+	}
+	LeaveCriticalSection(&g_pick_cs);
+	InterlockedIncrement(&g_pickup_rcv);
+}
+
+// CToeManager::GetEntityByClassAndID (0x45f540, thiscall: manager, class tag, id).
+typedef int(__fastcall *find_entity_t)(void *, void *, unsigned, unsigned);
+// The item's virtual slot 26 (vtable+0x68): the collect method FUN_004ddad0 calls.
+typedef int(__fastcall *item_collect_t)(void *, void *, void *);
+
+static unsigned human_with_tag(unsigned tag)
+{
+	unsigned hs[MAX_CH];
+	int n = world_humans(hs, MAX_CH);
+	for (int i = 0; i < n; i++)
+		if (rd32(hs[i] + H_TAG) == tag)
+			return hs[i];
+	unsigned h = player_human(g_role == 2 ? 1 : 0);
+	if (h)
+		return h;
+	return n > 0 ? hs[0] : 0;
+}
+
+// The entity the packet names: same class tag and (when the packet has one) the same id. Item ids are
+// often 0, so the position decides which of several same-class entities is meant. A collected
+// candidate is only used when nothing live matches (then the caller reports "already collected").
+static unsigned pickup_find_entity(unsigned mgr, unsigned cls, unsigned id, const float *pp)
+{
+	unsigned best = 0, best_dead = 0;
+	float bd = 1e30f;
+	if (!mgr)
+		return 0;
+	unsigned heads[2] = { rd32(mgr + 8), rd32(mgr + 0x18) };
+	for (int h = 0; h < 2; h++) {
+		unsigned seen[2] = { 0, 0 };
+		int nseen = 0;
+		for (unsigned node = heads[h], guard = 0; node && guard < 4000; guard++) {
+			int dup = 0;
+			for (int s = 0; s < nseen; s++)
+				if (seen[s] == node)
+					dup = 1;
+			if (dup)
+				break;
+			if (nseen < 2)
+				seen[nseen++] = node;
+			unsigned e = rd32(node);
+			if (e && rd32(e + 0x10) == cls && (!id || rd32(e + 4) == id)) {
+				if (rd32(e + 0xa8) != 0) {
+					if (!best_dead)
+						best_dead = e;
+				} else {
+					const float *ep = (const float *)(uintptr_t)(e + 0x6c);
+					float dx = ep[0] - pp[0], dy = ep[1] - pp[1], dz = ep[2] - pp[2];
+					float d = dx * dx + dy * dy + dz * dz;
+					if (d < bd) { bd = d; best = e; }
+				}
+			}
+			unsigned nx = rd32(node + 4);
+			if (nx == node)
+				break;
+			node = nx;
+		}
+	}
+	if (best)
+		return best;
+	if (best_dead)
+		return best_dead;
+	return (unsigned)(uintptr_t)((find_entity_t)0x45f540)((void *)(uintptr_t)mgr, NULL, cls, id);
+}
+
+static void peer_apply_pickups(void)
+{
+	for (;;) {
+		pkt_pickup p;
+		EnterCriticalSection(&g_pick_cs);
+		if (g_pick_head == g_pick_tail) {
+			LeaveCriticalSection(&g_pick_cs);
+			return;
+		}
+		p = g_pick_q[g_pick_head];
+		DWORD queued = g_pick_t[g_pick_head];
+		LeaveCriticalSection(&g_pick_cs);
+		unsigned g = game_obj(), w = world_obj();
+		if (GetTickCount() - queued > 10000) {   // never applicable (the level changed): do not block the queue
+			EnterCriticalSection(&g_pick_cs);
+			g_pick_head = (g_pick_head + 1) & 7;
+			LeaveCriticalSection(&g_pick_cs);
+			InterlockedIncrement(&g_pickup_missing);
+			logf("%s: item pickup class %08x id %08x dropped: not applied within 10 s (level changed?)",
+				g_role == 2 ? "guest" : "host", p.cls, p.id);
+			continue;
+		}
+		if (!g || !w || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0)
+			return;   // menu or loading: keep the pickup queued
+		if (rd32(w + 4) != p.level)
+			return;   // another level: keep it queued (a level change may be in progress)
+		EnterCriticalSection(&g_pick_cs);
+		g_pick_head = (g_pick_head + 1) & 7;
+		LeaveCriticalSection(&g_pick_cs);
+		char c[5], i[5], lv[5], ct[5];
+		unsigned mgr = rd32(w + 0x1768);
+		unsigned ent = pickup_find_entity(mgr, p.cls, p.id, p.pos);
+		if (!ent) {
+			InterlockedIncrement(&g_pickup_missing);
+			logf("%s: item pickup class %s id %s: no entity in level %s (already gone)",
+				g_role == 2 ? "guest" : "host", tag4(p.cls, c), tag4(p.id, i), tag4(p.level, lv));
+			continue;
+		}
+		if (rd32(ent + 0xa8) != 0) {
+			InterlockedIncrement(&g_pickup_skipped);
+			logf("%s: item pickup class %s id %s: already collected",
+				g_role == 2 ? "guest" : "host", tag4(p.cls, c), tag4(p.id, i));
+			continue;
+		}
+		unsigned ch = human_with_tag(p.ch_tag);
+		void **vt = *(void ***)(uintptr_t)ent;
+		if (!ch || !vt || IsBadReadPtr(vt, 27 * sizeof(void *)) || !mem_ok((const void *)(uintptr_t)ent, 0xac)) {
+			InterlockedIncrement(&g_pickup_missing);
+			logf("%s: item pickup class %s id %s: no character or item vtable",
+				g_role == 2 ? "guest" : "host", tag4(p.cls, c), tag4(p.id, i));
+			continue;
+		}
+		InterlockedIncrement(&g_pickup_applying);
+		((item_collect_t)vt[26])((void *)(uintptr_t)ent, NULL, (void *)(uintptr_t)ch);   // the game's own collect path
+		InterlockedDecrement(&g_pickup_applying);
+		InterlockedIncrement(&g_pickup_applied);
+		logf("%s: item pickup applied: class %s id %s at level %s by %s (collected=%u)",
+			g_role == 2 ? "guest" : "host", tag4(p.cls, c), tag4(p.id, i), tag4(p.level, lv),
+			tag4(p.ch_tag, ct), rd32(ent + 0xa8));
+	}
+}
+
 static void host_send_state(void)
 {
 	static DWORD last;
@@ -1836,6 +2021,7 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_save_cs);
 	InitializeCriticalSection(&g_rcvd_cs);
 	InitializeCriticalSection(&g_rload_cs);
+	InitializeCriticalSection(&g_pick_cs);
 }
 
 static void frame_tick(void)
@@ -1883,12 +2069,14 @@ static void frame_tick(void)
 		host_send_state();
 		host_send_npcs();
 		host_send_progress(0);
+		peer_apply_pickups();
 	} else {
 		attach_player2();
 		guest_apply_requests();
 		guest_apply_regions();
 		guest_apply_state();
 		guest_apply_npcs();
+		peer_apply_pickups();
 		guest_follow_own_player();
 		guest_record_history();
 		guest_debug_p1();
@@ -1906,6 +2094,7 @@ static void sync_status(char *reply, size_t replysz)
 			g_npc_applied, g_npc_snaps, g_npc_blends, g_npc_unmatched, g_cam_sets);
 	l = strlen(reply);
 	if (l < replysz)
-		_snprintf(reply + l, replysz - l, " | saves_done %ld | real load stage %ld at %lu", (long)g_saves_done,
-			(long)g_real_load_stage, (unsigned long)g_real_load_at);
+		_snprintf(reply + l, replysz - l, " | saves_done %ld | real load stage %ld at %lu | pickup sent %ld rcv %ld applied %ld already %ld missing %ld",
+			(long)g_saves_done, (long)g_real_load_stage, (unsigned long)g_real_load_at,
+			g_pickup_sent, g_pickup_rcv, g_pickup_applied, g_pickup_skipped, g_pickup_missing);
 }
