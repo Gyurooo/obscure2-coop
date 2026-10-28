@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 16   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 17   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -38,6 +38,8 @@
                         // 16: TASK 30, PKT_SCENE: both copies stream the world's scripted-event state
                         //     (world+0x11c / world+0x12c) and a skip by either player skips on both; pkt_state
                         //     also carries the battery/energy (inventory+0xc88) a story event may set
+                        // 17: TASK 31: pkt_scene carries leave_seq, so "I left the event" is an event that
+                        //     cannot be lost (the receiver keeps a pending skip instead of comparing scene ids)
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,
@@ -111,8 +113,12 @@ typedef struct { pkt_hdr h; DWORD kind; DWORD level; DWORD ch_tag; DWORD cls, id
 // flags = world+0x130, a/b/d = world+0x138/0x13c/0x118 (the kine's parameters, a = the scene id).
 // cine = 1 when the sender's copy is presenting a scripted event; a copy that is in one and hears that
 // the peer is not in one applies the game's own skip, so both copies leave together.
+// leave_seq (TASK 31) counts the sender's leaves of a scripted event: the receiver arms a pending skip on
+// a change, so a leave cannot be lost by comparing scene ids (which differ between the copies) and it
+// stays armed while the receiver's own scene is not there (yet). The sender repeats the leave until the
+// peer has left too.
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD state; DWORD scene; DWORD flags; DWORD a, b, d;
-                 DWORD name4; DWORD cine; } pkt_scene;
+                 DWORD name4; DWORD cine; DWORD leave_seq; } pkt_scene;
 #pragma pack(pop)
 
 static void guest_on_state(const char *buf, int n);

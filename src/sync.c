@@ -3312,6 +3312,17 @@ static void guest_follow_own_player(void)
 #define W_NAME 0x140   // a noe scene's name string (FUN_004b2890 copies it here)
 
 static DWORD g_scene_enter_tick;
+static DWORD g_leave_seq;      // this copy's leaves of a scripted event (sent as pkt_scene.leave_seq)
+static DWORD g_leave_t0;       // when this copy last left a scripted event
+
+// TASK 31: the leave is an event, not a state to compare. The leaving copy repeats it for a few seconds
+// (and only while the peer still reports a scripted event at the same level), the receiver arms a pending
+// skip the moment it arrives and keeps it while its own scene has not left, and the skip ladder is
+// repeated - the game can ignore the first press, and a receiver may still be loading into the scene.
+#define SCENE_LEAVE_RESEND_MS 8000   // how long a leave is repeated while the peer is still in a scene
+#define SCENE_PEND_MS 10000          // how long a received leave stays armed here
+#define SCENE_SKIP_TRIES 3           // skip ladders per received leave
+#define SCENE_SKIP_GAP_MS 1200       // pause between two ladders
 
 typedef struct { DWORD t_ms, level, state, scene, flags, a, b, d, name4, cine; DWORD tick; } scene_info;
 
@@ -3352,14 +3363,43 @@ static int scene_local_cinematic(void)
 static CRITICAL_SECTION g_scene_cs;
 static scene_info g_peer_scene;
 static volatile LONG g_peer_scene_valid;
-static DWORD g_peer_last_cine_a, g_peer_last_cine_n;   // the identity of the peer's last scripted event
+static DWORD g_peer_last_leave_seq;   // the peer's leave counter this copy has already seen
+
+// TASK 31: "the peer left its scripted event" is armed on the RX thread the moment that packet arrives,
+// so a game-thread check a frame later cannot miss it, and it survives until this copy is out too (or
+// until the peer is in a scene again / the peer is gone). TASK 30 compared the two copies' scene ids
+// instead and dropped the skip when they differed - which they do run to run, because a kine leaves a
+// different leftover in world+0x140 on each copy (that was the unreliable part).
+static volatile LONG g_pend_active;
+static volatile LONG g_pend_gen;      // one per received leave: restarts the skip-attempt counter
+static DWORD g_pend_at, g_pend_level, g_pend_a;
+
+static void scene_pending_arm(DWORD level, DWORD a, DWORD seq, const char *why)
+{
+	char lt[8];
+	g_pend_level = level;
+	g_pend_a = a;
+	g_pend_at = GetTickCount();
+	g_pend_active = 1;
+	InterlockedIncrement(&g_pend_gen);
+	logf("scene: %s (peer level %s, id %#x, leave %lu): pending skip armed", why, tag4(level, lt), a,
+			(unsigned long)seq);
+}
 
 static void peer_on_scene(const char *buf, int n)
 {
 	const pkt_scene *p = (const pkt_scene *)buf;
 	if (n != (int)sizeof *p)
 		return;
+	DWORD now = GetTickCount();
+	int had, was_cine, seq_edge, cine_edge;
 	EnterCriticalSection(&g_scene_cs);
+	had = g_peer_scene_valid != 0;
+	was_cine = had && g_peer_scene.cine != 0;
+	// Two ways to see a leave: the peer's leave counter moved (works even when every "in a scene" packet
+	// was lost), or its cine flag fell (works with a peer that only streams states).
+	seq_edge = had && p->leave_seq != g_peer_last_leave_seq;
+	cine_edge = had && was_cine && p->cine == 0;
 	g_peer_scene.t_ms = p->t_ms;
 	g_peer_scene.level = p->level;
 	g_peer_scene.state = p->state;
@@ -3370,43 +3410,60 @@ static void peer_on_scene(const char *buf, int n)
 	g_peer_scene.d = p->d;
 	g_peer_scene.name4 = p->name4;
 	g_peer_scene.cine = p->cine;
-	g_peer_scene.tick = GetTickCount();
-	if (p->cine) {
-		g_peer_last_cine_a = p->a;
-		g_peer_last_cine_n = p->name4;
-	}
+	g_peer_scene.tick = now;
+	g_peer_last_leave_seq = p->leave_seq;
 	g_peer_scene_valid = 1;
 	LeaveCriticalSection(&g_scene_cs);
+	if (seq_edge || cine_edge)
+		scene_pending_arm(p->level, p->a, p->leave_seq, "the peer left a scripted event");
+	else if (g_pend_active && p->cine == 0 && p->leave_seq != 0 && p->level == g_pend_level)
+		g_pend_at = now;   // the peer is still repeating that leave: keep the pending alive for it
 	InterlockedIncrement(&g_scene_rcv);
 }
 
 static void scene_send(void)
 {
-	static DWORD last, cine_until;
-	static unsigned sent_state = ~0u, sent_scene = ~0u, sent_cine = ~0u, sent_a = ~0u;
+	static DWORD last, sent_state = ~0u, sent_scene = ~0u, sent_a = ~0u;
+	static int sent_cine = -1;              // -1: nothing reported yet
 	DWORD now = GetTickCount();
 	scene_info s;
 	scene_read(&s);
 	if (!s.level)
 		return;
-	int changed = s.state != sent_state || s.scene != sent_scene || s.cine != sent_cine || s.a != sent_a;
-	// keep talking for 3 s after leaving a scene: a lost "I left it" packet would leave the peer stuck
-	int recent = s.cine || (LONG)(cine_until - now) > 0;
-	if (!changed && (!recent || now - last < 250))
+	int cine = s.cine != 0;
+	int entered = cine && sent_cine == 0, left = !cine && sent_cine == 1;
+	if (sent_cine < 0)
+		entered = cine;                 // the first report is not a leave, but "we are in it" is worth a line
+	if (left) {
+		g_leave_seq++;
+		g_leave_t0 = now;
+	}
+	// Repeat the state while this copy is in a scene, and keep repeating the leave: for a short while
+	// unconditionally (the peer may still be loading into its copy of the event) and for longer while the
+	// peer still reports a scripted event at this level. One lost packet must not leave the peer behind.
+	int peer_in_scene = 0;
+	EnterCriticalSection(&g_scene_cs);
+	if (g_peer_scene_valid)
+		peer_in_scene = g_peer_scene.cine != 0 && g_peer_scene.level == s.level;
+	LeaveCriticalSection(&g_scene_cs);
+	int changed = s.state != sent_state || s.scene != sent_scene || s.a != sent_a || (unsigned)cine != (unsigned)sent_cine;
+	DWORD since_leave = now - g_leave_t0;
+	int repeat = cine || since_leave < 1500 || (peer_in_scene && since_leave < SCENE_LEAVE_RESEND_MS);
+	if (!changed && (!repeat || now - last < 250))
 		return;
 	last = now;
-	if (s.cine && !sent_cine) {
+	if (entered) {
 		char lt[8];
 		logf("scene: this copy entered a scripted event (world state %u, scene %u, id %#x, level %s)", s.state, s.scene,
 			s.a, tag4(s.level, lt));
-	}
-	if (sent_cine && !s.cine)
-		logf("scene: this copy left the scripted event (world state %u, scene %u) after %u ms", s.state, s.scene,
-			(unsigned)(now - g_scene_enter_tick));
-	if (s.cine)
-		cine_until = now + 3000;
-	if (s.cine)
 		g_scene_enter_tick = now;
+	}
+	if (left) {
+		char lt[8];
+		logf("scene: this copy left the scripted event (world state %u, scene %u, level %s) after %u ms; "
+			"repeating it until the peer leaves too (leave %lu)", s.state, s.scene, tag4(s.level, lt),
+			(unsigned)(now - g_scene_enter_tick), (unsigned long)g_leave_seq);
+	}
 	pkt_scene p;
 	memset(&p, 0, sizeof p);
 	p.t_ms = timeline_now();
@@ -3418,10 +3475,11 @@ static void scene_send(void)
 	p.b = s.b;
 	p.d = s.d;
 	p.name4 = s.name4;
-	p.cine = s.cine;
+	p.cine = cine;
+	p.leave_seq = g_leave_seq;
 	net_send(PKT_SCENE, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
 	InterlockedIncrement(&g_scene_sent);
-	sent_state = s.state; sent_scene = s.scene; sent_cine = s.cine; sent_a = s.a;
+	sent_state = s.state; sent_scene = s.scene; sent_cine = cine; sent_a = s.a;
 }
 
 // ---- the skip ---------------------------------------------------------------------------------------
@@ -3430,8 +3488,9 @@ static void scene_send(void)
 // ~150 ms and the next is tried 160 ms later, so the sequence cannot look like a double press.
 static int g_skip_step;
 static DWORD g_skip_t0;
-static int g_skip_failed;                 // the ladder did not take for this scene identity: do not retry it
-static DWORD g_skip_fail_a, g_skip_fail_n;
+static DWORD g_skip_retry_at;             // a failed ladder: do not start the next one before this tick
+static int g_skip_tries;                  // ladders started for the current received leave
+static LONG g_skip_gen;                   // the leave (g_pend_gen) those tries belong to
 
 static void scene_vpad(unsigned buttons, int on)
 {
@@ -3460,15 +3519,25 @@ static void scene_skip_begin(const char *why)
 {
 	if (g_skip_step)
 		return;
+	DWORD now = GetTickCount();
+	LONG gen = g_pend_gen;
+	if (g_skip_gen != gen) {   // a new leave: the old attempts do not count against it
+		g_skip_gen = gen;
+		g_skip_tries = 0;
+		g_skip_retry_at = 0;
+	}
+	if ((LONG)(g_skip_retry_at - now) > 0 || g_skip_tries >= SCENE_SKIP_TRIES)
+		return;
+	g_skip_tries++;
 	scene_info s;
 	scene_read(&s);
 	{
 		char lt[8];
-		logf("scene: %s (world state %u, scene %u, id %#x, level %s): pressing the game's own skip here", why, s.state,
-			s.scene, s.a, tag4(s.level, lt));
+		logf("scene: %s (world state %u, scene %u, id %#x, level %s): pressing the game's own skip here "
+			"(attempt %d of %d)", why, s.state, s.scene, s.a, tag4(s.level, lt), g_skip_tries, SCENE_SKIP_TRIES);
 	}
 	g_skip_step = 1;
-	g_skip_t0 = GetTickCount();
+	g_skip_t0 = now;
 	scene_key(1);   // ESCAPE down
 	InterlockedIncrement(&g_scene_skips);
 }
@@ -3494,12 +3563,10 @@ static void scene_skip_frame(void)
 		scene_skip_release();
 		scene_info s;
 		scene_read(&s);
-		logf("scene: still in the scripted event after the skip ladder (world state %u)", s.state);
+		logf("scene: still in the scripted event after skip attempt %d (world state %u)", g_skip_tries, s.state);
 		InterlockedIncrement(&g_scene_stuck);
-		g_skip_failed = 1;
-		g_skip_fail_a = s.a;
-		g_skip_fail_n = s.name4;
 		g_skip_step = 0;
+		g_skip_retry_at = GetTickCount() + SCENE_SKIP_GAP_MS;   // the game may ignore the first press
 	}
 }
 
@@ -3513,13 +3580,18 @@ static void scene_tick(void)
 	EnterCriticalSection(&g_scene_cs);
 	peer = g_peer_scene;
 	have = g_peer_scene_valid;
-	DWORD last_a = g_peer_last_cine_a, last_n = g_peer_last_cine_n;
 	LeaveCriticalSection(&g_scene_cs);
 	if (!have)
 		return;
 	scene_info me;
 	scene_read(&me);
+	DWORD now = GetTickCount();
 	if (!me.cine) {
+		// A pending skip is only for a scripted event this copy is in (or is still loading into): once this
+		// copy is out of one the peer's leave has either been carried out here or does not apply here, and
+		// keeping it would skip the NEXT scene as well (both copies leave together in the normal case).
+		if (g_pend_active && me.level && now - g_pend_at > 500)
+			g_pend_active = 0;
 		if (peer.cine && me.level && peer.level == me.level) {
 			static DWORD logged_a, logged_n;
 			if (logged_a != peer.a || logged_n != peer.name4) {
@@ -3532,20 +3604,20 @@ static void scene_tick(void)
 		}
 		return;
 	}
-	if (peer.cine)
-		return;   // both copies are in it
-	if (!me.level || peer.level != me.level)
-		return;   // a different level: not the same event
-	// Only the event the peer itself was in counts: a peer that never reported a scripted event has none to
-	// leave together, and this copy must not skip a cutscene the peer simply did not see (yet).
-	if (!last_a && !last_n)
+	if (!g_pend_active)
+		return;   // nothing says the peer left an event: never skip one it simply did not see
+	if (peer.cine) {
+		g_pend_active = 0;   // the peer is in a scripted event again: its leave has been overtaken
 		return;
-	if (last_a != me.a || (last_n && last_n != me.name4))
-		return;   // the peer's last scripted event was a different one
-	if (GetTickCount() - peer.tick > 3000)
-		return;   // stale: the peer is not talking any more
-	if (g_skip_failed && g_skip_fail_a == me.a && g_skip_fail_n == me.name4)
-		return;   // the skip ladder already failed for this exact event; do not hammer it
+	}
+	if (g_pend_level && peer.level && me.level && g_pend_level != me.level) {
+		g_pend_active = 0;   // a different level: not the same event
+		return;
+	}
+	if (now - g_pend_at > SCENE_PEND_MS) {
+		g_pend_active = 0;   // too old to be this scene's leave
+		return;
+	}
 	scene_skip_begin("the peer's copy has left the scripted event and this copy is still in it");
 }
 
@@ -3563,11 +3635,12 @@ static void scene_status(char *reply, size_t replysz)
 	char l1[8], l2[8], a1[8], a2[8];
 	_snprintf(reply, replysz,
 		"scene local state %u scene %u id %s level %s cine %u | peer %s state %u scene %u id %s level %s cine %u"
-		" | sent %ld rcv %ld skips %ld left %ld stuck %ld missed %ld energy %ld",
+		" | sent %ld rcv %ld skips %ld left %ld stuck %ld missed %ld energy %ld"
+		" | leave %lu pend %ld tries %d/%d",
 		(unsigned)me.state, (unsigned)me.scene, tag4(me.a, a1), tag4(me.level, l1), (unsigned)me.cine,
 		have ? "" : "(none)", (unsigned)peer.state, (unsigned)peer.scene, tag4(peer.a, a2), tag4(peer.level, l2),
 		(unsigned)peer.cine, g_scene_sent, g_scene_rcv, g_scene_skips, g_scene_left, g_scene_stuck, g_scene_missed,
-		g_energy_sets);
+		g_energy_sets, (unsigned long)g_leave_seq, (long)g_pend_active, g_skip_tries, SCENE_SKIP_TRIES);
 }
 
 
