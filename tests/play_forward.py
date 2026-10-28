@@ -14,6 +14,7 @@ gated - and any teleport a later test makes must go through tests/tp_to_items.py
 Usage: python -I play_forward.py <pid> [--max-doors N] [--max-rooms N] [--no-save]
 Print only; the SLOT_SCAN.md section is appended at the end of the run.
 """
+import math
 import os
 import sys
 import time
@@ -65,6 +66,30 @@ def pad(lx=0, ly=0, hold=0.5):
     pipe.cmd('pad 0 0 %d %d' % (int(lx), int(ly)))
     time.sleep(hold)
     pipe.cmd('pad 0 0')
+
+
+def stick_set(lx, ly):
+    """Hold a stick direction without releasing it (the walker re-aims 5x a second)."""
+    pipe.cmd('pad 0 0 %d %d' % (int(lx), int(ly)))
+
+
+def stick_off():
+    pipe.cmd('pad 0 0')
+
+
+def cam_yaw():
+    """The camera's ground yaw in radians, as the mod sees it in the view matrix (sync.c g_cam_yaw,
+    printed in degrees by the `cam` command). None when the game has no valid scene camera yet."""
+    r = pipe.cmd('cam')
+    try:
+        parts = r.split()
+        deg = float(parts[parts.index('own') + 1])
+        valid = int(parts[parts.index('valid') + 1])
+    except (ValueError, IndexError):
+        return None
+    if not valid:
+        return None
+    return deg * 3.14159265358979 / 180.0
 
 
 def classify():
@@ -129,29 +154,45 @@ def room_report(label):
 
 # ---- the walker: calibrate the stick, then walk to a point ----------------------------------------
 class Walker:
-    """Drives pad 0 and knows what the stick does in world space. The two basis vectors are measured on
-    the live copy (four stick directions, 0.6 s each) and the pair with the largest area is kept, so
-    walls, a camera at a different angle and a left-handed axis convention all come out of the data."""
+    """Drives pad 0 and knows what the stick does in world space.
+
+    TASK 18: the stick is CAMERA-RELATIVE ("stick up = the camera's forward", src/obscoop2.c
+    remap_stick) and this game's camera turns to follow the character, so a stick held in one place
+    curves the walk into a circle: the old walker measured one stick->world basis and kept using it,
+    which is only true while the camera does not move. The fix is to aim with the live camera yaw the
+    mod publishes (`cam` -> g_cam_yaw from the view matrix) and re-aim several times a second:
+
+        world angle = up_world + (yaw_now - yaw_at_calibration) + sign * atan2(lx, ly)
+
+    `sign` and `up_world` come from two short measured presses (up and right), so an unexpected axis
+    convention still comes out of the data. When the mod has no valid camera yaw, the old measured
+    two-vector basis is used instead."""
 
     def __init__(self, pl=0):
         self.pl = pl
-        self.basis = None      # [((lx, ly) pressed, (dx, dy) measured), (...)]
+        self.basis = None      # fallback: [((lx, ly) pressed, (dx, dy) measured), (...)]
+        self.up_world = None   # world ground angle (radians) that "stick up" produced
+        self.sign = 1.0        # world = up_world + sign * atan2(lx, ly)
+        self.yaw_at_cal = None
+        self.yaw_ok = False
+        self.walked = 0.0      # path length walked by this walker (units)
 
     def _move(self, lx, ly, hold):
         before = player_pos(m, self.pl)
+        y0 = cam_yaw()
         pad(lx, ly, hold)
-        time.sleep(0.4)
+        time.sleep(0.25)
         after = player_pos(m, self.pl)
-        return (after[0] - before[0], after[1] - before[1], after[2] - before[2])
+        return (after[0] - before[0], after[1] - before[1], after[2] - before[2]), y0
 
     def calibrate(self):
         print('')
-        print('== stick calibration (what does the pad do in world space?)')
+        print('== stick calibration (what does the pad do in world space, and is it camera-relative?)')
         dirs = []
         for lx, ly, name in ((0, 30000, 'up'), (0, -30000, 'down'), (-30000, 0, 'left'), (30000, 0, 'right')):
-            best = (0.0, 0.0)
+            best, best_yaw = (0.0, 0.0), None
             for attempt in range(3):
-                d = self._move(lx, ly, 0.6)
+                d, y0 = self._move(lx, ly, 0.6)
                 planar = (d[0] ** 2 + d[1] ** 2) ** 0.5
                 if planar > 2000.0:
                     print('   stick %-5s for 0.6 s -> (%+.1f, %+.1f): %.0f units is not a walk (a level script'
@@ -159,12 +200,36 @@ class Walker:
                     time.sleep(1.5)
                     continue
                 if planar > (best[0] ** 2 + best[1] ** 2) ** 0.5:
-                    best = (d[0], d[1])
+                    best, best_yaw = (d[0], d[1]), y0
                 if (best[0] ** 2 + best[1] ** 2) ** 0.5 > 40.0:
                     break
-            print('   stick %-5s 0.6 s -> world (%+.1f, %+.1f) (planar %.1f)'
-                  % (name, best[0], best[1], (best[0] ** 2 + best[1] ** 2) ** 0.5))
-            dirs.append(((float(lx), float(ly)), best))
+            ang = None
+            if (best[0] ** 2 + best[1] ** 2) ** 0.5 > 20.0:
+                ang = math.atan2(best[1], best[0])
+            print('   stick %-5s 0.6 s -> world (%+.1f, %+.1f) (planar %.1f, angle %s, camera yaw %s)'
+                  % (name, best[0], best[1], (best[0] ** 2 + best[1] ** 2) ** 0.5,
+                     '-' if ang is None else '%.0f deg' % (ang * 180 / math.pi),
+                     '-' if best_yaw is None else '%.0f deg' % (best_yaw * 180 / math.pi)))
+            dirs.append(((float(lx), float(ly)), best, ang, best_yaw))
+        # the camera-relative model comes from the perpendicular presses. A tight room can block one of
+        # them (a wall 12 units away), so the opposite press supplies the direction when needed.
+        def flip(a):
+            return None if a is None else math.atan2(math.sin(a + math.pi), math.cos(a + math.pi))
+
+        up_ang, up_yaw = dirs[0][2], dirs[0][3]
+        if up_ang is None:
+            up_ang, up_yaw = flip(dirs[1][2]), dirs[1][3]
+        right_ang = dirs[3][2] if dirs[3][2] is not None else flip(dirs[2][2])
+        if up_ang is not None and right_ang is not None and up_yaw is not None:
+            diff = math.atan2(math.sin(right_ang - up_ang), math.cos(right_ang - up_ang))
+            self.up_world = up_ang
+            self.sign = 1.0 if diff > 0 else -1.0
+            self.yaw_at_cal = up_yaw
+            self.yaw_ok = abs(abs(diff) - math.pi / 2) < math.pi / 4   # the presses are ~90 deg apart
+            print('   camera-relative model: "up" is world %.0f deg at camera yaw %.0f deg, "right" is %+.0f deg '
+                  'from "up" (expected +-90) -> %s'
+                  % (self.up_world * 180 / math.pi, self.yaw_at_cal * 180 / math.pi, diff * 180 / math.pi,
+                     'aiming with the live camera yaw' if self.yaw_ok else 'NOT camera-relative, measuring a basis'))
         pair, best_det = None, 0.0
         for i in range(len(dirs)):
             for j in range(i + 1, len(dirs)):
@@ -177,20 +242,29 @@ class Walker:
         if pair is None:
             print('   the character does not walk in this room (pad ignored or blocked)')
             return False
-        self.basis = list(pair)
+        self.basis = [(pair[0][0], pair[0][1]), (pair[1][0], pair[1][1])]
         print('   basis: stick (+%.0f, +%.0f) -> (%+.1f, %+.1f), stick (%+.0f, %+.0f) -> (%+.1f, %+.1f), area %.0f'
               % (pair[0][0][0], pair[0][0][1], pair[0][1][0], pair[0][1][1],
                  pair[1][0][0], pair[1][0][1], pair[1][1][0], pair[1][1][1], best_det))
         return True
 
     def stick_for(self, d):
-        """Stick (lx, ly) that walks along world direction d: solve d = a*w1 + b*w2, stick = a*s1 + b*s2."""
+        """Stick (lx, ly) that walks along world direction d."""
+        n = (d[0] ** 2 + d[1] ** 2) ** 0.5 or 1.0
+        dx, dy = d[0] / n, d[1] / n
+        theta = math.atan2(dy, dx)
+        y = cam_yaw()
+        if self.yaw_ok and y is not None:
+            up_now = self.up_world + (y - self.yaw_at_cal)
+            phi = self.sign * (theta - up_now)
+            phi = math.atan2(math.sin(phi), math.cos(phi))
+            return int(math.sin(phi) * 30000), int(math.cos(phi) * 30000)
+        if not self.basis:
+            return 0, 0
         (s1, w1), (s2, w2) = self.basis
         det = w1[0] * w2[1] - w1[1] * w2[0]
         if abs(det) < 1.0:
             return 0, 0
-        n = (d[0] ** 2 + d[1] ** 2) ** 0.5 or 1.0
-        dx, dy = d[0] / n, d[1] / n
         a = (dx * w2[1] - dy * w2[0]) / det
         b = (w1[0] * dy - w1[1] * dx) / det
         lx = a * s1[0] + b * s2[0]
@@ -200,35 +274,70 @@ class Walker:
             lx, ly = lx * 30000.0 / big, ly * 30000.0 / big
         return int(lx), int(ly)
 
-    def walk_to(self, target, tol=70.0, limit=25.0, stop_on_block=2):
+    def walk_to(self, target, tol=70.0, limit=25.0, stop_on_block=4):
+        """Hold the stick (it is never released) and re-aim about 6x a second from the live camera yaw
+        and position: the camera turns with the character, so a stick set once curves the walk.
+        A block is handled like a player would: keep walking along the obstacle (one side, chosen per
+        goal), then re-aim; flip the side if that loses ground."""
         t0, stuck, last, sidestep = time.time(), 0, None, 0
+        side = 1.0
+        blocks = 0
+        best_have = None
+        have_at_side = None
         while time.time() - t0 < limit:
             p = player_pos(m, self.pl)
+            if last is not None:
+                self.walked += dist2d(p, last)
             d = (target[0] - p[0], target[1] - p[1])
             have = (d[0] ** 2 + d[1] ** 2) ** 0.5
             if have <= tol:
-                print('   walk: reached (%.1f, %.1f, %.1f), %.0f from the goal' % (p[0], p[1], p[2], have))
+                stick_off()
+                print('   walk: reached (%.1f, %.1f, %.1f), %.0f from the goal (%.0f units walked so far)'
+                      % (p[0], p[1], p[2], have, self.walked))
                 return True
-            if last is not None and dist3(p, last) < 1.0:
+            if best_have is None or have < best_have:
+                best_have = have
+            if last is not None and dist2d(p, last) < 2.0:
                 stuck += 1
             else:
                 stuck = 0
             last = p
             if stuck >= stop_on_block:
-                perp = (-d[1], d[0]) if sidestep % 2 == 0 else (d[1], -d[0])
-                lx, ly = self.stick_for(perp)
-                print('   walk: blocked at (%.1f, %.1f, %.1f); sidestep %d' % (p[0], p[1], p[2], sidestep + 1))
-                pad(lx, ly, 0.5)
+                blocks += 1
+                if have_at_side is not None and have > have_at_side + 40.0:
+                    side = -side          # that way lost ground: hug the other side
+                have_at_side = have
+                n = have or 1.0
+                ux, uy = d[0] / n, d[1] / n
+                if blocks % 4 == 0:
+                    # cornered: back out the way we came, then try again
+                    lx, ly = self.stick_for((-ux, -uy))
+                    print('   walk: cornered at (%.1f, %.1f, %.1f); backing out' % (p[0], p[1], p[2]))
+                    hold = 1.2
+                    side = -side if blocks % 8 == 0 else side
+                else:
+                    lx, ly = self.stick_for((-uy * side, ux * side))
+                    print('   walk: blocked at (%.1f, %.1f, %.1f); following the wall, side %+d (%d)'
+                          % (p[0], p[1], p[2], int(side), sidestep + 1))
+                    hold = 1.5
                 sidestep += 1
+                stick_set(lx, ly)
+                t1 = time.time()
+                while time.time() - t1 < hold:
+                    q = player_pos(m, self.pl)
+                    self.walked += dist2d(q, last)
+                    last = q
+                    time.sleep(0.15)
                 stuck = 0
-                time.sleep(0.2)
                 continue
             lx, ly = self.stick_for(d)
-            f = 1.0 if have > 250 else max(0.3, have / 250.0)
-            pad(int(lx * f), int(ly * f), 0.5)
+            f = 1.0 if have > 200 else max(0.4, have / 200.0)
+            stick_set(int(lx * f), int(ly * f))
+            time.sleep(0.15)
+        stick_off()
         p = player_pos(m, self.pl)
-        print('   walk: gave up at (%.1f, %.1f, %.1f), %.0f from the goal'
-              % (p[0], p[1], p[2], dist2d(p, target)))
+        print('   walk: gave up at (%.1f, %.1f, %.1f), %.0f from the goal (best %.0f)'
+              % (p[0], p[1], p[2], dist2d(p, target), best_have if best_have is not None else 0))
         return False
 
     def walk_via(self, goal, waypoints, tol=70.0):
@@ -297,24 +406,35 @@ def try_door(rec, walker, kind, markers=()):
     d = (rec['pos'][0] - p[0], rec['pos'][1] - p[1])
     n = (d[0] ** 2 + d[1] ** 2) ** 0.5 or 1.0
     goal = (rec['pos'][0] - d[0] / n * 80.0, rec['pos'][1] - d[1] / n * 80.0, rec['pos'][2])
-    old_lv, old_w, old_p = level(m), world(m), p
+    old_lv, old_w = level(m), world(m)
     reached = walker.walk_via(goal, markers, tol=90.0)
     if not reached:
         # fall back to the door itself (a loading zone triggers on its own centre, a door may be wide)
-        reached = walker.walk_to(rec['pos'], tol=60.0, limit=15.0)
-    if not reached:
-        print('   could not reach the %s (character at %s)' % (kind, player_pos(m, 0)))
+        reached = walker.walk_to(rec['pos'], tol=60.0, limit=20.0)
+    near = dist2d(player_pos(m, 0), rec['pos'])
+    if not reached and near > 250.0:
+        print('   could not reach the %s (character at %s, %.0f from it)' % (kind, player_pos(m, 0), near))
         return None
-    print('   at the %s: character %s, interaction scan target +0x73c = %#x (%s)'
-          % (kind, player_pos(m, 0), interact_target(), rtti(m, interact_target()) if interact_target() else '-'))
+    if not reached:
+        print('   gave up %.0f short of the %s but that is close enough to try it' % (near, kind))
+    old_p = player_pos(m, 0)   # the transition is measured from HERE, not from where the walk started
+    print('   at the %s: character %s (%.0f from it, its radius +0xa0 = %s), interaction scan target +0x73c = %#x (%s)'
+          % (kind, old_p, dist2d(old_p, rec['pos']), f32(m, rec['addr'] + 0xa0),
+             interact_target(), rtti(m, interact_target()) if interact_target() else '-'))
     if kind == 'door':
-        for attempt in range(3):
+        for attempt in range(4):
             print('   pressing A (attempt %d)' % (attempt + 1))
             press(pipe, 0, 'A', 0.4)
             time.sleep(1.5)
             how = wait_transition(old_lv, old_w, old_p, 6.0)
             if how:
                 return how
+            if attempt in (0, 1):
+                # walk right onto the door itself, then press again
+                print('   no transition yet; walking onto the door itself (%s)' % (rec['pos'],))
+                if walker.walk_to(rec['pos'], tol=40.0, limit=10.0):
+                    print('   interaction scan target +0x73c = %#x (%s)'
+                          % (interact_target(), rtti(m, interact_target()) if interact_target() else '-'))
         print('   no transition')
         return None
     return wait_transition(old_lv, old_w, old_p, 15.0)
@@ -385,6 +505,8 @@ for rec, kind in queue:
         break
 
 print('\n== forward play summary')
+if walker is not None:
+    print('   %d units of walking measured by the walker (camera-yaw aiming, TASK 18)' % round(walker.walked))
 for r in rows:
     print('  %-24s level %s entities %3d live %d enemies %d spawners %d at %s'
           % (r['label'][:24], r['level'], r['entities'], r['live'], r['enemies'], r['spawners'], r['p']))

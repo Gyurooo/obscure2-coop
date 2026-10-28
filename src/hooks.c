@@ -167,6 +167,11 @@ static void guest_weapons_frame(void);   // sync.c: the guest's held weapons, ap
 static void __fastcall hk_input_update(void *self, void *edx, int dt)
 {
 	unsigned ch = *(unsigned *)((BYTE *)self + 4);
+	if (g_passive) {   // OBSCOOP_PASSIVE: leave the game's own state alone
+		if (g_input_update)
+			g_input_update(self, edx, dt);
+		return;
+	}
 	if (ch && !IsBadWritePtr((void *)(uintptr_t)(ch + 0x880), 8)) {
 		*(unsigned *)(uintptr_t)(ch + 0x880) = 0;
 		*(unsigned *)(uintptr_t)(ch + 0x884) = 0;

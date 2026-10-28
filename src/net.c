@@ -477,6 +477,11 @@ static int env_int(const char *name, int def)
 static void net_start(void)
 {
 	char role[16] = "", net[16] = "udp", peer[64] = "127.0.0.1", hostid[32] = "";
+	if (getenv("OBSCOOP_PASSIVE")) {   // TASK 18 test switch: no net at all
+		g_role = 0;
+		logf("passive: net not started");
+		return;
+	}
 	GetEnvironmentVariableA("OBSCOOP_ROLE", role, sizeof role);
 	GetEnvironmentVariableA("OBSCOOP_NET", net, sizeof net);
 	GetEnvironmentVariableA("OBSCOOP_PEER", peer, sizeof peer);

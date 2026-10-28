@@ -114,3 +114,27 @@ Why (OBSERVED, `tests/probe_control.py` on H000): the game's own menu buttons (A
 do not change anything, the four 1-second stick presses move the character 0.0 units each, and 20 s of a
 held stick moves it 0.0 units. In I007 and G003 the character walks a few hundred units after the load and
 then stops dead. That is the same missing-collision picture FINDINGS_16 section 7 describes.
+
+## TASK 18 correction to section "What the scan shows" 5 and to the Part C conclusions
+
+Section 5 above ("the character does not move when the pad is pressed in this solo host run ... LEFT for
+3 s, player 1 position unchanged") and the Part C paragraph ("walks a few hundred units and then stops
+dead ... the same missing-collision picture") are **superseded**. `tests/probe_move.py` measured the same
+worlds and the pad works in every one of them (TASK 18, FINDINGS_18.md §1-§2):
+
+* 1 s presses move the character 10-322 units in every save slot tried (I007, J005, I100, H000, G003), and
+  a held stick walks at ~280-320 units/s.
+* where the character "stopped dead" the reverse stick moves it 390-435 units at once: it had walked into a
+  wall, not lost its input.
+* holding one stick walks a **circle** (the stick is camera-relative and the camera follows the character),
+  so a short fixed-duration sample can end near the start position - which is what "LEFT for 3 s,
+  position unchanged" recorded.
+* the "0.0 units in 20 s" of `probe_control.py` is the **pause menu**: that probe presses START before it
+  measures, and a paused game ignores the pad (0.0 units with the menu open, 264.5 units again once it is
+  closed, same world, same pad).
+
+The walker used for Part C was fixed accordingly (`tests/play_forward.py`: aim with the live camera yaw and
+re-aim ~6 times a second); it then walked 8335-11332 units on I007 and reached the level's nearest door.
+What remains open is the door interaction itself: a `CToeDoor` that is eligible for the game's interaction
+scan (p20 = 1, gates 0, radius 200) is never selected at 61-70 units and does not open on A (FINDINGS_18
+§5).

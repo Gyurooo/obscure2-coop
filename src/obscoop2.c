@@ -458,6 +458,7 @@ static CRITICAL_SECTION g_vpad_cs;
 
 static int g_seeded_ipt;   // 1 = copied the shipped gamepad input map into the co-op profile, -1 = failed
 static int g_role;   // 0 off, 1 host, 2 guest (net.c)
+static int g_passive;   // OBSCOOP_PASSIVE=1: no net and no input-hook writes (TASK 18 test switch)
 static xstate g_netpad;                 // guest: the host's controller (net.c)
 static volatile DWORD g_netpad_tick;
 static int g_local_pad;
@@ -1496,6 +1497,11 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	logf("background running %s", g_background ? "on" : "off");
 	g_hide_real_pads = GetEnvironmentVariableA("OBSCOOP_HIDE_REAL_PADS", bg, sizeof bg) && bg[0] == '1';
 	logf("real controllers %s", g_hide_real_pads ? "hidden" : "visible");
+	// OBSCOOP_PASSIVE=1 (TASK 18): the mod behaves like a plain proxy - no net, and the input hook does
+	// not touch the game's own state. The command pipe and the virtual pad still work, so a test can
+	// drive and read the game while proving that the mod's other features change nothing.
+	g_passive = GetEnvironmentVariableA("OBSCOOP_PASSIVE", bg, sizeof bg) && bg[0] == '1';
+	logf("passive mode %s (no net, no input hook writes)", g_passive ? "on" : "off");
 	{ char m[8]; g_multi = GetEnvironmentVariableA("OBSCOOP_MULTI", m, sizeof m) && m[0] == '1'; }
 	sync_init();
 	install_request_hooks();
