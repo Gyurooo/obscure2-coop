@@ -244,6 +244,50 @@ ok = True
 results = []
 
 
+TRACE = os.environ.get('OBSCOOP_PICKUP_TRACE') == '1'
+
+
+def inv_raw(m):
+    """Every inventory entry as (tag, 32 raw bytes in hex), for a before/after diff."""
+    w = world(m)
+    inv = u32(m, w + 0x1790) if w else 0
+    if not inv:
+        return []
+    out = []
+    for i in range(min(u32(m, inv + 4), 99)):
+        a = inv + 8 + i * 0x20
+        out.append((tag(u32(m, a + 4)), ''.join('%08x' % u32(m, a + k) for k in range(0, 0x20, 4))))
+    return out
+
+
+def inv_diff(name, before, after):
+    print('   %s inventory: %d -> %d entries' % (name, len(before), len(after)))
+    for i in range(max(len(before), len(after))):
+        b = before[i] if i < len(before) else None
+        a = after[i] if i < len(after) else None
+        if b != a:
+            print('     [%2d] %s -> %s' % (i, b, a))
+
+
+def anim_trace(m, pl, stop, out):
+    """Sample player pl's animation state (+0x2dc) every 50 ms until stop is set."""
+    while not stop.is_set():
+        hh = player_human(m, pl)
+        out.append(u32(m, hh + 0x2dc) if hh else None)
+        time.sleep(0.05)
+
+
+def runs(seq):
+    """Compress a sample list to 'value x count' runs."""
+    r = []
+    for v in seq:
+        if r and r[-1][0] == v:
+            r[-1][1] += 1
+        else:
+            r.append([v, 1])
+    return ' '.join('%s x%d' % ('%x' % v if v is not None else '-', n) for v, n in r)
+
+
 def collect(phase, who, pipe, m, pl, item, other_pipe, om, other_name, hold=(), force=True):
     """Teleport `who`'s player `pl` onto `item`, press A, wait for the local collect, then the peer.
 
@@ -258,6 +302,14 @@ def collect(phase, who, pipe, m, pl, item, other_pipe, om, other_name, hold=(), 
           % (phase, who, pl + 1, tag(cls), pos[0], pos[1], pos[2]))
     before_send, before_rcv = pickup_stat(pipe), pickup_stat(other_pipe)
     inv0 = (inventory(m), inventory(om))
+    if TRACE:
+        import threading
+        raw0 = (inv_raw(mh), inv_raw(mg))
+        stop, tr_m, tr_o = threading.Event(), [], []
+        ths = [threading.Thread(target=anim_trace, args=(m, pl, stop, tr_m)),
+               threading.Thread(target=anim_trace, args=(om, pl, stop, tr_o))]
+        for t in ths:
+            t.start()
     got = False
     forced = False
     for attempt in range(3):
@@ -308,6 +360,14 @@ def collect(phase, who, pipe, m, pl, item, other_pipe, om, other_name, hold=(), 
         time.sleep(0.5)
     print('inventory after: host %s guest %s (before %s / %s)' % (
         inventory(mh), inventory(mg), inv0[0], inv0[1]))
+    if TRACE:
+        stop.set()
+        for t in ths:
+            t.join()
+        print('   anim +0x2dc of player %d on %s (50 ms samples): %s' % (pl + 1, who, runs(tr_m)))
+        print('   anim +0x2dc of player %d on %s (50 ms samples): %s' % (pl + 1, other_name, runs(tr_o)))
+        inv_diff('host', raw0[0], inv_raw(mh))
+        inv_diff('guest', raw0[1], inv_raw(mg))
     print('inventory tags host: %s' % ' '.join(inv_tags(mh)))
     print('inventory tags guest: %s' % ' '.join(inv_tags(mg)))
     print('%s sync:  %s' % (who, pipe.cmd('sync')))
