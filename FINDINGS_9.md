@@ -5,7 +5,7 @@ with the address/line named; GUESS = plausible but untested; UNKNOWN = not estab
 
 ## 1. The failing run, re-read from the logs on disk
 
-Source: `C:\Users\gyuro\coop-anything-obscure\local\obscure2-test\obscoop.log` (host) and
+Source: `<test root>\obscure2-test\obscoop.log` (host) and
 `...\obscure2-test2\obscoop.log` (guest), the run of 23:48:29-23:50:45, the same run the task quotes.
 Both copies share one PC clock and one log format (`HH:MM:SS.mmm [thread] ...`).
 
