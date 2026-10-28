@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 17   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 18   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -40,10 +40,12 @@
                         //     also carries the battery/energy (inventory+0xc88) a story event may set
                         // 17: TASK 31: pkt_scene carries leave_seq, so "I left the event" is an event that
                         //     cannot be lost (the receiver keeps a pending skip instead of comparing scene ids)
+                        // 18: TASK 34, PKT_DOOR: a used door/transition object plays on the other copy too;
+                        //     PKT_LEVELASK: the guest's own (dropped) ChangeLevel is asked of the host
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,
-	PKT_APT = 21, PKT_SCENE = 22 };
+	PKT_APT = 21, PKT_SCENE = 22, PKT_DOOR = 23, PKT_LEVELASK = 24 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
 
 #pragma pack(push, 1)
@@ -119,6 +121,16 @@ typedef struct { pkt_hdr h; DWORD kind; DWORD level; DWORD ch_tag; DWORD cls, id
 // peer has left too.
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD state; DWORD scene; DWORD flags; DWORD a, b, d;
                  DWORD name4; DWORD cine; DWORD leave_seq; } pkt_scene;
+// TASK 34: a level-transition object (a door) was used on one copy. kind 1 = the use started. cls is the
+// entity's class vtable address (the same on both copies: same exe build), id its +4, pos its +0x6c,
+// ch_tag the character that used it. The receiver replays the game's own use path (vtable+0x34 then
+// vtable+0x70) on its own copy of the same entity with the same character, so the door animation plays
+// on both copies instead of only the level change.
+typedef struct { pkt_hdr h; DWORD kind; DWORD level; DWORD ch_tag; DWORD cls, id; float pos[3]; } pkt_door;
+// TASK 34: the guest's own ChangeLevel is not performed (the host decides). Once the host's own path has
+// had its chance (the guest used the same door, so the host runs it too), the guest asks the host to do
+// it; kind 1 = ask, kind 2 = cancel (the host already asked for that level and it was applied).
+typedef struct { pkt_hdr h; DWORD kind; DWORD level, entry, flag; } pkt_levelask;
 #pragma pack(pop)
 
 static void guest_on_state(const char *buf, int n);
@@ -138,6 +150,8 @@ static void peer_on_prop(const char *buf, int n);
 static void guest_on_props(const char *buf, int n);
 static void peer_on_apt(const char *buf, int n);
 static void peer_on_scene(const char *buf, int n);   // TASK 30: the peer's scripted-event state (both roles)
+static void peer_on_door(const char *buf, int n);    // TASK 34: a door used on the peer (both roles)
+static void host_on_levelask(const char *buf, int n);   // TASK 34: the guest asks the host for a level change
 static unsigned rd32(unsigned addr);      // sync.c
 static unsigned world_obj(void);          // sync.c
 static int guest_need_saves(void);        // sync.c: this process has no save file from the host yet
@@ -419,6 +433,12 @@ static void net_handle(const char *buf, int n, sid_t from)
 		case PKT_SCENE:
 			peer_on_scene(buf, n);  // TASK 30: the guest's scripted-event state / its skip
 			break;
+		case PKT_DOOR:
+			peer_on_door(buf, n);   // TASK 34: the guest used a door: play the same door use here
+			break;
+		case PKT_LEVELASK:
+			host_on_levelask(buf, n);   // TASK 34: the guest's own level change, applied here
+			break;
 		}
 	} else if (g_role == 2) {
 		if (!g_peer_ok) {
@@ -463,6 +483,8 @@ static void net_handle(const char *buf, int n, sid_t from)
 		peer_on_apt(buf, n);
 	} else if (h->type == PKT_SCENE) {
 		peer_on_scene(buf, n);   // TASK 30: the host's scripted-event state / its skip
+	} else if (h->type == PKT_DOOR) {
+		peer_on_door(buf, n);    // TASK 34: the host used a door: play the same door use here
 	} else if (h->type == PKT_STATE) {
 			guest_on_state(buf, n);
 		} else if (h->type == PKT_REGION) {

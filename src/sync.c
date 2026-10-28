@@ -32,6 +32,7 @@ static unsigned world_obj(void) { unsigned g = game_obj(); return g ? rd32(g + 0
 static volatile LONG g_scene_sent, g_scene_rcv, g_scene_skips, g_scene_left, g_scene_stuck, g_scene_missed, g_energy_sets;
 static int scene_local_cinematic(void);
 static void scene_tick(void);
+static int door_animation_running(void);   // TASK 34: a local door use is still animating
 
 // Fills out with the characters in the human manager; returns how many.
 static int world_humans(unsigned *out, int max)
@@ -1997,6 +1998,52 @@ static pkt_char g_rx_char, g_rx_char_prev;
 static volatile LONG g_rx_char_new;
 static volatile LONG g_char_rcv, g_char_applied, g_char_blends, g_char_snaps, g_char_skipped, g_char_sent, g_char_extrap;
 
+// TASK 34: the remote character's animation state (character+0x2dc) is taken from the stream only when the
+// streamed value has disagreed with the local simulation for ANIM_FORCE_MS. Both copies simulate both
+// characters from the streamed pads, so a short difference is an action the local game is already
+// playing (aim stance, swing, item use); writing the owner's value on every packet reset that animation
+// to a state one link delay old, which is why the owner saw no attack animation on the other PC. A
+// persistent difference is a state the local simulation cannot produce (death, a respawn, a scripted
+// animation) and is taken over.
+#define ANIM_FORCE_MS 250
+#define ANIM_TRACK 10
+typedef struct { DWORD tag, since, want; } anim_hold;
+static anim_hold g_anim_hold[ANIM_TRACK];
+static volatile LONG g_anim_forced;
+
+static void anim_apply_remote(unsigned h, DWORD tag, DWORD anim)
+{
+	if (!h || IsBadWritePtr((void *)(uintptr_t)(h + 0x2dc), 4))
+		return;
+	DWORD now = GetTickCount();
+	anim_hold *e = 0;
+	for (int i = 0; i < ANIM_TRACK; i++) {
+		if (g_anim_hold[i].tag == tag) { e = &g_anim_hold[i]; break; }
+		if (!g_anim_hold[i].tag && !e) e = &g_anim_hold[i];
+	}
+	if (!e)
+		return;
+	DWORD cur = rd32(h + 0x2dc);
+	if (!e->tag) {
+		e->tag = tag;
+		e->since = now;
+		e->want = anim;
+	}
+	if (anim == cur) {
+		e->since = now;   // the two agree: nothing to take over
+		e->want = anim;
+		return;
+	}
+	if (e->want != anim) {   // a different value from the last packet: restart the timer
+		e->want = anim;
+		e->since = now;
+	}
+	if (now - e->since >= ANIM_FORCE_MS) {
+		*(DWORD *)(uintptr_t)(h + 0x2dc) = anim;
+		InterlockedIncrement(&g_anim_forced);
+	}
+}
+
 static void host_on_char(const char *buf, int n)
 {
 	if (n != (int)sizeof(pkt_char))
@@ -2059,7 +2106,7 @@ static void host_apply_remote_char(void)
 			pos[0] += ex * kk; pos[1] += ey * kk; pos[2] += ez * kk;
 			InterlockedIncrement(&g_char_blends);
 		}
-		*(DWORD *)(uintptr_t)(hs[k] + 0x2dc) = p.me.anim;   // the guest owns its character's animation
+		anim_apply_remote(hs[k], p.me.tag, p.me.anim);   // TASK 34: only a persistent divergence is taken over
 		InterlockedIncrement(&g_char_applied);
 		break;
 	}
@@ -2513,7 +2560,7 @@ static void guest_apply_state(void)
 				InterlockedIncrement(&g_applied);
 				break;
 			}
-			*(DWORD *)(uintptr_t)(hs[k] + 0x2dc) = st.ch[i].anim;   // death/animation state from the host
+			anim_apply_remote(hs[k], st.ch[i].tag, st.ch[i].anim);   // TASK 34: only a persistent divergence
 			// the error is measured against where this copy's character was at the snapshot's time
 			float ref[3] = { pos[0], pos[1], pos[2] };
 			int timed = g_clock_valid && hist_at(st.ch[i].tag, st.t_ms, ref);
@@ -3172,6 +3219,19 @@ static void guest_apply_requests(void)
 				return;
 			}
 			waited = GetTickCount() - seen;
+			// TASK 34: this copy's own door animation is still running (it reaches its ChangeLevel when it
+			// ends, which clears the flag). Rebuilding the world now would cut the animation the owner saw
+			// cut when the host's request arrived first. Keep the request queued; the door guard is short.
+			if (g_role == 2 && door_animation_running()) {
+				static DWORD logged;
+				LeaveCriticalSection(&g_req_cs);
+				if (!logged || GetTickCount() - logged > 3000) {
+					logged = GetTickCount();
+					char lv[5];
+					logf("guest: level request %s held until this copy's door animation ends", tag4(r.a, lv));
+				}
+				return;
+			}
 			// The world is rebuilt from the progress character table during state 4, so the host's party
 			// (PKT_REGION) has to be here first or the guest spawns its own and a late table never reaches
 			// the rebuilt world (PARTY_FINDINGS 4.8). Wait for it, but not forever.
@@ -3205,6 +3265,11 @@ static void guest_apply_requests(void)
 			g_lvl_req_done_a = r.a;
 			g_lvl_req_done_b = r.b;
 			g_lvl_req_done_at = GetTickCount();
+			// TASK 34: the rebuilt world may ask "player 2 is joining"; accept it on this copy too (the
+			// pulse is added to both served pads in XInputGetState for 150 ms, 4.5 s from now).
+			g_accept_at = GetTickCount() + 4500;
+			g_accept_until = g_accept_at + 150;
+			logf("join dialog: auto-accept pulse in 4.5 s (this copy's pads)");
 		}
 		LeaveCriticalSection(&g_req_cs);
 		if (r.kind == REQ_LEVEL && g_lvl_defer_level == r.a) {
@@ -3314,6 +3379,11 @@ static void guest_follow_own_player(void)
 static DWORD g_scene_enter_tick;
 static DWORD g_leave_seq;      // this copy's leaves of a scripted event (sent as pkt_scene.leave_seq)
 static DWORD g_leave_t0;       // when this copy last left a scripted event
+// TASK 34: no skip within this window after the world was rebuilt. A level change tears the world down
+// and builds a new one; pressing the cinematic skip (ESCAPE) while the game is still settling opens the
+// pause menu instead of skipping, which is the guest's "it pauses by itself when we change location".
+static DWORD g_scene_guard_until;
+static DWORD g_scene_guard_level;
 
 // TASK 31: the leave is an event, not a state to compare. The leaving copy repeats it for a few seconds
 // (and only while the peer still reports a scripted event at the same level), the receiver arms a pending
@@ -3328,10 +3398,26 @@ typedef struct { DWORD t_ms, level, state, scene, flags, a, b, d, name4, cine; D
 
 // 1 when a state pair means "a scripted event is being presented on this copy". The pause menu (5) and
 // the game-over state (0x11) are local states, not scripted events: pausing must not stop or skip the peer.
+// TASK 34: a level load leaves world+0x12c holding the previous scene kind while world+0x11c is 0/4, so a
+// loading copy used to count as "in a cutscene". Only a level state of 6 (cinematic presentation) or a
+// scene kind inside a normal level (state 1) is a real cutscene; anything else is logged but never skipped.
 static int scene_cinematic(unsigned state, unsigned scene)
 {
-	return state == 6 || scene != 0;
+	if (state == 6)
+		return 1;
+	return state == 1 && scene != 0;
 }
+
+// TASK 34: the game is in a level and no level/load request is pending. A skip is never pressed outside it.
+static int scene_in_level_now(void)
+{
+	unsigned g = game_obj();
+	if (!g || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0)
+		return 0;
+	unsigned w = world_obj();
+	return w && rd32(w + 4) != 0;
+}
+
 
 static void scene_read(scene_info *s)
 {
@@ -3373,6 +3459,22 @@ static DWORD g_peer_last_leave_seq;   // the peer's leave counter this copy has 
 static volatile LONG g_pend_active;
 static volatile LONG g_pend_gen;      // one per received leave: restarts the skip-attempt counter
 static DWORD g_pend_at, g_pend_level, g_pend_a;
+
+// TASK 34: true only for a real cutscene this copy may be asked to leave. A pending skip is carried out
+// only through this test, so a skip can never be pressed during a load, in a menu or right after a level
+// change (the cases that opened the pause menu and crashed the guest).
+static int scene_skippable(void)
+{
+	scene_info s;
+	scene_read(&s);
+	if (!s.cine || !s.level)
+		return 0;
+	if (!scene_in_level_now())
+		return 0;
+	if ((LONG)(GetTickCount() - g_scene_guard_until) < 0)
+		return 0;
+	return 1;
+}
 
 static void scene_pending_arm(DWORD level, DWORD a, DWORD seq, const char *why)
 {
@@ -3483,20 +3585,16 @@ static void scene_send(void)
 }
 
 // ---- the skip ---------------------------------------------------------------------------------------
-// Pressed only while this copy is in a scripted event. ESCAPE is what the game's own cinematic takes
-// (OBSERVED, FINDINGS_30 §5); START and A are the pad buttons the game also accepts. Each is held for
-// ~150 ms and the next is tried 160 ms later, so the sequence cannot look like a double press.
+// Pressed only while this copy is in a real cutscene (scene_skippable). ESCAPE is what the game's own
+// cinematic takes (OBSERVED, FINDINGS_30 §5). TASK 34: START and A are NOT tried any more - START is the
+// pause key and A the action key, and a skip that lands one frame after the cutscene ended opened the
+// guest's pause menu on every location change (the owner's "it pauses by itself"). One short press, held
+// ~140 ms, and the release as soon as the copy is out of the scene.
 static int g_skip_step;
 static DWORD g_skip_t0;
 static DWORD g_skip_retry_at;             // a failed ladder: do not start the next one before this tick
 static int g_skip_tries;                  // ladders started for the current received leave
 static LONG g_skip_gen;                   // the leave (g_pend_gen) those tries belong to
-
-static void scene_vpad(unsigned buttons, int on)
-{
-	int pad = g_role == 2 ? g_local_pad : 0;   // the pad this copy's own player is on
-	vpad_set(pad, on, on ? buttons : 0, 0, 0, 0, 0, 0, 0);
-}
 
 // The keyboard path needs BOTH: g_vkeys feeds the polled key state (DirectInput GetDeviceState, which is
 // what the cinematic's own input check reads) and keyq_push feeds the buffered records (menus). The pipe
@@ -3511,8 +3609,6 @@ static void scene_key(int down)
 static void scene_skip_release(void)
 {
 	scene_key(0);
-	scene_vpad(0x10, 0);
-	scene_vpad(0x1000, 0);
 }
 
 static void scene_skip_begin(const char *why)
@@ -3527,6 +3623,8 @@ static void scene_skip_begin(const char *why)
 		g_skip_retry_at = 0;
 	}
 	if ((LONG)(g_skip_retry_at - now) > 0 || g_skip_tries >= SCENE_SKIP_TRIES)
+		return;
+	if (!scene_skippable())   // not a real cutscene on this copy: never press a menu/action key here
 		return;
 	g_skip_tries++;
 	scene_info s;
@@ -3547,19 +3645,17 @@ static void scene_skip_frame(void)
 	if (!g_skip_step)
 		return;
 	DWORD el = GetTickCount() - g_skip_t0;
-	if (!scene_local_cinematic()) {
+	if (!scene_skippable()) {
+		// Out of the scene (or the game entered a load / menu): release at once. ESCAPE held into the
+		// next state is the pause key, so this release is what keeps a location change from pausing.
 		scene_skip_release();
-		logf("scene: the local copy left the scripted event %lu ms after the skip was pressed", (unsigned long)el);
+		logf("scene: skip released after %lu ms (the copy is no longer in a scripted event)", (unsigned long)el);
 		InterlockedIncrement(&g_scene_left);
 		g_skip_step = 0;
 		return;
 	}
-	if (g_skip_step == 1 && el >= 140) { keyq_push(0x01, 0); g_skip_step = 2; }
-	if (g_skip_step == 2 && el >= 300) { scene_vpad(0x10, 1); g_skip_step = 3; }        // START
-	if (g_skip_step == 3 && el >= 450) { scene_vpad(0x10, 0); g_skip_step = 4; }
-	if (g_skip_step == 4 && el >= 750) { scene_vpad(0x1000, 1); g_skip_step = 5; }      // A
-	if (g_skip_step == 5 && el >= 900) { scene_vpad(0x1000, 0); g_skip_step = 6; }
-	if (g_skip_step == 6 && el >= 2500) {
+	if (g_skip_step == 1 && el >= 140) { scene_skip_release(); g_skip_step = 2; }
+	if (g_skip_step == 2 && el >= 1800) {
 		scene_skip_release();
 		scene_info s;
 		scene_read(&s);
@@ -3570,9 +3666,32 @@ static void scene_skip_frame(void)
 	}
 }
 
+// TASK 34: after the world is rebuilt nothing may press a skip for a moment. Called once per frame from
+// scene_tick, both roles: a level tag change (a door, a loading zone, a load) starts the guard.
+static void scene_level_guard(void)
+{
+	unsigned w = world_obj();
+	DWORD lvl = 0;
+	if (w && !IsBadReadPtr((const void *)(uintptr_t)w, 8))
+		lvl = rd32(w + 4);
+	DWORD now = GetTickCount();
+	if (lvl != g_scene_guard_level) {
+		if (g_scene_guard_level) {
+			g_scene_guard_until = now + 4000;
+			g_pend_active = 0;   // a leave from before the rebuild does not apply to the new world
+		}
+		g_scene_guard_level = lvl;
+	}
+	if (!scene_in_level_now() && g_skip_step) {
+		scene_skip_release();
+		g_skip_step = 0;
+	}
+}
+
 // Game thread, both roles: mirror this copy's state and leave a scene the peer has already left.
 static void scene_tick(void)
 {
+	scene_level_guard();
 	scene_send();
 	scene_skip_frame();
 	scene_info peer;
@@ -3618,7 +3737,548 @@ static void scene_tick(void)
 		g_pend_active = 0;   // too old to be this scene's leave
 		return;
 	}
+	if (!scene_skippable()) {
+		// The pending skip stays armed while this copy is not (yet) in a skippable cutscene, but nothing is
+		// pressed: a load, a menu or a fresh level must never receive the cinematic key.
+		return;
+	}
 	scene_skip_begin("the peer's copy has left the scripted event and this copy is still in it");
+}
+
+
+// ---- doors and level transitions (TASK 34) ----------------------------------------------------------
+// The level change was synced, the door use was not: the owner saw the guest jump into the new level with
+// the door still shut on its screen, and the guest's own door use was swallowed by hk_change_level (its
+// ChangeLevel is dropped: the host decides). Both come from the same gap - the game's own door path
+// (FUN_0042c2b0, door vtable+0x70; the interaction scan calls +0x34 then +0x70, FINDINGS_19 §1.3) runs
+// only where the pad that pressed A is simulated. PKT_DOOR carries the used entity (class vtable address,
+// id, position, character), so the other copy runs the same path on its own entity.
+//
+// Which entity? The game marks what a character is using: FUN_0042c2b0 writes the door into
+// character+0x2bc and the character into door+0xc4. Watching our own character's +0x2bc catches every
+// door family that goes through this path (a single door, a double door, an internal/special door)
+// without guessing class tags from a 4-byte hash, and it fires once per use because the value stays set
+// while the use runs.
+//
+// Transitions without a door object (a loading zone) have no use to replay: their walk-in is the synced
+// movement, and the level change itself is covered by the guest's ChangeLevel ask below.
+#define DOOR_MAX 48
+#define DOOR_SCAN_MAX 600
+typedef struct { unsigned ent; DWORD cls, id; float pos[3]; DWORD tag; } door_slot;
+static door_slot g_doors[DOOR_MAX];
+static int g_door_n;
+static DWORD g_door_level, g_door_scan_at, g_door_scanned;
+static unsigned g_door_world;
+static unsigned g_door_prev;             // the last +0x2bc seen on this copy's own character
+static unsigned g_door_echo_ent;         // a door use this copy applied from the peer: do not echo it
+static DWORD g_door_echo_until;
+static unsigned g_door_use_ent;          // the last door use this copy started
+static DWORD g_door_use_at;
+static volatile LONG g_door_sent, g_door_rcv, g_door_applied, g_door_missed, g_door_queued;
+static CRITICAL_SECTION g_door_cs;
+static pkt_door g_door_q[4];
+static int g_door_qh, g_door_qt;
+
+// A level change the guest's own game asked for (hk_change_level dropped it). It is asked of the host
+// after REQ_ASK_DELAY_MS, so the host's own copy of the same door use gets to do it first; the ask is
+// repeated for a moment (PKT_LEVELASK has no ack) and dropped when the level actually changes.
+#define ASK_DELAY_MS 800
+#define ASK_REPEAT_MS 1000
+#define ASK_GIVE_UP_MS 8000
+static DWORD g_ask_t0, g_ask_level, g_ask_entry, g_ask_flag, g_ask_sent_at;
+static volatile LONG g_ask_pending, g_ask_sent;
+static DWORD g_ask_logged_level, g_ask_log_at;
+static int g_ask_calls;
+
+// Only the door classes measured before (door_class: DORH CToeDoor, DODO CToeDoubleDoor, INDO
+// CToeInternalDoor). A tag that is not listed is never called through: the log names it once, so a door
+// family this list misses shows up as "use target XXXX is not a door" instead of a wrong call.
+static int door_known(DWORD tag)
+{
+	return door_class(tag);
+}
+
+static void door_scan(unsigned w, DWORD level)
+{
+	g_door_n = 0;
+	g_door_level = level;
+	g_door_world = w;
+	g_door_scan_at = GetTickCount();
+	g_door_scanned = level;
+	g_door_prev = 0;
+	unsigned mgr = w ? rd32(w + 0x1768) : 0;
+	unsigned node = mgr ? rd32(mgr + 8) : 0;
+	unsigned seen[DOOR_SCAN_MAX];
+	int nseen = 0;
+	while (node && nseen < DOOR_SCAN_MAX && g_door_n < DOOR_MAX) {
+		int dup = 0;
+		for (int k = 0; k < nseen; k++)
+			if (seen[k] == node) { dup = 1; break; }
+		if (dup)
+			break;
+		seen[nseen++] = node;
+		unsigned e = rd32(node);
+		node = rd32(node + 4);
+		if (!e || e <= 0x10000 || IsBadReadPtr((void *)(uintptr_t)e, 0x150))
+			continue;
+		DWORD tag = rd32(e + 0x10);
+		if (!door_known(tag))
+			continue;
+		door_slot *d = &g_doors[g_door_n++];
+		memset(d, 0, sizeof *d);
+		d->ent = e;
+		d->tag = tag;
+		d->cls = rd32(e);       // the class vtable: the same address on both copies (same exe build)
+		d->id = rd32(e + 4);
+		if (!IsBadReadPtr((const void *)(uintptr_t)(e + 0x6c), 12))
+			memcpy(d->pos, (const void *)(uintptr_t)(e + 0x6c), sizeof d->pos);
+	}
+	logf("%s: door objects: %d watched in level %x", g_role == 2 ? "guest" : "host", g_door_n, (unsigned)level);
+}
+
+static void door_ensure(void)
+{
+	unsigned w = world_obj();
+	if (!w)
+		return;
+	DWORD lvl = rd32(w + 4);
+	if (!lvl)
+		return;
+	if (w != g_door_world || lvl != g_door_level || (!g_door_n && g_door_scanned != lvl))
+		door_scan(w, lvl);
+}
+
+// Game thread: our own character started a door use -> tell the peer (once per use).
+static void door_watch(void)
+{
+	if (!g_peer_ok || g_role == 0)
+		return;
+	unsigned w = world_obj();
+	if (!w || !rd32(w + 4) || rd32(w + 4) != g_door_level || w != g_door_world)
+		return;   // door_ensure (door_tick) rebuilds the table first
+	unsigned h = player_human(g_role == 2 ? 1 : 0);
+	if (!h || IsBadReadPtr((const void *)(uintptr_t)(h + 0x2bc), 4))
+		return;
+	unsigned cur = rd32(h + 0x2bc);
+	if (cur == g_door_prev)
+		return;
+	g_door_prev = cur;
+	if (!cur || cur <= 0x10000 || IsBadReadPtr((const void *)(uintptr_t)cur, 0x150))
+		return;
+	DWORD tag = rd32(cur + 0x10);
+	if (!door_known(tag)) {
+		static DWORD logged_tag;
+		static int logged_n;
+		if (logged_tag != tag && logged_n < 12) {   // a save point, a lock, a lever: not a door
+			logged_tag = tag;
+			logged_n++;
+			char c[5];
+			logf("%s: use target %s is not a door: not forwarded as a door use", g_role == 2 ? "guest" : "host",
+			     tag4(tag, c));
+		}
+		return;
+	}
+	g_door_use_ent = cur;
+	g_door_use_at = GetTickCount();
+	pkt_door p;
+	memset(&p, 0, sizeof p);
+	p.kind = 1;
+	p.level = rd32(w + 4);
+	p.ch_tag = rd32(h + H_TAG);
+	p.cls = rd32(cur);
+	p.id = rd32(cur + 4);
+	if (!IsBadReadPtr((const void *)(uintptr_t)(cur + 0x6c), 12))
+		memcpy(p.pos, (const void *)(uintptr_t)(cur + 0x6c), sizeof p.pos);
+	net_send(PKT_DOOR, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	InterlockedIncrement(&g_door_sent);
+	{
+		char c[5], i4[5];
+		logf("%s: used door %s id %s at level %x (ent %x): telling the peer", g_role == 2 ? "guest" : "host",
+		     tag4(tag, c), tag4(p.id, i4), (unsigned)p.level, cur);
+	}
+}
+
+// UDP thread: queue the peer's door use for the game thread (the game's state machine is not thread-safe).
+static void peer_on_door(const char *buf, int n)
+{
+	const pkt_door *p = (const pkt_door *)buf;
+	if (n != (int)sizeof *p || p->kind != 1)
+		return;
+	EnterCriticalSection(&g_door_cs);
+	if (((g_door_qt + 1) & 3) != g_door_qh) {
+		memcpy(&g_door_q[g_door_qt], p, sizeof *p);
+		g_door_qt = (g_door_qt + 1) & 3;
+		InterlockedIncrement(&g_door_queued);
+	}
+	LeaveCriticalSection(&g_door_cs);
+	InterlockedIncrement(&g_door_rcv);
+}
+
+// Game thread: replay the peer's door use through the game's own path on this copy's entity.
+static void door_apply(const pkt_door *p)
+{
+	DWORD base = virt_exe_base(), size = virt_exe_size();
+	if (p->kind != 1)
+		return;
+	unsigned w = world_obj();
+	if (!w || !g_peer_ok || rd32(w + 4) != p->level)
+		return;   // not in that level (yet): nothing here to replay it on
+	if (w != g_door_world || rd32(w + 4) != g_door_level)
+		door_scan(w, rd32(w + 4));
+	door_slot *best = 0;
+	float bd = 200.0f;
+	for (int i = 0; i < g_door_n; i++) {
+		door_slot *d = &g_doors[i];
+		if (d->cls != p->cls || (p->id && d->id != p->id))
+			continue;
+		float dd = adist(d->pos, p->pos);
+		if (dd < bd) { bd = dd; best = d; }
+	}
+	if (!best) {
+		InterlockedIncrement(&g_door_missed);
+		char c[5], i4[5];
+		logf("%s: the peer used door %s id %s at level %x: no such door on this copy", g_role == 2 ? "guest" : "host",
+		     tag4((DWORD)p->cls, c), tag4(p->id, i4), (unsigned)p->level);
+		return;
+	}
+	// Pointer validation tied to the level generation: the entity must still be that exact object (class
+	// vtable, class tag, id) and its two use entries must still be inside the exe image. A door rebuilt by
+	// a level change or freed by the game is never called through.
+	unsigned e = best->ent;
+	if (!e || IsBadReadPtr((void *)(uintptr_t)e, 0x150) || rd32(e + 0x10) != best->tag || rd32(e) != best->cls ||
+	    rd32(e + 4) != best->id) {
+		InterlockedIncrement(&g_door_missed);
+		return;
+	}
+	DWORD vt = rd32(e);
+	if (!vt || IsBadReadPtr((void *)(uintptr_t)vt, 0x74))
+		return;
+	DWORD f34 = rd32(vt + 0x34), f70 = rd32(vt + 0x70);
+	if (f34 < base || f34 >= base + size || f70 < base || f70 >= base + size) {
+		char c[5];
+		logf("%s: door %s (ent %x) has no usable use entries: not replayed", g_role == 2 ? "guest" : "host",
+		     tag4(best->tag, c), e);
+		return;
+	}
+	if (!rd32(e + 0x24)) {   // the game's own gate (FUN_0042a480 returns 0 when +0x24 is 0)
+		char c[5];
+		logf("%s: door %s (ent %x) is disabled here (+0x24 = 0): use not replayed",
+		     g_role == 2 ? "guest" : "host", tag4(best->tag, c), e);
+		return;
+	}
+	unsigned h = 0;
+	unsigned hs[MAX_CH];
+	int n = world_humans(hs, MAX_CH);
+	for (int i = 0; i < n; i++)
+		if (rd32(hs[i] + H_TAG) == p->ch_tag) { h = hs[i]; break; }
+	if (!h) {
+		InterlockedIncrement(&g_door_missed);
+		return;
+	}
+	// Both copies simulate both characters from pads, so this copy's own scan may already have run the
+	// use (the door stores the user at +0xc4, the character the object it is using at +0x2bc). Running it
+	// again would restart the animation: recognise it and leave it alone.
+	if (rd32(e + 0xc4) == h || rd32(h + 0x2bc) == e) {
+		g_door_echo_ent = e;
+		g_door_echo_until = GetTickCount() + 2500;
+		InterlockedIncrement(&g_door_applied);
+		char c[5];
+		logf("%s: door %s (ent %x) was already used by %s here: not replayed", g_role == 2 ? "guest" : "host",
+		     tag4(best->tag, c), e, tag4(p->ch_tag, c));
+		return;
+	}
+	// FUN_0042a480 takes (type, character) and FUN_0042c2b0 takes (character): the interaction scan calls
+	// `(door->vtable+0x34)(type, character)` then `(door->vtable+0x70)(character)` (decompile 128210-128245).
+	// Passing only the type made the check read a garbage character pointer (it crashed at Obscure2+0x2a4c2).
+	((void(__fastcall *)(void *, void *, unsigned, void *))f34)((void *)(uintptr_t)e, NULL, 1,
+		(void *)(uintptr_t)h);
+	((void(__fastcall *)(void *, void *, void *))f70)((void *)(uintptr_t)e, NULL, (void *)(uintptr_t)h);
+	g_door_echo_ent = e;
+	g_door_echo_until = GetTickCount() + 2500;
+	InterlockedIncrement(&g_door_applied);
+	{
+		char c[5], i4[5], t[5];
+		logf("%s: door %s id %s use replayed on ent %x for character %s", g_role == 2 ? "guest" : "host",
+		     tag4(best->tag, c), tag4(p->id, i4), e, tag4(p->ch_tag, t));
+	}
+}
+
+static void door_apply_tick(void)
+{
+	pkt_door p;
+	for (;;) {
+		EnterCriticalSection(&g_door_cs);
+		if (g_door_qh == g_door_qt) {
+			LeaveCriticalSection(&g_door_cs);
+			return;
+		}
+		p = g_door_q[g_door_qh];
+		g_door_qh = (g_door_qh + 1) & 3;
+		LeaveCriticalSection(&g_door_cs);
+		door_apply(&p);
+	}
+}
+
+// hk_change_level (guest): the game asked for a level change this copy must not perform. Log it once per
+// burst (the game's door script calls it every frame while it waits - 1334 lines in the owner's log) and
+// remember it for the ask below. Called on the game thread.
+static void guest_note_own_level(unsigned level, unsigned entry, unsigned flag)
+{
+	DWORD now = GetTickCount();
+	if (level != g_ask_logged_level || now - g_ask_log_at > 2000) {
+		if (g_ask_calls)
+			logf("guest: own ChangeLevel %c%c%c%c dropped (the host decides); %d calls in %lu ms",
+			     (char)(level >> 24), (char)(level >> 16), (char)(level >> 8), (char)level, g_ask_calls,
+			     (unsigned long)(now - g_ask_log_at));
+		else
+			logf("guest: own ChangeLevel %c%c%c%c dropped (the host decides)", (char)(level >> 24),
+			     (char)(level >> 16), (char)(level >> 8), (char)level);
+		g_ask_logged_level = level;
+		g_ask_log_at = now;
+		g_ask_calls = 0;
+	}
+	g_ask_calls++;
+	g_door_use_at = 0;   // the door animation is over: the world may be rebuilt by the level request now
+	if (!g_ask_pending || level != g_ask_level) {
+		g_ask_level = level;
+		g_ask_entry = entry;
+		g_ask_flag = flag;
+		g_ask_t0 = now;
+		g_ask_sent_at = 0;
+		g_ask_pending = 1;
+	}
+}
+
+// Guest, game thread: ask the host for the level change the guest's own game wanted.
+static void level_ask_tick(void)
+{
+	if (g_role != 2 || !g_ask_pending || !g_peer_ok)
+		return;
+	DWORD now = GetTickCount();
+	if (now - g_ask_t0 < ASK_DELAY_MS)
+		return;   // the host's own copy of the same door use gets to do the change first
+	unsigned w = world_obj();
+	if (w && rd32(w + 4) == g_ask_level) {   // the host's request arrived and this copy changed level
+		g_ask_pending = 0;
+		return;
+	}
+	if (now - g_ask_t0 > ASK_GIVE_UP_MS) {
+		g_ask_pending = 0;
+		return;
+	}
+	if (g_ask_sent_at && now - g_ask_sent_at < ASK_REPEAT_MS)
+		return;
+	g_ask_sent_at = now;
+	pkt_levelask a;
+	memset(&a, 0, sizeof a);
+	a.kind = 1;
+	a.level = g_ask_level;
+	a.entry = g_ask_entry;
+	a.flag = g_ask_flag;
+	net_send(PKT_LEVELASK, &a, (WORD)(sizeof a - sizeof(pkt_hdr)));
+	InterlockedIncrement(&g_ask_sent);
+	logf("guest: asking the host for ChangeLevel %c%c%c%c entry %u flag %u", (char)(a.level >> 24),
+	     (char)(a.level >> 16), (char)(a.level >> 8), (char)a.level, (unsigned)a.entry, (unsigned)a.flag);
+}
+
+// Host, UDP thread: the guest's ask, applied on the game thread.
+static volatile LONG g_levelask_pending;
+static DWORD g_levelask_level, g_levelask_entry, g_levelask_flag;
+
+static void host_on_levelask(const char *buf, int n)
+{
+	const pkt_levelask *a = (const pkt_levelask *)buf;
+	if (n != (int)sizeof *a || g_role != 1 || a->kind != 1)
+		return;
+	g_levelask_level = a->level;
+	g_levelask_entry = a->entry;
+	g_levelask_flag = a->flag;
+	g_levelask_pending = 1;
+}
+
+static void host_levelask_tick(void)
+{
+	if (g_role != 1 || !g_levelask_pending || !g_peer_ok)
+		return;
+	g_levelask_pending = 0;
+	host_apply_guest_level(g_levelask_level, g_levelask_entry, g_levelask_flag);
+}
+
+// TEST ONLY (pipe `usedoor <0|1>`): run the game's own door use on the nearest door to that player, the
+// same two calls the interaction scan makes. The test saves' doors do not open from a pad press in these
+// loaded worlds (FINDINGS_19 §2.4: the scan's gate is not satisfied), so this is how a live check drives
+// the door path the mod mirrors. It runs on the game thread (the pipe thread must not call the game).
+#define DOORU_IDLE 0
+#define DOORU_QUEUED 1
+#define DOORU_DONE 2
+#define DOORU_PLACED 3
+#define DOORU_WAIT_MS 8000
+static volatile LONG g_dooru_state, g_dooru_verdict;
+static int g_dooru_player;
+static DWORD g_dooru_at;
+static void *g_dooru_door;
+static float g_dooru_door_pos[3];
+static char g_dooru_msg[200];
+
+// Step 2: the character has had a few frames to settle at the door: run the use now.
+static void door_use_run(unsigned h, door_slot *best, float bd)
+{
+	DWORD base = virt_exe_base(), size = virt_exe_size();
+	unsigned e = best->ent;
+	DWORD vt = (e && !IsBadReadPtr((void *)(uintptr_t)e, 0x150)) ? rd32(e) : 0;
+	DWORD f34 = (vt && !IsBadReadPtr((void *)(uintptr_t)vt, 0x74)) ? rd32(vt + 0x34) : 0;
+	DWORD f70 = f34 ? rd32(vt + 0x70) : 0;
+	char c[5];
+	if (!f34 || f34 < base || f34 >= base + size || f70 < base || f70 >= base + size) {
+		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: door %x has no usable use entries", e);
+		return;
+	}
+	// FUN_0042a480(type, character) then FUN_0042c2b0(character): the scan's own two calls (decompile
+	// 128210-128245). The first argument is the interaction type (1 = the front pass).
+	((void(__fastcall *)(void *, void *, unsigned, void *))f34)((void *)(uintptr_t)e, NULL, 1,
+		(void *)(uintptr_t)h);
+	((void(__fastcall *)(void *, void *, void *))f70)((void *)(uintptr_t)e, NULL, (void *)(uintptr_t)h);
+	g_door_prev = 0;   // the watch sees this use as its own and announces it to the peer
+	InterlockedIncrement(&g_dooru_verdict);
+	_snprintf(g_dooru_msg, sizeof g_dooru_msg, "ok usedoor player %d door %s id %x ent %x (%.1f units away)",
+		g_dooru_player, tag4(best->tag, c), (unsigned)best->id, e, bd);
+	logf("usedoor: %s", g_dooru_msg);
+}
+
+// The door's own check (FUN_0042a480) wants the character within 80 units of the door's interaction anchor
+// (door+0x10c) and its forward vector pointing at the door (dot >= 0.5). The test character usually spawns
+// far from the nearest door, so this places it 55 units in front of the anchor along the door's own normal
+// (door+0x13c) and turns it to the door, then lets a few frames of the game's own physics settle it before
+// the use runs (the game thread only; test-only path).
+static void door_use_frame(void)
+{
+	if (g_dooru_state != DOORU_QUEUED && g_dooru_state != DOORU_PLACED)
+		return;
+	if (g_dooru_state == DOORU_PLACED) {
+		if (GetTickCount() - g_dooru_at < 500)
+			return;   // let the character land on the floor
+		g_dooru_state = DOORU_DONE;
+		unsigned h = player_human(g_dooru_player);
+		if (!h || !g_dooru_door) {
+			_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: the character or door vanished");
+			return;
+		}
+		unsigned pos = h + H_POS;
+		float pp[3] = { 0, 0, 0 };
+		if (!IsBadReadPtr((const void *)(uintptr_t)pos, 12))
+			memcpy(pp, (const void *)(uintptr_t)pos, sizeof pp);
+		door_use_run(h, (door_slot *)g_dooru_door, adist(g_dooru_door_pos, pp));
+		g_dooru_door = 0;
+		return;
+	}
+	logf("usedoor: the game thread is running the request (player %d)", g_dooru_player);
+	g_dooru_verdict = 0;
+	unsigned w = world_obj();
+	if (!w || !rd32(w + 4)) {
+		g_dooru_state = DOORU_DONE;
+		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: not in a level");
+		return;
+	}
+	if (w != g_door_world || rd32(w + 4) != g_door_level)
+		door_scan(w, rd32(w + 4));
+	unsigned h = player_human(g_dooru_player);
+	if (!h) {
+		g_dooru_state = DOORU_DONE;
+		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: player %d has no character", g_dooru_player);
+		return;
+	}
+	unsigned pos = h + H_POS;
+	float pp[3] = { 0, 0, 0 };
+	if (!IsBadReadPtr((const void *)(uintptr_t)pos, 12))
+		memcpy(pp, (const void *)(uintptr_t)pos, sizeof pp);
+	door_slot *best = 0;
+	float bd = 4000.0f;
+	for (int i = 0; i < g_door_n; i++) {
+		float d = adist(g_doors[i].pos, pp);
+		if (d < bd) { bd = d; best = &g_doors[i]; }
+	}
+	if (!best) {
+		g_dooru_state = DOORU_DONE;
+		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: no door in level %x", (unsigned)rd32(w + 4));
+		return;
+	}
+	unsigned e = best->ent;
+	float anchor[3] = { 0, 0, 0 }, dir[3] = { 0, 0, 1 };
+	if (!IsBadReadPtr((const void *)(uintptr_t)(e + 0x10c), 24)) {
+		memcpy(anchor, (const void *)(uintptr_t)(e + 0x10c), 12);   // the interaction anchor
+		memcpy(dir, (const void *)(uintptr_t)(e + 0x13c), 12);      // the door's facing (its normal)
+	}
+	float n = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+	if (n < 0.5f) { dir[0] = 0; dir[1] = 0; dir[2] = 1; n = 1.0f; }
+	dir[0] /= n; dir[1] /= n; dir[2] /= n;
+	// The door's own check (FUN_0042a480, decompile 24471-24498) wants the character within 80 units and
+	// `0.5 <= dot(character forward, door +0x13c normal)`: the character stands on the side the normal points
+	// away from and faces along the normal (FINDINGS_19 §2.2: walking "up" at a door whose normal is +Y).
+	float tx = anchor[0] - dir[0] * 55.0f, ty = anchor[1] - dir[1] * 55.0f, tz = pp[2];
+	int too_far = ((tx - pp[0]) * (tx - pp[0]) + (ty - pp[1]) * (ty - pp[1])) > 80.0f * 80.0f;
+	if (too_far && !IsBadWritePtr((void *)(uintptr_t)pos, 24)) {
+		float np[3] = { tx, ty, tz };
+		memcpy((void *)(uintptr_t)pos, np, 12);
+		float nf[3] = { dir[0], dir[1], 0.0f };   // face along the door's normal (the check's dot >= 0.5)
+		memcpy((void *)(uintptr_t)(h + H_DIR), nf, 12);
+		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "usedoor: placed player %d 55 units in front of door %x (was %.1f away)",
+			g_dooru_player, e, bd);
+		logf("%s", g_dooru_msg);
+		g_dooru_door = best;
+		memcpy(g_dooru_door_pos, anchor, sizeof g_dooru_door_pos);
+		g_dooru_at = GetTickCount();
+		g_dooru_state = DOORU_PLACED;
+		return;
+	}
+	g_dooru_state = DOORU_DONE;
+	door_use_run(h, best, bd);
+}
+
+static int door_use_request(int player, char *reply, size_t replysz)
+{
+	if (player < 0 || player > 1) {
+		_snprintf(reply, replysz, "error usedoor <0|1>");
+		return 0;
+	}
+	if (g_dooru_state == DOORU_QUEUED) {
+		_snprintf(reply, replysz, "error usedoor: another request is in flight");
+		return 0;
+	}
+	g_dooru_player = player;
+	g_dooru_msg[0] = 0;
+	g_dooru_verdict = 0;
+	g_dooru_state = DOORU_QUEUED;
+	DWORD t0 = GetTickCount();
+	while (g_dooru_state != DOORU_DONE) {
+		if (GetTickCount() - t0 > DOORU_WAIT_MS) {
+			g_dooru_state = DOORU_IDLE;
+			_snprintf(reply, replysz, "error usedoor: the game thread did not run it in %d s", DOORU_WAIT_MS / 1000);
+			return 0;
+		}
+		Sleep(10);
+	}
+	int ok = g_dooru_verdict;
+	_snprintf(reply, replysz, "%s", g_dooru_msg);
+	g_dooru_state = DOORU_IDLE;
+	return ok;
+}
+
+// Both roles, game thread: the door table and the two transition helpers.
+static void door_tick(void)
+{
+	door_ensure();
+	door_watch();
+	door_apply_tick();
+	door_use_frame();
+	level_ask_tick();
+	host_levelask_tick();
+}
+
+// The guest's own door animation is still running: do not rebuild the world under it. hk_change_level
+// clears g_door_use_at when the animation reaches its ChangeLevel, so this is only a safety net.
+static int door_animation_running(void)
+{
+	return g_door_use_at && GetTickCount() - g_door_use_at < 3000;
 }
 
 
@@ -4253,6 +4913,7 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_aptq_cs);   // TASK 28
 	InitializeCriticalSection(&g_apt_cs);     // TASK 28 pipe `aptdone`
 	InitializeCriticalSection(&g_scene_cs);   // TASK 30 (rx thread / game thread / pipe thread)
+	InitializeCriticalSection(&g_door_cs);    // TASK 34 (rx thread / game thread)
 }
 
 static void frame_tick(void)
@@ -4309,6 +4970,7 @@ static void frame_tick(void)
 		if (!scene_local_cinematic())
 			host_apply_remote_char();   // TASK 30: in a scripted event the script owns both characters
 		scene_tick();                   // TASK 30: mirror the world's scripted-event state / apply a skip
+		door_tick();                    // TASK 34: door uses / transition objects on both copies
 		peer_apply_pickups();
 		prop_tick();                // TASK 26: chairs/boxes: carry and break state
 		apt_tick();                 // TASK 28: character abilities on level objects
@@ -4323,6 +4985,7 @@ static void frame_tick(void)
 		prop_tick();                // TASK 26: chairs/boxes: carry and break state
 		apt_tick();                 // TASK 28: character abilities on level objects
 		scene_tick();               // TASK 30: mirror the world's scripted-event state / apply a skip
+		door_tick();                // TASK 34: door uses / transition objects on both copies
 		guest_follow_own_player();
 		guest_record_history();
 		guest_debug_p1();
@@ -4356,6 +5019,13 @@ static void sync_status(char *reply, size_t replysz)
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | apt sent %ld rcv %ld applied %ld actions %ld",
 			g_apt_sent, g_apt_rcv, g_apt_applied, g_apt_actions);
+	l = strlen(reply);
+	if (l < replysz)
+		_snprintf(reply + l, replysz - l, " | anim forced %ld", g_anim_forced);
+	l = strlen(reply);
+	if (l < replysz)
+		_snprintf(reply + l, replysz - l, " | door sent %ld rcv %ld applied %ld missed %ld | ask sent %ld pend %ld",
+			g_door_sent, g_door_rcv, g_door_applied, g_door_missed, g_ask_sent, (long)g_ask_pending);
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | frames %ld", g_frames);

@@ -34,6 +34,35 @@ static HANDLE g_log = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_log_cs;
 static LONG g_redirects, g_blocked;
 
+// TASK 34: the last formatted log lines, for the crash report (src/crash.c). Written outside the log lock
+// (a single string copy into a slot), so a crashing thread can read them without taking anything.
+#define LOG_RING 64
+#define LOG_RING_LEN 256
+static char g_logring[LOG_RING][LOG_RING_LEN];
+static volatile LONG g_logring_n;
+
+static DWORD virt_exe_base(void)
+{
+	static DWORD base;
+	if (!base) {
+		base = (DWORD)(uintptr_t)GetModuleHandleA(NULL);
+		if (!base)
+			base = 0x400000;
+	}
+	return base;
+}
+
+static DWORD virt_exe_size(void)
+{
+	static DWORD size;
+	if (!size) {
+		IMAGE_DOS_HEADER *d = (IMAGE_DOS_HEADER *)(uintptr_t)virt_exe_base();
+		IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((BYTE *)d + d->e_lfanew);
+		size = nt->OptionalHeader.SizeOfImage;
+	}
+	return size;
+}
+
 static void logf(const char *fmt, ...)
 {
 	char buf[1024];
@@ -50,10 +79,18 @@ static void logf(const char *fmt, ...)
 	n += m;
 	buf[n++] = '\r';
 	buf[n++] = '\n';
+	// TASK 34: keep the line for the crash report (before the lock: no ordering dependency).
+	{
+		LONG slot = InterlockedIncrement(&g_logring_n) - 1;
+		int len = n < LOG_RING_LEN ? n : LOG_RING_LEN - 1;
+		memcpy(g_logring[slot % LOG_RING], buf, (size_t)len);
+		g_logring[slot % LOG_RING][len] = 0;
+	}
 	EnterCriticalSection(&g_log_cs);
 	if (g_log != INVALID_HANDLE_VALUE) {
 		DWORD w;
 		WriteFile(g_log, buf, n, &w, NULL);
+		FlushFileBuffers(g_log);   // nothing is lost if the process dies right after this line
 	}
 	LeaveCriticalSection(&g_log_cs);
 }
@@ -226,6 +263,110 @@ static bool __fastcall rs_FileWrite(void *self, void *edx, const char *name, con
 	return ok;
 }
 
+// ---- the input map (TASK 34) ---------------------------------------------------------------------
+// The pad -> player mapping lives in the game's o2.ipt (FINDINGS_24 §1): action slots 0x00-0x27 are
+// player 1 and 0x28-0x4f player 2, and every binding names a device (1 keyboard, 2 mouse, 3 gamepad 1,
+// 4 gamepad 2). Device 3 polls XInput user 0 and device 4 user 1 (FUN_0059c7e0). The mod's two copies
+// therefore only drive the right characters when player 1's block is on device 3 and player 2's on
+// device 4. The game's own "swap controllers" menu rewrites those blocks and the file keeps the swap,
+// and the mod seeds the map only when the file is missing - which is what the owner's guest hit: its
+// own pad drove the host's character until they swapped controllers in the game menu. The map is read
+// through the Steam remote-storage hook, so it is corrected there, in memory, on every read:
+//   * player 1's pad bindings are pointed at device 3, player 2's at device 4;
+//   * a block with no pad bindings at all (the shipped default has keyboard+mouse for player 2) is
+//     replaced by the mod's own obscoop_o2.ipt, which has the same pad codes for both players.
+// Keyboard and mouse bindings are never touched. 8 + count + trailing bytes: only the declared slots
+// are parsed (the live file carries 20 trailing bytes the game ignores).
+static volatile LONG g_ipt_fixed, g_ipt_replaced;
+
+static DWORD ipt_rd32(const BYTE *p)
+{
+	DWORD v;
+	memcpy(&v, p, 4);
+	return v;
+}
+
+static void ipt_wr32(BYTE *p, DWORD v)
+{
+	memcpy(p, &v, 4);
+}
+
+// Returns 1 when the buffer is a map this code understands (little-endian, >= 0x50 slots).
+static int ipt_parse(BYTE *b, int n, int *p1pads, int *p2pads, int *fix1, int *fix2)
+{
+	*p1pads = *p2pads = *fix1 = *fix2 = 0;
+	if (n < 8 || ipt_rd32(b) != 1)
+		return 0;
+	DWORD count = ipt_rd32(b + 4);
+	if (count < 0x50 || count > 400)
+		return 0;
+	int off = 8;
+	for (DWORD i = 0; i < count && off + 1 <= n; i++) {
+		int bound = b[off];
+		if (!bound) {
+			off += 1;
+			continue;
+		}
+		if (off + 9 > n)
+			return 0;
+		DWORD *dev = (DWORD *)(void *)(b + off + 1);
+		DWORD d = ipt_rd32(b + off + 1);
+		if (i < 0x28) {
+			if (d == 3 || d == 4) {
+				(*p1pads)++;
+				if (d != 3) { ipt_wr32((BYTE *)dev, 3); (*fix1)++; }
+			}
+		} else if (i < 0x50) {
+			if (d == 3 || d == 4) {
+				(*p2pads)++;
+				if (d != 4) { ipt_wr32((BYTE *)dev, 4); (*fix2)++; }
+			}
+		}
+		off += 9;
+	}
+	return 1;
+}
+
+static void ipt_fix(void *buf, int n)
+{
+	BYTE *b = buf;
+	int p1pads, p2pads, fix1, fix2;
+	if (!ipt_parse(b, n, &p1pads, &p2pads, &fix1, &fix2)) {
+		static int said;
+		if (!said++)
+			logf("input map: o2.ipt is not a map this build understands (%d bytes): left alone", n);
+		return;
+	}
+	if (p1pads && p2pads) {
+		if (fix1 || fix2) {
+			InterlockedIncrement(&g_ipt_fixed);
+			logf("input map: corrected here (player 1 pad bindings %d -> device 3: %d changed; player 2 -> device 4: %d changed)",
+				p1pads, fix1, fix2);
+		} else {
+			static int said;
+			if (!said++)
+				logf("input map: player 1's %d pad bindings are on gamepad 1 and player 2's %d on gamepad 2: "
+					"left as they are", p1pads, p2pads);
+		}
+		return;
+	}
+	// A player block without any pad binding: this map cannot drive both players. Use the mod's map.
+	char path[MAX_PATH];
+	_snprintf(path, MAX_PATH, "%s\\obscoop_o2.ipt", g_dir);
+	BYTE alt[1024];
+	int got = read_whole(path, alt, (int)sizeof alt);
+	int a1, a2, f1, f2;
+	if (got > 0 && got <= n && ipt_parse(alt, got, &a1, &a2, &f1, &f2) && a1 && a2) {
+		memcpy(b, alt, (size_t)got);
+		InterlockedIncrement(&g_ipt_replaced);
+		logf("input map: this o2.ipt has no pad bindings for player %d (player 1 %d, player 2 %d): using obscoop_o2.ipt",
+			p1pads ? 2 : 1, p1pads, p2pads);
+	} else {
+		logf("input map: no pad bindings for player %d in o2.ipt and no usable obscoop_o2.ipt (%d bytes): "
+			"that player cannot use a pad", p1pads ? 2 : 1, got);
+	}
+}
+
 // The save the game loaded last (host): sent to a joining guest (net.c / sync.c).
 static BYTE g_last_save[65536];
 static volatile LONG g_last_save_len, g_last_save_ver;
@@ -237,6 +378,8 @@ static int __fastcall rs_FileRead(void *self, void *edx, const char *name, void 
 	(void)self; (void)edx;
 	remote_path(name, p, sizeof p);
 	int got = read_whole(p, buf, size);
+	if (got > 0 && !_stricmp(name, "o2.ipt"))   // TASK 34: player 1 -> pad 1, player 2 -> pad 2
+		ipt_fix(buf, got);
 	if (got > 0 && got <= (int)sizeof g_last_save && (!_strnicmp(name, "game", 4) || !_stricmp(name, "recover.sav")) &&
 		strstr(name, ".sav")) {
 		memcpy(g_last_save, buf, got);
@@ -629,6 +772,11 @@ static void merge_pad(xstate *dst, const xstate *src)
 DWORD WINAPI XInputGetState(DWORD user, void *state)
 {
 	load_xinput();
+	// TASK 34: which users the game polls at all, on every path (virtual pads included). The guest's
+	// "my pad drives the host's character" report needs exactly this: whether the game ever reads the
+	// controller that feeds player 2.
+	if (user < 8 && InterlockedIncrement(&g_poll_seen[user]) == 1)
+		logf("game polls XInput user %lu (first poll; role %d)", (unsigned long)user, g_role);
 	if (g_role == 2 && user < 2) {   // guest: user 0 is the host's controller (player 1), user 1 is this PC's (player 2)
 		InterlockedIncrement(&g_polls[user]);
 		int in_level = game_in_level();
@@ -660,6 +808,8 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 				memset(state, 0, sizeof(xstate));   // not connected yet: this PC's own pad drives the menus
 				pad_read((DWORD)g_local_pad, state);
 			}
+			if (accept_pulse_on())
+				((xstate *)state)->buttons |= 0x1000;   // TASK 34: the guest's own join dialog too
 			return ERROR_SUCCESS;
 		}
 		memset(state, 0, sizeof(xstate));
@@ -672,6 +822,11 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		}
 		if (g_peer_ok && in_level)
 			drop_remote_start((xstate *)state);   // START pauses both copies; it must not open "player 2 is leaving"
+		// TASK 34: a level change on this copy can bring the game's "player 2 is joining" prompt, which
+		// waits for an A and - while it waits - stops the game's own update (the guest log went silent after
+		// a host ChangeLevel in the first soak). Pulse A on both pads of this copy for 150 ms, once.
+		if (accept_pulse_on())
+			((xstate *)state)->buttons |= 0x1000;
 		return ERROR_SUCCESS;
 	}
 	if (g_role == 2)
@@ -728,8 +883,6 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		return ERROR_SUCCESS;
 	}
 	DWORD r = (real_XInputGetState && !g_hide_real_pads) ? real_XInputGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
-	if (user < 8 && InterlockedIncrement(&g_poll_seen[user]) == 1)
-		logf("game polls XInput user %lu (first result %lu)", user, r);
 	return r;
 }
 
@@ -1042,6 +1195,7 @@ static int level_request(unsigned tag, int entry, int flag, char *reply, size_t 
 static int item_use_request(int player, unsigned tag, char *reply, size_t replysz);   // sync.c: pipe `useitem` (host)
 static int item_use_forward(int player, unsigned tag, char *reply, size_t replysz);   // sync.c: pipe `useitem` (guest)
 static int aptitude_done_request(int player, char *reply, size_t replysz);   // sync.c: pipe `aptdone` (TEST ONLY)
+static int door_use_request(int player, char *reply, size_t replysz);        // sync.c: pipe `usedoor` (TEST ONLY)
 
 static volatile float g_view[16];            // window.c: the last view matrix
 static volatile LONG g_view_sets, g_xf_sets;
@@ -1126,6 +1280,15 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		InterlockedExchangeAdd(&g_mdy, ly);
 		g_mbuttons = (BYTE)buttons;
 		_snprintf(reply, replysz, "ok reads %ld%s", g_mouse_reads, g_mouse ? "" : " (no mouse device)");
+	} else if (!strncmp(line, "crash", 5)) {
+		// TEST-ONLY (TASK 34): trigger a fatal fault so a check can prove the crash handler writes the
+		// report (code, module+offset, registers, stack, last log lines). "crash" faults on a null write;
+		// "crash <hex addr>" reads/writes that address, for another code. The process is expected to die.
+		unsigned addr = 0;
+		sscanf(line + 5, "%x", &addr);
+		_snprintf(reply, replysz, "ok crashing at 0x%x", addr ? addr : 1);
+		FlushFileBuffers(g_log);
+		*(volatile unsigned *)(uintptr_t)(addr ? addr : 1) = 0x5a5a5a5a;
 	} else if (!strncmp(line, "stats", 5)) {
 		HWND fg = GetForegroundWindow();
 		DWORD fgpid = 0;
@@ -1196,6 +1359,19 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		unsigned tgt = cm ? *(unsigned *)(cm + 0x17c) : 0;
 		_snprintf(reply, replysz, "cam yaw own %.1f valid %ld peer %.1f valid %ld target %x",
 		          g_cam_yaw * 57.2958f, g_cam_yaw_valid, g_peer_yaw * 57.2958f, g_peer_yaw_valid, tgt);
+	} else if (!strncmp(line, "xread ", 6)) {
+		// TEST-ONLY (TASK 34): what the game gets if it polls this XInput user right now - the mod's own
+		// XInputGetState, so a check can tell a pad-routing bug from a game-side one.
+		int u = -1;
+		if (sscanf(line + 6, "%d", &u) != 1 || u < 0 || u > 7) {
+			_snprintf(reply, replysz, "error xread <0..7>");
+		} else {
+			xstate st;
+			memset(&st, 0, sizeof st);
+			DWORD r = XInputGetState((DWORD)u, &st);
+			_snprintf(reply, replysz, "xread user %d -> %lu buttons %04x lx %d ly %d rx %d ry %d lt %d rt %d",
+				u, r, st.buttons, st.lx, st.ly, st.rx, st.ry, st.lt, st.rt);
+		}
 	} else if (!strncmp(line, "padshow", 7)) {
 		EnterCriticalSection(&g_vpad_cs);
 		_snprintf(reply, replysz, "netpad %d,%d,%d,%d age %lu peer %d | vpad1 %d,%d,%d,%d on %ld", g_netpad.lx, g_netpad.ly,
@@ -1354,6 +1530,16 @@ static void handle_command(char *line, char *reply, size_t replysz)
 				item_use_forward(pl, tag, reply, replysz);
 			else
 				item_use_request(pl, tag, reply, replysz);
+		}
+	} else if (!strncmp(line, "usedoor ", 8)) {
+		// TEST-ONLY (TASK 34): run the game's own door use (vtable+0x34 then +0x70) on the nearest door to
+		// that player on the game thread. The interaction scan does not fire on the test saves' doors from a
+		// pad press (FINDINGS_19 §2.4), so a check needs this to drive the door path the mod mirrors.
+		int pl = -1;
+		if (sscanf(line + 8, "%d", &pl) != 1 || pl < 0 || pl > 1) {
+			_snprintf(reply, replysz, "error usedoor <0|1>");
+		} else {
+			door_use_request(pl, reply, replysz);
 		}
 	} else if (!strncmp(line, "aptdone", 7)) {
 		// aptdone <0|1>: TEST-ONLY (TASK 28). The lock-picking mini-game is a 3-D lock turned with the
@@ -1564,6 +1750,7 @@ static LSTATUS WINAPI hk_RegCreateKeyA(HKEY k, LPCSTR sub, PHKEY out)
 	return real_RegCreateKeyA(k, reg_map(sub, b, sizeof b), out);
 }
 
+#include "crash.c"
 #include "window.c"
 #include "net.c"
 #include "hooks.c"
@@ -1718,6 +1905,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	if (g_seeded_ipt)
 		logf("input map: %s the shipped obscoop_o2.ipt to the co-op profile", g_seeded_ipt > 0 ? "copied" : "could not copy");
 	logf("obscoop 0.2 loaded, pid %lu, game dir %s, data dir %s", GetCurrentProcessId(), g_dir, g_data);
+	crash_install();   // TASK 34: a fatal exception leaves a report (code, module+offset, stack, log tail)
 	// Settings: obscoop.ini next to the exe, section [obscoop], key = name without OBSCOOP_. An
 	// environment variable with the full name wins (the one-PC tests use those).
 	{
@@ -1764,6 +1952,14 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	sync_init();
 	install_request_hooks();
 	apply_hooks(1);
+	// TASK 34: on the guest PC the game must see TWO controllers from the first frame. The guest has one
+	// pad, and it is served to the game as XInput user 1 (player 2); if the game only sees one controller
+	// at startup, player 2's device is never read and the guest's pad can only drive player 1 - the owner's
+	// "my controller moves the host's character". Report the second pad as connected (idle) here.
+	if (g_role == 2) {
+		vpad_set(1, 1, 0, 0, 0, 0, 0, 0, 0);
+		logf("virtual pad 1 connected at start (guest: player 2's controller)");
+	}
 	// OBSCOOP_VPADS=0,1 : report those virtual pads as connected (idle) from the first poll.
 	char vp[32];
 	if (GetEnvironmentVariableA("OBSCOOP_VPADS", vp, sizeof vp)) {

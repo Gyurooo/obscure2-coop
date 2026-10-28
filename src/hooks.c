@@ -91,10 +91,56 @@ static req0_t g_to_menu;
 static party_t g_party_table;
 static void host_level_request_repeat(unsigned level, unsigned entry, unsigned flag);   // sync.c
 static void host_load_request_repeat(const char *name);   // sync.c
+static void guest_note_own_level(unsigned level, unsigned entry, unsigned flag);   // sync.c (TASK 34)
+static void test_hold_party(void);                    // sync.c
+static void host_send_progress(int force);            // sync.c
 static int guest_party_copy(unsigned level, BYTE *out);   // sync.c: the host's party table for this level
 static void game_load_tick(unsigned game);                // sync.c: a real save load, on the game thread
 static void host_save_include(const char *name);          // sync.c: remember the loaded file, send it to the guest
 static void host_save_forget(void);                       // sync.c: the world no longer comes from a save file
+
+// TASK 34: a level change this copy performed for the guest's ask (PKT_LEVELASK). The guest's own copy
+// of the same door calls ChangeLevel a moment later; that call is the same transition and must not
+// rebuild the world a second time (the owner's back-and-forth door glitch).
+static DWORD g_ask_done_level, g_ask_done_at;
+
+// Host, game thread: perform the level change the guest's own game asked for (its door script calls
+// ChangeLevel every frame and the guest drops it), then tell the guest exactly like a local request does.
+static void host_apply_guest_level(unsigned level, unsigned entry, unsigned flag)
+{
+	char t[5];
+	if (g_role != 1 || !g_peer_ok)
+		return;
+	unsigned g = *(volatile unsigned *)0x6c3068;
+	if (!g || *(unsigned *)((BYTE *)g + 0x310) != 1) {
+		logf("host: the guest asked for ChangeLevel %s, but this copy is not in a level", tag4(level, t));
+		return;
+	}
+	if (level == g_last_level) {
+		logf("host: the guest asked for ChangeLevel %s: already here", tag4(level, t));
+		return;
+	}
+	DWORD now = GetTickCount();
+	if (g_ask_done_level == level && (LONG)(now - g_ask_done_at) < 2000) {
+		logf("host: the guest's ask for %s is the change just made here: ignored", tag4(level, t));
+		return;
+	}
+	logf("host: the guest asked for ChangeLevel %s (0x%08x) entry %u flag %u: doing it here", tag4(level, t), level,
+		entry, flag);
+	g_ask_done_level = level;
+	g_ask_done_at = now;
+	test_hold_party();
+	host_send_progress(1);   // the party table must reach the guest before the level it belongs to
+	((req3_t)g_change_level)((void *)(uintptr_t)g, NULL, level, entry, flag);
+	g_last_level = level;
+	g_last_entry = entry;
+	g_last_flag = flag;
+	net_send_req(REQ_LEVEL, level, entry, flag, NULL);
+	InterlockedIncrement(&g_req_sent);
+	host_level_request_repeat(level, entry, flag);
+	g_accept_at = GetTickCount() + 4500;   // the rebuilt world asks "player 2 is joining" again
+	g_accept_until = g_accept_at + 150;
+}
 
 static void __fastcall hk_change_level(void *game, void *edx, unsigned level, unsigned entry, unsigned flag)
 {
@@ -102,7 +148,16 @@ static void __fastcall hk_change_level(void *game, void *edx, unsigned level, un
 	InterlockedIncrement(&g_req_seq);
 	if (g_role == 2 && g_peer_ok && !g_apply_host_req &&
 	    (LONG)(GetTickCount() - g_guest_load_until) >= 0) {   // guest: only the host changes levels,
-		logf("guest: own ChangeLevel %s dropped (the host decides)", tag4(level, t));   // except its own save load
+		guest_note_own_level(level, entry, flag);   // except its own save load; TASK 34 asks the host
+		return;
+	}
+	// TASK 34: this copy's own door path asking for the level the guest just asked for: one change, not two.
+	if (g_role == 1 && !g_apply_host_req && g_ask_done_level == level &&
+	    (LONG)(GetTickCount() - g_ask_done_at) < 2000) {
+		logf("request ChangeLevel %s is the change just made for the guest: not applied again", tag4(level, t));
+		g_last_level = level;
+		g_last_entry = entry;
+		g_last_flag = flag;
 		return;
 	}
 	logf("request ChangeLevel level %s (0x%08x) entry %u flag %u [mode %u state %u]", tag4(level, t), level, entry, flag,
