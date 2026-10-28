@@ -41,6 +41,30 @@ Summarised in our own words; check a value live before relying on it.
   picked up with the action button and break when swung or hit.
 - Battery: shared pool for the chainsaw, stun gun and uber flashlight; recharged at power boxes.
 
+## Character aptitudes (each character has one; used for puzzles and progress; must work and sync in co-op)
+From the community guide "obscure guide for dummy" (https://steamcommunity.com/sharedfiles/filedetails/?id=241744706) and the
+stats guide: Corey climbs walls/ledges and shimmies (acrobatics), Mei hacks machines (a mini-game), Sven and Kenny push heavy
+objects (strength), Stan picks locks (a mini-game), Shannon absorbs black auras/spores on doors, Amy reads faded documents and
+solves riddles; Jun has no aptitude. Ledge moves, hacking and lock picking are animations or mini-games the guest copy must also
+see and finish the same way (not synced yet; untested). Puzzle codes and keys: guides 2257482438 (all codes, Spanish) and
+1990384144 ("The keys to success").
+
+## PC and Steam version notes (community guides; relevant for players' setups and the save transfer)
+- Saves on the Steam version are synced through Steam Cloud: Steam keeps them under `Steam\userdata\<user id>\254480\remote\`
+  (with `remotecache.vdf` one folder up, and the input file `o2.ipt` among them). A save copied in from outside is only kept by
+  Steam if it has the same name as the game's own saves; otherwise Steam's copy can win on the next sync
+  (guide 1599088959, Russian). CHECK for the real two-account test: where the guest's transferred save is written versus where the
+  Steam build reads it, and whether Steam Cloud overwrites it on the next start. The test harness redirects saves away from Steam.
+- Known game crashes/freezes on modern PCs: using the STUN GUN can freeze or crash the game under DirectX 9; the community fix is a
+  DXVK `d3d9.dll` (DirectX 9 on Vulkan) next to `Obscure2.exe` (guide 3722581300; the same idea fixes black screens, 3528679298;
+  a black screen in the Kenny boss fight is described in 2385019953). Our mod reads the D3D9 view matrix for the camera yaw, so a
+  player with a DXVK `d3d9.dll` installed is an untested setup: test it before telling players it works. Do not ship or download
+  that DLL ourselves (third-party file on a file host).
+- The game is 4:3 by default; widescreen patches exist (guides 3606707913, 442124251, 1123131599). They change the exe or config,
+  which can change our hash-checked game identity (Obscure2.exe SHA-256 in the README): the mod should refuse or warn, not crash.
+- "The game doesn't start" guides (887639483, 3731047704) mention deleting the MRS folder in Documents, i.e. the profile/save folder
+  the mod also uses.
+
 ## Story events that change state (guide; relevant for cutscene and state sync)
 - Some story moments set a character's HP or the battery to fixed values, empty the whole inventory (after the Friedmans
   fight, later a bag refills it depending on chests opened), or switch characters. These must reach both copies.
