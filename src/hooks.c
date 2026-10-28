@@ -56,6 +56,8 @@ static void host_level_request_repeat(unsigned level, unsigned entry, unsigned f
 static void host_load_request_repeat(const char *name);   // sync.c
 static int guest_party_copy(unsigned level, BYTE *out);   // sync.c: the host's party table for this level
 static void game_load_tick(unsigned game);                // sync.c: a real save load, on the game thread
+static void host_save_include(const char *name);          // sync.c: remember the loaded file, send it to the guest
+static void host_save_forget(void);                       // sync.c: the world no longer comes from a save file
 
 static void __fastcall hk_change_level(void *game, void *edx, unsigned level, unsigned entry, unsigned flag)
 {
@@ -85,6 +87,8 @@ static void __fastcall hk_load_progress(void *game, void *edx, unsigned arg)
 {
 	InterlockedIncrement(&g_req_seq);
 	logf("request LoadProgress arg %u [mode %u]", arg, *(unsigned *)((BYTE *)game + 0x310));
+	if (g_role == 1)   // a new game: the host's world no longer comes from a save file
+		host_save_forget();
 	if (g_role == 2 && !g_apply_host_req) {   // the guest's own save load: let its ChangeLevel through
 		g_guest_load_until = GetTickCount() + 5000;
 		logf("guest: own save load, allowing its ChangeLevel for 5 s");
@@ -104,6 +108,8 @@ static void __fastcall hk_load_name(void *game, void *edx, unsigned name)
 {
 	InterlockedIncrement(&g_req_seq);
 	logf("request LoadByName \"%.60s\" [mode %u]", name ? (const char *)name : "(null)", *(unsigned *)((BYTE *)game + 0x310));
+	if (g_role == 1 && name)   // the file this load names: a guest that joins later must get exactly it
+		host_save_include((const char *)name);
 	g_load_name(game, edx, name);
 	if (g_role == 1 && !g_apply_host_req && g_peer_ok && name) {
 		net_send_req(REQ_LOAD_NAME, 0, 0, 0, (const char *)name);
@@ -116,6 +122,8 @@ static void __fastcall hk_to_menu(void *game, void *edx)
 {
 	InterlockedIncrement(&g_req_seq);
 	logf("request ToMenu [mode %u]", *(unsigned *)((BYTE *)game + 0x310));
+	if (g_role == 1)   // back at the menu: the last load no longer describes what the host is in
+		host_save_forget();
 	g_to_menu(game, edx);
 	if (g_role == 1 && !g_apply_host_req && g_peer_ok) {
 		net_send_req(REQ_TO_MENU, 0, 0, 0, NULL);

@@ -14,12 +14,14 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 7   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 8   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
                         // 7: PKT_SAVES_DONE tells the guest when the host's save transfer is complete (the guest may then
                         //    load a transferred save with the game's own menu path)
+                        // 8: PKT_SAVES_DONE names the save file that just completed (and says when all of them have); the
+                        //    transfer sends the file the host's load named (o2.sav too), not only game0..9.sav
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15 };
@@ -46,6 +48,8 @@ typedef struct { pkt_hdr h; DWORD level; DWORD off; DWORD count; DWORD total; DW
 #define SAVE_CHUNK 512
 typedef struct { pkt_hdr h; char name[32]; DWORD off; DWORD len; BYTE data[SAVE_CHUNK]; } pkt_save;
 typedef struct { pkt_hdr h; char name[32]; DWORD off; } pkt_save_ack;
+// "this save file is complete on the guest" (name set), or all of them are (all = 1, name empty).
+typedef struct { pkt_hdr h; DWORD all; char name[32]; } pkt_saves_done;
 #define MAX_NPC 24
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; npc_state npc[MAX_NPC]; } pkt_npc;
 #pragma pack(pop)
@@ -53,7 +57,8 @@ typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; npc_state npc[MAX_
 static void guest_on_state(const char *buf, int n);
 static void guest_on_item(const char *buf, int n);
 static void guest_on_save(const char *buf, int n);
-static void guest_on_saves_done(void);
+static void guest_on_saves_done(const char *buf, int n);
+static void guest_save_session(void);
 static void host_on_save_ack(const char *buf, int n);
 static void host_save_begin(void);
 static void guest_on_req(const char *buf, int n);
@@ -260,6 +265,7 @@ static void net_handle(const char *buf, int n, sid_t from)
 			g_peer = from;
 			g_peer_ok = 1;
 			g_last_hostpad_seq = 0;
+			guest_save_session();   // a new session: the host starts its save transfer again
 			logf("net: host welcomed us (%s)", g_use_steam ? "steam" : "udp");
 		} else if (from != g_peer) {
 			return;
@@ -281,7 +287,7 @@ static void net_handle(const char *buf, int n, sid_t from)
 		} else if (h->type == PKT_SAVE) {
 		guest_on_save(buf, n);
 	} else if (h->type == PKT_SAVES_DONE) {
-		guest_on_saves_done();
+		guest_on_saves_done(buf, n);
 	} else if (h->type == PKT_ITEM) {
 		guest_on_item(buf, n);
 	} else if (h->type == PKT_STATE) {

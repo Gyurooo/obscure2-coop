@@ -12,7 +12,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bot, peek
 
 R = os.path.dirname(os.path.abspath(__file__))
-SAVE = sys.argv[1] if len(sys.argv) > 1 else 'game0.sav'
+# The save to load: argv[1], else OBSCOOP_MENU_SAVE (CASE 2 uses o2.sav, the file the main menu's own Load
+# Game is hard-wired to), else save 01.
+SAVE = sys.argv[1] if len(sys.argv) > 1 else (os.environ.get('OBSCOOP_MENU_SAVE') or 'game0.sav')
 LIMIT = int(sys.argv[2]) if len(sys.argv) > 2 else 90
 hp = int(open(R + r'\duo_host.pid').read()); gp = int(open(R + r'\duo_guest.pid').read())
 host, guest = bot.Pipe(hp), bot.Pipe(gp)

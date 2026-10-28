@@ -104,24 +104,71 @@ static void attach_player2(void)
 }
 
 // ---- save-file transfer (host -> guest) --------------------------------------------------------
-// The guest starts from the host's campaign save: the host sends Save\game0..9.sav in 512-byte
-// chunks; the guest writes them and acks each chunk; a chunk that is not acked is retransmitted
-// after 250 ms. Several chunks are in flight at once (SAVE_WINDOW): stop-and-wait moved one chunk
-// per round trip, so 400 KB took 150 s over a 60 ms relay link and never finished inside the test.
-// The ack arrives on the network thread while the frame thread sends, so all of the transfer state
-// is guarded by g_save_cs.
+// The guest builds its world from the same save file the host loaded, so the transfer sends the file the
+// host's load named first (o2.sav for the main menu's Load Game, gameN.sav for a pause-menu slot) and then
+// Save\game0..9.sav, in 512-byte chunks; the guest writes them and acks each chunk; a chunk that is not
+// acked is retransmitted after 250 ms. Several chunks are in flight at once (SAVE_WINDOW): stop-and-wait
+// moved one chunk per round trip, so 400 KB took 150 s over a 60 ms relay link and never finished inside
+// the test. The ack arrives on the network thread while the frame thread sends, so all of the transfer
+// state is guarded by g_save_cs.
+//
+// Each completed file is announced by name (PKT_SAVES_DONE), so the guest waits for the exact file its
+// load needs instead of for all ten. A file the host loads after the join transfer (a second load in one
+// session) is queued and sent then (host_save_include).
 #define SAVE_RETRY_MS 250
 #define SAVE_WINDOW 16
+#define SAVE_MAX_FILES 12    // the loaded file plus game0..9.sav
+#define SAVE_DONE_MS 200     // PKT_SAVES_DONE has no ack: each notice is repeated a few times
+#define SAVE_DONE_REPEAT 4
 typedef struct { DWORD off, len, sent_at; int sent, acked; BYTE data[SAVE_CHUNK]; } save_chunk;
+typedef struct { char name[32]; DWORD at; int left; } save_done_rep;
 static CRITICAL_SECTION g_save_cs;
+static char g_save_list[SAVE_MAX_FILES][32];   // host: the files of this transfer, in send order
+static int g_save_cnt;
+static char g_last_load_name[32];              // host: the file the last load named ("" = a new game)
 static DWORD g_save_file, g_save_next;   // the file being sent and the next offset to read
 static int g_save_eof;                   // the file's last (short or empty) chunk has been queued
 static int g_save_active, g_save_n;      // transfer running; chunks in the window, in send order
 static int g_save_done_sent;             // the "all files acked" notice was sent for this welcome
 static save_chunk g_save_win[SAVE_WINDOW];
-// Guest: the host's transfer of all ten saves has finished, so a transferred file is complete on disk and
-// the guest may load it with the game's own menu path (real load, see request_real_load below).
-static volatile LONG g_saves_done;
+static save_done_rep g_save_done_rep[SAVE_MAX_FILES];
+static int g_save_done_n;
+// Guest: the files the host's transfer has completed (each is whole on disk), so a real load may use it.
+#define SAVE_RCVD_MAX 16
+static CRITICAL_SECTION g_rcvd_cs;
+static char g_save_rcvd[SAVE_RCVD_MAX][32];
+static int g_save_rcvd_n;
+static volatile LONG g_saves_done;   // guest: the whole transfer has finished (status line)
+
+// A save file name from the game or the host: a plain name inside Save\ (never a path).
+static int save_name_ok(const char *name)
+{
+	size_t l = name ? strlen(name) : 0;
+	return l > 0 && l < 32 && !strchr(name, '\\') && !strchr(name, '/') && !strchr(name, ':') && !strstr(name, "..");
+}
+
+// Host: is this file already in the transfer list? (g_save_cs held)
+static int save_list_index(const char *name)
+{
+	for (int i = 0; i < g_save_cnt; i++)
+		if (!_stricmp(g_save_list[i], name))
+			return i;
+	return -1;
+}
+
+static int save_list_has(const char *name)
+{
+	return save_list_index(name) >= 0;
+}
+
+static void save_bak_path(char *out, size_t n, const char *name)
+{
+	char exe[MAX_PATH];
+	GetModuleFileNameA(NULL, exe, sizeof exe);
+	char *slash = strrchr(exe, '\\');
+	if (slash) *slash = 0;
+	_snprintf(out, n, "%s\\Save.bak\\%s", exe, name);
+}
 
 static void save_path(char *out, size_t n, const char *name)
 {
@@ -132,43 +179,152 @@ static void save_path(char *out, size_t n, const char *name)
 	_snprintf(out, n, "%s\\Save\\%s", exe, name);
 }
 
-// Host: send all of the saves again from the first file. Called from the welcome path, so a guest
-// that reconnects (or missed chunks) gets a clean transfer.
+// The game's own save files do NOT live in <exe>\Save: its save manager reads them through Steam
+// RemoteStorage, which this mod's proxy maps to <exe>\coop_profile\remote\<name> (obscoop2.c remote_path).
+// OBSERVED (TASK 14): `loadsave o2.sav` with the file only in Save\ logged "remote FileExists o2.sav -> 0"
+// and the game's open failed; with the file in coop_profile\remote\ it was read. A transferred save must
+// land there to be loadable, so the transfer reads/writes that copy and keeps <exe>\Save in step.
+static void save_game_path(char *out, size_t n, const char *name)
+{
+	char exe[MAX_PATH];
+	GetModuleFileNameA(NULL, exe, sizeof exe);
+	char *slash = strrchr(exe, '\\');
+	if (slash) *slash = 0;
+	_snprintf(out, n, "%s\\coop_profile\\remote\\%s", exe, name);
+}
+
+// The copy of a save that exists (the game's own folder first, then the Save mirror); 0 if neither.
+static int save_existing_path(char *out, size_t n, const char *name)
+{
+	save_game_path(out, n, name);
+	if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES)
+		return 1;
+	save_path(out, n, name);
+	return GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Host: send the saves again from the first file. Called from the welcome path, so a guest that reconnects
+// (or missed chunks) gets a clean transfer. The file the host's latest load named goes first: the guest's
+// load waits for exactly that file.
 static void host_save_begin(void)
 {
 	EnterCriticalSection(&g_save_cs);
+	g_save_cnt = 0;
+	if (save_name_ok(g_last_load_name))
+		_snprintf(g_save_list[g_save_cnt++], sizeof g_save_list[0], "%s", g_last_load_name);
+	for (int i = 0; i < 10 && g_save_cnt < SAVE_MAX_FILES; i++) {
+		char name[16];
+		_snprintf(name, sizeof name, "game%d.sav", i);
+		if (!save_list_has(name))
+			_snprintf(g_save_list[g_save_cnt++], sizeof g_save_list[0], "%s", name);
+	}
 	g_save_active = 1;
 	g_save_file = 0;
 	g_save_next = 0;
 	g_save_eof = 0;
 	g_save_n = 0;
 	g_save_done_sent = 0;
+	g_save_done_n = 0;
+	memset(g_save_done_rep, 0, sizeof g_save_done_rep);
+	logf("host: save transfer starts (%d file%s, first \"%s\")", g_save_cnt, g_save_cnt == 1 ? "" : "s",
+		g_save_cnt ? g_save_list[0] : "");
 	LeaveCriticalSection(&g_save_cs);
+}
+
+// Host: the game is loading this save file. Remember it (a guest that joins later must load the same file,
+// CASE 1) and make sure the guest receives exactly it: it goes first on the next welcome, or it is queued
+// and sent right away when the join transfer is already running or finished (a second load, CASE 3).
+static void host_save_include(const char *name)
+{
+	if (!save_name_ok(name))
+		return;
+	int send_now = 0, fresh = 0;
+	EnterCriticalSection(&g_save_cs);
+	_snprintf(g_last_load_name, sizeof g_last_load_name, "%s", name);
+	int idx = save_list_index(name);
+	if (g_peer_ok && idx < 0 && g_save_cnt < SAVE_MAX_FILES) {
+		_snprintf(g_save_list[g_save_cnt++], sizeof g_save_list[0], "%s", name);
+		idx = g_save_cnt - 1;
+		fresh = 1;
+	}
+	if (g_peer_ok && idx >= 0 && !g_save_active) {
+		// The join transfer is over: (re)send this file now. It may be new (a second load naming a file the
+		// join transfer never sent) or the guest may have lost it — the load waits for the notice either way.
+		g_save_file = (DWORD)idx;
+		g_save_next = 0;
+		g_save_eof = 0;
+		g_save_n = 0;
+		g_save_done_sent = 0;
+		g_save_active = 1;
+		send_now = 1;
+	}
+	LeaveCriticalSection(&g_save_cs);
+	if (send_now)
+		logf("host: \"%s\" is %s in the save transfer for the guest", name,
+			fresh ? "added" : "sent again");
+}
+
+// Host: the host's world no longer comes from a save file (a new game, back to the menu).
+static void host_save_forget(void)
+{
+	EnterCriticalSection(&g_save_cs);
+	g_last_load_name[0] = 0;
+	LeaveCriticalSection(&g_save_cs);
+}
+
+// Host: announce one finished file, or the whole transfer (name NULL), and repeat it: PKT_SAVES_DONE has
+// no ack. (g_save_cs held)
+static void host_send_saves_done(const char *name)
+{
+	pkt_saves_done p;
+	memset(&p, 0, sizeof p);
+	p.all = name ? 0 : 1;
+	if (name)
+		_snprintf(p.name, sizeof p.name, "%s", name);
+	net_send(PKT_SAVES_DONE, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	if (g_save_done_n < SAVE_MAX_FILES) {
+		save_done_rep *d = &g_save_done_rep[g_save_done_n++];
+		_snprintf(d->name, sizeof d->name, "%s", name ? name : "");
+		d->at = GetTickCount();
+		d->left = SAVE_DONE_REPEAT;
+	}
 }
 
 static void host_send_saves(void)
 {
 	EnterCriticalSection(&g_save_cs);
+	DWORD now = GetTickCount();
+	for (int i = 0; i < g_save_done_n; ) {   // repeat the completion notices the guest may have missed
+		save_done_rep *d = &g_save_done_rep[i];
+		if (d->left <= 0) {
+			memmove(&g_save_done_rep[i], &g_save_done_rep[i + 1], sizeof g_save_done_rep[0] * (g_save_done_n - i - 1));
+			g_save_done_n--;
+			continue;
+		}
+		if (now - d->at >= SAVE_DONE_MS) {
+			d->at = now;
+			d->left--;
+			host_send_saves_done(d->name[0] ? d->name : NULL);
+		}
+		i++;
+	}
 	if (!g_peer_ok || !g_save_active) {   // the guest is gone; the next welcome starts the transfer again
 		g_save_active = 0;
 		g_save_n = 0;
 		LeaveCriticalSection(&g_save_cs);
 		return;
 	}
-	if (g_save_file > 9) {   // everything was acked (or skipped); wait for the next welcome
+	if (g_save_file >= (DWORD)g_save_cnt) {   // everything was acked (or skipped); wait for the next welcome
 		int tell = !g_save_done_sent;
 		g_save_done_sent = 1;
 		g_save_active = 0;
 		g_save_n = 0;
+		host_send_saves_done(NULL);
 		LeaveCriticalSection(&g_save_cs);
-		if (tell && g_peer_ok) {   // the guest may now load any of the transferred files (real load)
-			pkt_hdr h;
-			net_send(PKT_SAVES_DONE, &h, 0);
+		if (tell)
 			logf("host: save transfer finished, the guest may load a transferred save");
-		}
 		return;
 	}
-	DWORD now = GetTickCount();
 	// Advance over every chunk at the head that was acked. The file is done when a chunk shorter than
 	// SAVE_CHUNK (its last one, possibly empty) has been acked.
 	while (g_save_n > 0 && g_save_win[0].acked) {
@@ -176,16 +332,22 @@ static void host_send_saves(void)
 		memmove(&g_save_win[0], &g_save_win[1], sizeof g_save_win[0] * (g_save_n - 1));
 		g_save_n--;
 		if (end) {
+			char fin[32];
+			_snprintf(fin, sizeof fin, "%s", g_save_list[g_save_file]);
 			g_save_file++;
 			g_save_next = 0;
 			g_save_eof = 0;
 			g_save_n = 0;
+			host_send_saves_done(fin);
+			logf("host: the guest has \"%s\" (%u of %d files)", fin, (unsigned)g_save_file, g_save_cnt);
 		}
 	}
-	while (g_save_n < SAVE_WINDOW && g_save_file <= 9 && !g_save_eof) {
-		char name[32]; _snprintf(name, sizeof name, "game%u.sav", (unsigned)g_save_file);
-		char path[MAX_PATH]; save_path(path, sizeof path, name);
-		HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	while (g_save_n < SAVE_WINDOW && g_save_file < (DWORD)g_save_cnt && !g_save_eof) {
+		const char *name = g_save_list[g_save_file];
+		char path[MAX_PATH];
+		HANDLE f = INVALID_HANDLE_VALUE;
+		if (save_existing_path(path, sizeof path, name))
+			f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
 		if (f == INVALID_HANDLE_VALUE) {
 			if (g_save_n > 0)   // a file cannot vanish in the middle of its window; try again next frame
 				break;
@@ -217,7 +379,7 @@ static void host_send_saves(void)
 		if (c->acked || (c->sent && now - c->sent_at < SAVE_RETRY_MS))
 			continue;
 		pkt_save p; memset(&p, 0, sizeof p);
-		_snprintf(p.name, sizeof p.name, "game%u.sav", (unsigned)g_save_file);
+		_snprintf(p.name, sizeof p.name, "%s", g_save_list[g_save_file]);
 		p.off = c->off;
 		p.len = c->len;
 		if (c->len)
@@ -238,9 +400,8 @@ static void host_on_save_ack(const char *buf, int n)
 	acked[sizeof a->name] = 0;
 	EnterCriticalSection(&g_save_cs);
 	// Mark the chunk it acknowledges; a stale or duplicated ack (wrong file or offset) is ignored.
-	if (g_save_active && g_save_file <= 9) {
-		char name[32]; _snprintf(name, sizeof name, "game%u.sav", (unsigned)g_save_file);
-		if (!strcmp(acked, name))
+	if (g_save_active && g_save_file < (DWORD)g_save_cnt) {
+		if (!_stricmp(acked, g_save_list[g_save_file]))
 			for (int i = 0; i < g_save_n; i++)
 				if (g_save_win[i].off == a->off && !g_save_win[i].acked) {
 					g_save_win[i].acked = 1;
@@ -250,9 +411,43 @@ static void host_on_save_ack(const char *buf, int n)
 	LeaveCriticalSection(&g_save_cs);
 }
 
-static void guest_on_saves_done(void)
+// Guest: a new session (the host welcomed us), so the host starts its transfer again. Forget what the
+// previous one completed; the files are still on disk, but the host's copies may have changed.
+static void guest_save_session(void)
 {
-	if (InterlockedExchange(&g_saves_done, 1) == 0)
+	EnterCriticalSection(&g_rcvd_cs);
+	g_save_rcvd_n = 0;
+	LeaveCriticalSection(&g_rcvd_cs);
+	InterlockedExchange(&g_saves_done, 0);
+}
+
+static int guest_save_complete(const char *name)
+{
+	int ok = 0;
+	EnterCriticalSection(&g_rcvd_cs);
+	for (int i = 0; i < g_save_rcvd_n; i++)
+		if (!_stricmp(g_save_rcvd[i], name)) { ok = 1; break; }
+	LeaveCriticalSection(&g_rcvd_cs);
+	return ok;
+}
+
+static void guest_on_saves_done(const char *buf, int n)
+{
+	if (n != (int)sizeof(pkt_saves_done)) return;
+	const pkt_saves_done *p = (const pkt_saves_done *)buf;
+	if (!memchr(p->name, 0, sizeof p->name)) return;
+	if (p->name[0]) {
+		if (!save_name_ok(p->name)) return;
+		int fresh = !guest_save_complete(p->name);
+		if (fresh) {
+			EnterCriticalSection(&g_rcvd_cs);
+			if (g_save_rcvd_n < SAVE_RCVD_MAX)
+				_snprintf(g_save_rcvd[g_save_rcvd_n++], sizeof g_save_rcvd[0], "%s", p->name);
+			LeaveCriticalSection(&g_rcvd_cs);
+			logf("guest: the host's save transfer has \"%s\" (whole file on disk)", p->name);
+		}
+	}
+	if (p->all && InterlockedExchange(&g_saves_done, 1) == 0)
 		logf("guest: the host's save transfer is complete (transferred saves may be loaded)");
 }
 
@@ -260,19 +455,52 @@ static void guest_on_save(const char *buf, int n)
 {
 	if (n != (int)sizeof(pkt_save)) return;   // a short packet must not make us read past data[]
 	const pkt_save *p = (const pkt_save *)buf;
-	if (!memchr(p->name, 0, sizeof p->name)) return;
-	if (strncmp(p->name, "game", 4) || strstr(p->name, "..") || p->len > SAVE_CHUNK) return;
-	if (p->off == 0 && !strcmp(p->name, "game0.sav"))   // a new transfer starts with the first file
-		InterlockedExchange(&g_saves_done, 0);
-	char path[MAX_PATH]; save_path(path, sizeof path, p->name);
-	char dir[MAX_PATH]; _snprintf(dir, sizeof dir, "%s", path);
-        char *slash = strrchr(dir, '\\'); if (slash) *slash = 0;
-	CreateDirectoryA(dir, NULL);
-	HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
-	if (f == INVALID_HANDLE_VALUE) return;
-	SetFilePointer(f, p->off, NULL, FILE_BEGIN);
-	DWORD wrote = 0; WriteFile(f, p->data, p->len, &wrote, NULL); CloseHandle(f);
-	if (wrote != p->len) return;   // not acked: the host retransmits this chunk
+	if (!memchr(p->name, 0, sizeof p->name) || !save_name_ok(p->name)) return;
+	if (p->len > SAVE_CHUNK) return;
+	// Both copies the game might use: the one its save manager really reads (coop_profile\remote) and the
+	// Save mirror the owner's setup and check_savexfer.py look at.
+	char paths[2][MAX_PATH];
+	save_game_path(paths[0], sizeof paths[0], p->name);
+	save_path(paths[1], sizeof paths[1], p->name);
+	for (int i = 0; i < 2; i++) {
+		char dir[MAX_PATH]; _snprintf(dir, sizeof dir, "%s", paths[i]);
+		char *slash = strrchr(dir, '\\'); if (slash) *slash = 0;
+		CreateDirectoryA(dir, NULL);
+	}
+	if (p->off == 0) {
+		// First chunk of a file: this may be a re-transfer of a file the guest already has (the host sends the
+		// file its load names again). Until the host announces this file complete again, the copy on disk is
+		// being rewritten and must not be loaded: forgetting the completion is what makes the guest wait.
+		EnterCriticalSection(&g_rcvd_cs);
+		for (int i = 0; i < g_save_rcvd_n; i++)
+			if (!_stricmp(g_save_rcvd[i], p->name)) {
+				memmove(&g_save_rcvd[i], &g_save_rcvd[i + 1], sizeof g_save_rcvd[0] * (g_save_rcvd_n - i - 1));
+				g_save_rcvd_n--;
+				break;
+			}
+		LeaveCriticalSection(&g_rcvd_cs);
+		// Keep the guest's own copy before the host's version overwrites it. The owner agreed to this;
+		// CopyFileA with bFailIfExists never replaces an earlier backup.
+		char bak[MAX_PATH], bakdir[MAX_PATH], src[MAX_PATH];
+		save_bak_path(bak, sizeof bak, p->name);
+		_snprintf(bakdir, sizeof bakdir, "%s", bak);
+		char *bs = strrchr(bakdir, '\\'); if (bs) *bs = 0;
+		CreateDirectoryA(bakdir, NULL);
+		if (save_existing_path(src, sizeof src, p->name) && CopyFileA(src, bak, TRUE))
+			logf("guest: kept the guest's own \"%s\" (%s) in Save.bak before the host's copy overwrote it",
+				p->name, strstr(src, "coop_profile") ? "the game's save folder" : "Save");
+	}
+	for (int i = 0; i < 2; i++) {
+		HANDLE f = CreateFileA(paths[i], GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
+		if (f == INVALID_HANDLE_VALUE) {
+			if (i == 0) return;   // the game's own copy is the one that matters: not acked, retransmitted
+			continue;
+		}
+		SetFilePointer(f, p->off, NULL, FILE_BEGIN);
+		DWORD wrote = 0; WriteFile(f, p->data, p->len, &wrote, NULL); CloseHandle(f);
+		if (i == 0 && wrote != p->len)
+			return;   // the game's copy is short: not acked, the host retransmits this chunk
+	}
 	pkt_save_ack a; memset(&a, 0, sizeof a);
 	_snprintf(a.name, sizeof a.name, "%s", p->name);
 	a.off = p->off;
@@ -572,10 +800,11 @@ static int save_file_ready(const char *name)
 	char path[MAX_PATH];
 	if (!name[0])
 		return 0;
-	save_path(path, sizeof path, name);
-	if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+	if (!save_existing_path(path, sizeof path, name))
 		return 0;
-	if (g_role == 2 && !g_saves_done)
+	// The guest only loads a file the host's own transfer has completed: its own copy may be stale, and a
+	// half-written file would load as garbage. (CASE 2: wait for exactly this file, not for all of them.)
+	if (g_role == 2 && !guest_save_complete(name))
 		return 0;
 	return 1;
 }
@@ -616,6 +845,8 @@ static int guest_owns_level(unsigned level)
 	return w && rd32(w + 4) == level;
 }
 
+static void guest_load_failed(const char *name);   // sync.c: the game refused the file, take a repeat again
+
 // Runs on the game's own thread, every frame, in every mode (main menu included).
 static void game_load_tick(unsigned game)
 {
@@ -651,7 +882,7 @@ static void game_load_tick(unsigned game)
 	if (!save_file_ready(name)) {
 		if ((LONG)(now - at) < LOAD_WAIT_MS)
 			return;   // still transferring (or not there yet): keep waiting, the request stays pending
-		logf("%s: real load of \"%s\" (%s) given up after %u ms: the save file is not complete on disk",
+		logf("%s: real load of \"%s\" (%s) given up after %u ms: the host's transfer of that file is not complete",
 			g_role == 2 ? "guest" : "host", name, src, now - at);
 		InterlockedExchange(&g_rload_want, 0);
 		return;
@@ -660,8 +891,11 @@ static void game_load_tick(unsigned game)
 	int opened = game_save_open(game, name);
 	logf("%s: real load of \"%s\" (%s): the game's save open %s", g_role == 2 ? "guest" : "host", name, src,
 		opened ? "ok" : "FAILED");
-	if (!opened)
+	if (!opened) {
+		if (g_role == 2 && !strcmp(src, "host"))   // let the host's repeat of the request through again
+			guest_load_failed(name);
 		return;
+	}
 	if (g_role == 2) {   // the guest's own load: remember it, so the host's level request does not rebuild
 		g_real_load_at = now;
 		g_real_load_stage = 1;
@@ -1314,12 +1548,26 @@ static void host_watch_level(void)
 // Host: a guest just connected. Make it load and go to the level the party is in, then send all of the state.
 static void host_welcome_guest(void)
 {
+	char lname[sizeof g_last_load_name];
+	EnterCriticalSection(&g_save_cs);
+	memcpy(lname, g_last_load_name, sizeof lname);
+	LeaveCriticalSection(&g_save_cs);
 	logf("join: sending the current state to the guest (level %c%c%c%c)", (char)(g_last_level >> 24), (char)(g_last_level >> 16),
 		(char)(g_last_level >> 8), (char)g_last_level);
-	// The friend starts their own "New game, Two players" first (that choice decides who controls player 2); the
-	// level request waits on the guest until its world exists.
 	test_hold_party();
 	host_send_progress(1);   // the party table has to reach the guest before the level request
+	if (lname[0]) {
+		// The host is already inside a save it loaded (possibly before this guest existed): the guest must
+		// load that file itself, exactly as it would if the load happened now (CASE 1). No REQ_LEVEL: the
+		// file builds that world, and a level request would only sit in the guest's queue behind the load.
+		logf("join: the host is in a load of \"%s\"; asking the guest to load that file itself", lname);
+		net_send_req(REQ_LOAD_NAME, 0, 0, 0, lname);
+		InterlockedIncrement(&g_req_sent);
+		host_load_request_repeat(lname);
+		return;
+	}
+	// The friend starts their own "New game, Two players" first (that choice decides who controls player 2); the
+	// level request waits on the guest until its world exists.
 	if (g_last_level) {
 		net_send_req(REQ_LEVEL, g_last_level, g_last_entry, g_last_flag, NULL);
 		InterlockedIncrement(&g_req_sent);
@@ -1340,6 +1588,17 @@ static DWORD g_lvl_req_done_a, g_lvl_req_done_b, g_lvl_req_done_at;   // the las
 static unsigned g_lvl_defer_level;  // the level request currently waiting for the host party (0 = none)
 static DWORD g_ln_done_at;          // the last load request this copy took
 static char g_ln_done_name[sizeof(((pkt_req *)0)->name)];
+
+// The game refused to open the file this load named (a half-written file, or a name it does not accept).
+// Forget the "already taken" mark, so the host's repeat of the same request is executed again instead of
+// being dropped as a duplicate for REQ_LOAD_DONE_MS.
+static void guest_load_failed(const char *name)
+{
+	EnterCriticalSection(&g_req_cs);
+	if (!strncmp(g_ln_done_name, name, sizeof g_ln_done_name))
+		g_ln_done_at = 0;
+	LeaveCriticalSection(&g_req_cs);
+}
 
 static void guest_on_req(const char *buf, int n)
 {
@@ -1482,18 +1741,13 @@ static void guest_apply_requests(void)
 			break;
 		case REQ_LOAD_NAME:
 			logf("guest: host LoadByName \"%s\" (world %s)", r.name, world_obj() ? "exists" : "none");
-			if (!world_obj()) {
-				// The guest sits at the main menu (no world): a bare LoadByName (state 3) would only
-				// re-read whatever the progress object already holds. Run the game's own menu load
-				// instead — open the transferred save file, then LoadByName — on the game thread, once
-				// the file is complete (FINDINGS_12 (b)/(c)).
-				g_ln_done_at = GetTickCount();
-				_snprintf(g_ln_done_name, sizeof g_ln_done_name, "%.63s", r.name);
-				request_real_load(r.name, "host");
-				break;
-			}
-			if (g_load_name)
-				g_load_name((void *)(uintptr_t)g, NULL, (unsigned)(uintptr_t)r.name);
+			// Always the game's own menu load (the save manager opens the file, then LoadByName). A bare
+			// LoadByName is state 3 without that open: it re-reads whatever chunks the manager still holds
+			// (FINDINGS_12 (b)), which fits neither a guest at the main menu nor a guest already in a level
+			// that must follow a second load in the same session (CASE 3).
+			g_ln_done_at = GetTickCount();
+			_snprintf(g_ln_done_name, sizeof g_ln_done_name, "%.63s", r.name);
+			request_real_load(r.name, "host");
 			break;
 		case REQ_TO_MENU:
 			logf("guest: host ToMenu");
@@ -1580,6 +1834,7 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_rx_cs);
 	InitializeCriticalSection(&g_req_cs);
 	InitializeCriticalSection(&g_save_cs);
+	InitializeCriticalSection(&g_rcvd_cs);
 	InitializeCriticalSection(&g_rload_cs);
 }
 
