@@ -1360,6 +1360,7 @@ static unsigned tag_key(unsigned t)
 }
 
 static volatile LONG g_npc_sent, g_npc_rcv, g_npc_applied, g_npc_snaps, g_npc_blends, g_npc_unmatched;
+static volatile LONG g_npc_life, g_npc_dead, g_npc_state;   // TASK 21: life writes, deaths, state writes on the guest
 
 static void host_send_npcs(void)
 {
@@ -1382,6 +1383,8 @@ static void host_send_npcs(void)
 		p.npc[i].tag = tag_key(rd32(hs[i] + H_TAG));
 		memcpy(p.npc[i].pos, (const void *)(uintptr_t)(hs[i] + H_POS), 12);
 		memcpy(p.npc[i].dir, (const void *)(uintptr_t)(hs[i] + H_DIR), 12);
+		p.npc[i].life = rd32(hs[i] + 0x320);   // TASK 21: the host owns the enemy's life
+		p.npc[i].state = rd32(hs[i] + 0x2dc);  // ... and its AI/death state
 	}
 	net_send(PKT_NPC, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
 	InterlockedIncrement(&g_npc_sent);
@@ -1444,6 +1447,31 @@ static void guest_apply_npcs(void)
 			for (int a = 0; a < 3; a++)
 				pos[a] += (st.npc[i].pos[a] - pos[a]) * 0.25f;
 			InterlockedIncrement(&g_npc_blends);
+		}
+		// TASK 21: the host owns enemy life and death. Apply only the *difference* through the game's own
+		// life method (character vtable slot 9 = +0x24, the method CharacterSetLife uses), so a hit both
+		// copies simulated nets one subtraction (the difference is then 0) and crossing 0 runs the game's
+		// own death path (FUN_004f5bf0 -> state 3). The host's death state (+0x2dc) is copied with it.
+		{
+			float *gl = (float *)(uintptr_t)(hs[best] + 0x320);
+			DWORD *gst = (DWORD *)(uintptr_t)(hs[best] + 0x2dc);
+			if (!IsBadWritePtr(gl, 4) && !IsBadWritePtr(gst, 4)) {
+				float hl = *(const float *)&st.npc[i].life;
+				float dlt = hl - *gl;
+				if (dlt > 0.01f || dlt < -0.01f) {
+					void **vt = *(void ***)(uintptr_t)hs[best];
+					if (vt && vt[9] && !IsBadCodePtr((FARPROC)vt[9])) {
+						((void(__thiscall *)(void *, float))vt[9])((void *)(uintptr_t)hs[best], hl - *gl);
+						InterlockedIncrement(&g_npc_life);
+						if (hl <= 0.0f)
+							InterlockedIncrement(&g_npc_dead);
+					}
+				}
+				if (hl <= 0.0f && *gst != st.npc[i].state) {
+					*gst = st.npc[i].state;   // same death/animation state on both copies
+					InterlockedIncrement(&g_npc_state);
+				}
+			}
 		}
 		InterlockedIncrement(&g_npc_applied);
 	}
@@ -2283,8 +2311,8 @@ static void sync_status(char *reply, size_t replysz)
 		g_skipped_level, g_timed_corr, g_req_sent, g_req_applied);
 	size_t l = strlen(reply);
 	if (l < replysz)
-		_snprintf(reply + l, replysz - l, " | prog sent %ld rcv %ld applied %ld | npc sent %ld rcv %ld applied %ld snaps %ld blends %ld unmatched %ld | cam sets %ld", g_prog_chunks_sent, g_prog_chunks_rcv, g_prog_chunks_applied, g_npc_sent, g_npc_rcv,
-			g_npc_applied, g_npc_snaps, g_npc_blends, g_npc_unmatched, g_cam_sets);
+		_snprintf(reply + l, replysz - l, " | prog sent %ld rcv %ld applied %ld | npc sent %ld rcv %ld applied %ld snaps %ld blends %ld unmatched %ld life %ld dead %ld state %ld | cam sets %ld", g_prog_chunks_sent, g_prog_chunks_rcv, g_prog_chunks_applied, g_npc_sent, g_npc_rcv,
+			g_npc_applied, g_npc_snaps, g_npc_blends, g_npc_unmatched, g_npc_life, g_npc_dead, g_npc_state, g_cam_sets);
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | saves_done %ld | real load stage %ld at %lu | pickup sent %ld rcv %ld applied %ld already %ld missing %ld",

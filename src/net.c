@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 9   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 10   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -23,6 +23,7 @@
                         // 8: PKT_SAVES_DONE names the save file that just completed (and says when all of them have); the
                         //    transfer sends the file the host's load named (o2.sav too), not only game0..9.sav
                         // 9: PKT_PICKUP: a placed world item collected on one copy is collected on the other (both directions)
+                        // 10: npc_state carries the enemy's life (+0x320) and AI/death state (+0x2dc); the host owns them
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16 };
@@ -36,7 +37,10 @@ typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; DWORD 
 #define MAX_CH 8
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; xstate hpad; float yaw; DWORD yaw_valid; ch_state ch[MAX_CH]; } pkt_state;
 typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; } pkt_req;
-typedef struct { DWORD cls, tag; float pos[3]; float dir[3]; } npc_state;   // cls = the object's vtable address (its class)
+// life = character+0x320 (float bits), state = character+0x2dc (the NPC's AI/animation/death state; the
+// same field the humans stream as `anim`). TASK 21: the host owns enemy life and death, the guest applies
+// the difference through the game's own life method (see guest_apply_npcs).
+typedef struct { DWORD cls, tag; float pos[3]; float dir[3]; DWORD life; DWORD state; } npc_state;   // cls = the object's vtable address (its class)
 // A copy of part of the progress object (game+0x318): story / world state the guest must share.
 #define REGION_MAX 960
 typedef struct { pkt_hdr h; DWORD level; DWORD off; DWORD len; BYTE data[REGION_MAX]; } pkt_region;
