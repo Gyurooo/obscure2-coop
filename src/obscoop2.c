@@ -990,17 +990,29 @@ static void watch_start(DWORD addr, DWORD ms)
 //   key <DIK hex> <0|1>                             virtual keyboard key up/down
 //   mouse <dx> <dy> <buttons hex>                   add mouse movement, set button bits
 //   loadsave <name>                                 run the game's own menu Load for that save file
-//   swing <0|1>                                     start the selected weapon's own attack (the game's
-//                                                   "attack" vtable entry of CToeWeapon, 0x4563a0).
+//   swing <0|1>                                     start the selected weapon's own attack: call the game's
+//                                                   attack entry FUN_004563a0 (vtable slot 28, +0x70) on
+//                                                   an object of the class that carries it (searched for
+//                                                   from the weapon, the character and its impact manager).
 //                                                   TEST-ONLY: no pad button, key or mouse button was
 //                                                   found that reaches the game's attack action in the
-//                                                   shipped input map (TASK 22), so the fight test drives
-//                                                   the game's own swing with this.
+//                                                   shipped input map (TASK 22/23).
+//   swingobj <0|1> <hex object>                     the same call on an explicitly given object (diagnostic)
+//   npcset <hex npc> <life>                         TEST-ONLY: set an enemy's life through the game's own
+//                                                   life method (vtable slot 9, the path every damage
+//                                                   source uses); 0 kills it through the game's death path.
+//                                                   Not an attack — the fight test uses it only because no
+//                                                   input reaches the attack (TASK 23).
 //   tp <0|1> x y [z dx dy]                          SAFE teleport: the game thread places the character,
 //                                                   watches the physics settle it on a floor within 8 units
 //                                                   of z and restores the old position (with the reason)
 //                                                   when there is none. Reply: ok settled at (...) / refused: ...
 //   tpraw <0|1> x y [z dx dy]                       old raw position write, no floor check (diagnostics only)
+//   level <tag> <entry> <flag>                      replay a real transition (obscoop_levels.txt). Runs on
+//                                                   the game thread (frame_tick request flag, like `tp`): the
+//                                                   pipe thread waits for the verdict and cannot deadlock.
+//   npclife <0|1>                                   TASK 23 test switch: 0 turns the guest's enemy-life
+//                                                   application of 6704c30 off (position sync stays on)
 //   ping                                            -> pong <pid>
 
 static void vpad_set(int user, int on, unsigned buttons, int lx, int ly, int rx, int ry, int lt, int rt)
@@ -1019,6 +1031,7 @@ static unsigned player_human(int player);   // sync.c
 static void request_real_load(const char *name, const char *src);   // sync.c: the game's own save load
 static int tp_request(int pl, float x, float y, float z, int have_z, float dx, float dy, int have_dir, int safe,
                       char *reply, size_t replysz);   // sync.c: the safe teleport (TASK 17 Part A)
+static int level_request(unsigned tag, int entry, int flag, char *reply, size_t replysz);   // sync.c: pipe `level`
 
 static volatile float g_view[16];            // window.c: the last view matrix
 static volatile LONG g_view_sets, g_xf_sets;
@@ -1033,6 +1046,11 @@ static LONG g_views_n[NVIEWS], g_views_count;
 // Set while the pipe "level" command replays a transition: the hook must not record its own replay
 // as a transition the game made (TASK 20: obscoop_levels.txt grows from real calls only).
 static volatile LONG g_level_replay;
+
+// TASK 23 test switch for the enemy-life code of 6704c30 (pipe `npclife <0|1>`): 1 = the guest applies
+// the host's enemy life/death (the shipped behaviour), 0 = it does not, so a test can compare the copies
+// during a fight with the correction off and on. Read in sync.c guest_apply_npcs.
+static volatile LONG g_npc_life_on = 1;
 
 // Test-only guard for the pipe "level" command: only a transition the game itself produced
 // (tag, entry, flag), listed in obscoop_levels.txt next to the DLL, may be replayed. A guessed
@@ -1055,6 +1073,26 @@ static int level_allowed(unsigned t, int entry, int flag)
 	}
 	fclose(f);
 	return ok;
+}
+
+// TASK 23: find an object of the game's attack class reachable from `root`: a dword inside the first `n`
+// bytes of root that points to an object whose vtable slot 28 (+0x70) is the attack start FUN_004563a0.
+// root == self also accepts the object itself. Every candidate is checked with IsBadReadPtr first.
+static int attack_obj_find(unsigned root, unsigned n, int *slot, unsigned self)
+{
+	if (!root || n < 0x80 || IsBadReadPtr((void *)(uintptr_t)root, n))
+		return 0;
+	for (unsigned off = 0; off < n; off += 4) {
+		unsigned cand = off == 0 && self == root ? root : *(unsigned *)(uintptr_t)(root + off);
+		if (cand < 0x10000 || (cand & 3) || IsBadReadPtr((void *)(uintptr_t)cand, 0x80))
+			continue;
+		void **vt = *(void ***)(uintptr_t)cand;
+		if (!vt || IsBadReadPtr(vt, 0x80) || (unsigned)(uintptr_t)vt[28] != 0x4563a0)
+			continue;
+		*slot = 28;
+		return 1;
+	}
+	return 0;
 }
 
 static void handle_command(char *line, char *reply, size_t replysz)
@@ -1099,10 +1137,9 @@ static void handle_command(char *line, char *reply, size_t replysz)
 			if (!level_allowed(t, entry, flag)) {
 				_snprintf(reply, replysz, "error level %s %d %d not in obscoop_levels.txt (only real transitions)", tag, entry, flag);
 			} else {
-				InterlockedIncrement(&g_level_replay);
-				((void(__fastcall *)(void *, void *, unsigned, unsigned, unsigned))0x4a1c00)((void *)(uintptr_t)g, NULL, t, (unsigned)entry, (unsigned)flag);
-				InterlockedDecrement(&g_level_replay);
-				_snprintf(reply, replysz, "ok");
+				// On the game thread (frame_tick request flag), like the safe tp: the call takes state the
+				// game thread owns and deadlocked the pipe thread in two runs of TASK 22.
+				level_request(t, entry, flag, reply, replysz);
 			}
 		}
 	} else if (!strncmp(line, "loadsave ", 9)) {
@@ -1195,12 +1232,17 @@ static void handle_command(char *line, char *reply, size_t replysz)
 			}
 		}
 	} else if (!strncmp(line, "swing ", 6)) {
-		// swing <0|1>: start the selected weapon's own attack. FUN_004563a0 (the "attack" entry of the
-		// CToeWeapon vtable, right before the swing end FUN_00456710) takes the weapon as `this` and the
-		// character as its argument: it queries the character's impact manager (character+0x30c), sets
-		// character+0x2bc, the weapon's state (+0x14 = 4) and requests the "K3LA" swing animation.
-		// TEST-ONLY (TASK 22): no pad button, key or mouse button reached the game's attack action in the
-		// shipped input map, so the combat test starts the game's own swing through this command.
+		// swing <0|1>: start the selected weapon's own attack. The game's attack start is FUN_004563a0,
+		// vtable slot 28 (+0x70) of the class whose vtable is 0x659568 (exe scan: the dword 0x4563a0 sits at
+		// vtable+0x70, the swing end 0x456710 at +0x74). It takes `this` = that attack object and the
+		// character as its argument: it sweeps the hit volume through the character's impact manager
+		// (+0x30c), sets character+0x2bc, plays the "attack" animation event and moves the object's state
+		// (+0x14) to the swing state.
+		// The weapon ENTITY the character holds (character+0x704[4], class CToeWeapon<X>) does not carry
+		// that entry itself (TASK 22/23: its vtable has no 0x4563a0), so this looks for an object of the
+		// attack class among the pointers reachable from the selected weapon, the other weapons, the
+		// character and its impact manager, and calls slot 28 on it. TEST-ONLY (TASK 23): no pad button,
+		// key or mouse button reaches the game's attack action in the shipped input map.
 		int pl = 0;
 		if (sscanf(line + 6, "%d", &pl) != 1 || pl < 0 || pl > 1) {
 			_snprintf(reply, replysz, "error swing <0|1>");
@@ -1211,34 +1253,95 @@ static void handle_command(char *line, char *reply, size_t replysz)
 			} else {
 				unsigned sel = *(unsigned *)(uintptr_t)(h + 0x714);
 				unsigned wp = sel < 4 ? *(unsigned *)(uintptr_t)(h + 0x704 + 4 * sel) : 0;
-				if (!wp || IsBadReadPtr((void *)(uintptr_t)wp, 0x160)) {
-					_snprintf(reply, replysz, "error swing: no weapon in slot %u", sel);
+				unsigned hit = 0, impact = *(unsigned *)(uintptr_t)(h + 0x30c);
+				int slot = -1;
+				const char *via = "";
+				if (wp)
+					hit = attack_obj_find(wp, 0x200, &slot, wp) ? wp : 0;
+				if (hit) {
+					via = "selected weapon";
 				} else {
-					void **vt = *(void ***)(uintptr_t)wp;
-					int slot = -1, pair = 0;
-					if (vt && !IsBadReadPtr(vt, 0x400))
-						for (int i = 0; i < 0x100; i++) {
-							if ((unsigned)(uintptr_t)vt[i] != 0x4563a0)
-								continue;
-							slot = i;
-							pair = (unsigned)(uintptr_t)vt[i + 1] == 0x456710;
-							break;
-						}
-					if (slot < 0) {
-						_snprintf(reply, replysz,
-							"error swing: slot %u weapon %p has no attack entry (vt %p: %#x %#x %#x %#x)",
-							sel, (void *)(uintptr_t)wp, vt, vt ? (unsigned)(uintptr_t)vt[0] : 0,
-							vt ? (unsigned)(uintptr_t)vt[1] : 0, vt ? (unsigned)(uintptr_t)vt[2] : 0,
-							vt ? (unsigned)(uintptr_t)vt[3] : 0);
-					} else {
-						unsigned before = *(unsigned *)(uintptr_t)(wp + 0x14);
-						((void(__fastcall *)(void *, void *, void *))vt[slot])((void *)(uintptr_t)wp, NULL,
-							(void *)(uintptr_t)h);
-						_snprintf(reply, replysz, "ok swing %d slot %u weapon %p vtslot %d%s state %u -> %u", pl,
-							sel, (void *)(uintptr_t)wp, slot, pair ? "+end" : "", before,
-							*(unsigned *)(uintptr_t)(wp + 0x14));
+					for (int i = 0; i < 4 && !hit; i++) {
+						unsigned w = *(unsigned *)(uintptr_t)(h + 0x704 + 4 * i);
+						if (w && attack_obj_find(w, 0x200, &slot, w))
+							hit = w, via = "weapon slot";
 					}
+					if (!hit && attack_obj_find(h, 0x800, &slot, h))
+						hit = h, via = "character";
+					if (!hit && attack_obj_find(impact, 0x200, &slot, impact))
+						hit = impact, via = "impact manager";
 				}
+				if (!hit) {
+					_snprintf(reply, replysz,
+						"error swing: no attack object (weapon %p, impact %p, character %p; tried slot 28 = 0x4563a0)",
+						(void *)(uintptr_t)wp, (void *)(uintptr_t)impact, (void *)(uintptr_t)h);
+				} else {
+					void **vt = *(void ***)(uintptr_t)hit;
+					unsigned before = *(unsigned *)(uintptr_t)(hit + 0x14);
+					((void(__fastcall *)(void *, void *, void *))vt[slot])((void *)(uintptr_t)hit, NULL,
+						(void *)(uintptr_t)h);
+					_snprintf(reply, replysz, "ok swing %d slot %u %s %p vtslot %d state %u -> %u hits %u", pl,
+					          sel, via, (void *)(uintptr_t)hit, slot, before,
+					          *(unsigned *)(uintptr_t)(hit + 0x14), *(unsigned *)(uintptr_t)(hit + 0x144));
+				}
+			}
+		}
+	} else if (!strncmp(line, "npclife ", 8)) {
+		// npclife <0|1>: TASK 23 test switch for the enemy-life code of 6704c30. 0 = the guest keeps its
+		// own simulated enemy life (position sync still runs), 1 = it applies the host's life/death (the
+		// shipped behaviour). Used to show whether the copies drift apart without the correction.
+		int on = -1;
+		if (sscanf(line + 8, "%d", &on) != 1 || (on != 0 && on != 1)) {
+			_snprintf(reply, replysz, "error npclife <0|1>");
+		} else {
+			g_npc_life_on = on;
+			_snprintf(reply, replysz, "ok npclife %d (enemy life/death application %s)", on, on ? "on" : "off");
+		}
+	} else if (!strncmp(line, "npcset ", 7)) {
+		// npcset <hex npc> <life>: TEST-ONLY (TASK 23). Applies a life value to an enemy through the
+		// character's OWN life method (vtable slot 9 = +0x24, CCharacterNPC_s9_v @ 0x4f5bf0): life +=
+		// delta, clamp to max (+0x31c) and, when life reaches <= 0, the game's own death path (state 3).
+		// That is the method every damage source funnels through (FINDINGS_21 section 2), so a test can
+		// drive the life/death path on ONE copy without an attack input. Not an attack: no hit reaction,
+		// no attacker (+0x750) and no damage number of its own.
+		unsigned addr = 0;
+		float want = 0.0f;
+		if (sscanf(line + 7, "%x %f", &addr, &want) != 2 || addr < 0x10000) {
+			_snprintf(reply, replysz, "error npcset <hex npc> <life>");
+		} else if (IsBadReadPtr((void *)(uintptr_t)addr, 0x330) || IsBadWritePtr((void *)(uintptr_t)(addr + 0x320), 4)) {
+			_snprintf(reply, replysz, "error npcset: bad character %x", addr);
+		} else {
+			void **vt = *(void ***)(uintptr_t)addr;
+			float before = *(float *)(uintptr_t)(addr + 0x320);
+			if (!vt || vt[9] == NULL || IsBadCodePtr((FARPROC)vt[9])) {
+				_snprintf(reply, replysz, "error npcset: no life method on %x", addr);
+			} else {
+				((void(__thiscall *)(void *, float))vt[9])((void *)(uintptr_t)addr, want - before);
+				_snprintf(reply, replysz, "ok npcset %x life %.1f -> %.1f (asked %.1f) state %u", addr, before,
+				          *(float *)(uintptr_t)(addr + 0x320), want, *(unsigned *)(uintptr_t)(addr + 0x2dc));
+			}
+		}
+	} else if (!strncmp(line, "swingobj ", 9)) {
+		// swingobj <0|1> <hex object>: TEST-ONLY diagnostic (TASK 23). Calls vtable slot 28 (byte +0x70,
+		// the game's attack entry 0x4563a0, verified in the exe: the class at vtable 0x659568) of the given
+		// object with the player's character as the argument — the same call the weapon's own attack makes.
+		int pl = 0; unsigned addr = 0;
+		if (sscanf(line + 9, "%d %x", &pl, &addr) != 2 || pl < 0 || pl > 1 || addr < 0x10000) {
+			_snprintf(reply, replysz, "error swingobj <0|1> <hex object>");
+		} else {
+			unsigned h = player_human(pl);
+			void **vt = (void **)(uintptr_t)addr;
+			if (!h) {
+				_snprintf(reply, replysz, "error swingobj: no character");
+			} else if (IsBadReadPtr(vt, 0x80) || IsBadReadPtr(*vt, 0x80)) {
+				_snprintf(reply, replysz, "error swingobj: bad object %x", addr);
+			} else {
+				void **tbl = *(void ***)(uintptr_t)addr;
+				unsigned before = *(unsigned *)(uintptr_t)(addr + 0x14);
+				((void(__fastcall *)(void *, void *, void *))tbl[28])((void *)(uintptr_t)addr, NULL,
+					(void *)(uintptr_t)h);
+				_snprintf(reply, replysz, "ok swingobj pl %d obj %x vt %p slot28 %p state %u -> %u", pl, addr, tbl,
+				          tbl[28], before, *(unsigned *)(uintptr_t)(addr + 0x14));
 			}
 		}
 	} else if (!strncmp(line, "views", 5)) {

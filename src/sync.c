@@ -1452,7 +1452,9 @@ static void guest_apply_npcs(void)
 		// life method (character vtable slot 9 = +0x24, the method CharacterSetLife uses), so a hit both
 		// copies simulated nets one subtraction (the difference is then 0) and crossing 0 runs the game's
 		// own death path (FUN_004f5bf0 -> state 3). The host's death state (+0x2dc) is copied with it.
-		{
+		// TASK 23 test switch: the pipe command `npclife 0` turns this off, so a run can show whether the
+		// copies drift apart without it (the position part above stays on either way).
+		if (g_npc_life_on) {
 			float *gl = (float *)(uintptr_t)(hs[best] + 0x320);
 			DWORD *gst = (DWORD *)(uintptr_t)(hs[best] + 0x2dc);
 			if (!IsBadWritePtr(gl, 4) && !IsBadWritePtr(gst, 4)) {
@@ -2229,6 +2231,89 @@ static int tp_request(int pl, float x, float y, float z, int have_z, float dx, f
 	}
 }
 
+// ---- level change on the game thread (pipe `level`) --------------------------------------------------
+//
+// FINDINGS_22 4.3: the pipe "level" command called the game's ChangeLevel (FUN_004a1c00) straight on the
+// pipe thread and two live runs hung there for minutes while both games kept running and syncing — the
+// call takes state the game thread owns, so the pipe thread waited for it forever. It now runs the way
+// the safe tp does: the pipe thread queues the request and waits, frame_tick makes the call on the game
+// thread and publishes the verdict.
+#define LVL_IDLE 0
+#define LVL_QUEUED 1
+#define LVL_DONE 2
+#define LVL_WAIT_MS 30000
+
+static CRITICAL_SECTION g_lvl_cs;
+static volatile LONG g_lvl_state, g_lvl_verdict;
+static unsigned g_lvl_tag, g_lvl_entry, g_lvl_flag;
+static char g_lvl_msg[160];
+
+// Game thread: perform a queued level change. Returns 1 when a request was handled (the caller leaves the
+// frame: the game's request state machine (game+0x320 = 4) tears the world down right after this call).
+static int level_frame(void)
+{
+	if (g_lvl_state != LVL_QUEUED)
+		return 0;
+	unsigned g = *(volatile unsigned *)0x6c3068;
+	if (!g) {
+		_snprintf(g_lvl_msg, sizeof g_lvl_msg, "error level: the game object is gone");
+		g_lvl_verdict = 0;
+		g_lvl_state = LVL_DONE;
+		return 1;
+	}
+	// The same call the Cslh_ChangeLevel script command makes: FUN_004a1c00 is hooked, so the host still
+	// forwards the change to the guest and the replay is not recorded as a transition the game made.
+	InterlockedIncrement(&g_level_replay);
+	((void(__fastcall *)(void *, void *, unsigned, unsigned, unsigned))0x4a1c00)((void *)(uintptr_t)g, NULL,
+		g_lvl_tag, (unsigned)g_lvl_entry, (unsigned)g_lvl_flag);
+	InterlockedDecrement(&g_level_replay);
+	{
+		char t[5];
+		_snprintf(g_lvl_msg, sizeof g_lvl_msg, "ok level %s %u %u (game thread)", tag4(g_lvl_tag, t),
+		          g_lvl_entry, g_lvl_flag);
+	}
+	g_lvl_verdict = 1;
+	g_lvl_state = LVL_DONE;
+	return 1;
+}
+
+// Pipe-thread side: queue the request for the game thread, wait for its verdict, return it.
+static int level_request(unsigned tag, int entry, int flag, char *reply, size_t replysz)
+{
+	EnterCriticalSection(&g_lvl_cs);
+	if (g_lvl_state == LVL_QUEUED) {
+		LeaveCriticalSection(&g_lvl_cs);
+		_snprintf(reply, replysz, "error level: another level change is still in flight");
+		return 0;
+	}
+	g_lvl_tag = tag; g_lvl_entry = (unsigned)entry; g_lvl_flag = (unsigned)flag;
+	g_lvl_msg[0] = 0;
+	g_lvl_verdict = 0;
+	g_lvl_state = LVL_QUEUED;
+	LeaveCriticalSection(&g_lvl_cs);
+	{
+		DWORD t0 = GetTickCount();
+		for (;;) {
+			if (g_lvl_state == LVL_DONE)
+				break;
+			if (GetTickCount() - t0 > LVL_WAIT_MS) {
+				// The game thread never ran a frame (loading, menu): give the slot back.
+				g_lvl_state = LVL_IDLE;
+				_snprintf(reply, replysz, "error level: the game thread did not run the request in %d s",
+				          LVL_WAIT_MS / 1000);
+				return 0;
+			}
+			Sleep(10);
+		}
+	}
+	{
+		int ok = g_lvl_verdict;
+		_snprintf(reply, replysz, "%s", g_lvl_msg);
+		g_lvl_state = LVL_IDLE;
+		return ok;
+	}
+}
+
 // ---- frame tick (Present hook, main thread) --------------------------------------------------------
 
 static void sync_init(void)
@@ -2242,10 +2327,13 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_rload_cs);
 	InitializeCriticalSection(&g_pick_cs);
 	InitializeCriticalSection(&g_tp_cs);
+	InitializeCriticalSection(&g_lvl_cs);
 }
 
 static void frame_tick(void)
 {
+	if (level_frame())   // a pipe level change was queued: run it here and leave the frame to the game
+		return;
 	tp_frame();   // safe teleport: must run with no peer too (TASK 17 Part A)
 	if (!g_role)
 		return;
