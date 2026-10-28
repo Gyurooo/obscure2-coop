@@ -1264,9 +1264,11 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		}
 	} else if (!strncmp(line, "swing ", 6)) {
 		// swing <0|1>: start the selected weapon's own attack. The game's attack start is FUN_004563a0,
-		// vtable slot 28 (+0x70) of the class whose vtable is 0x659568 (exe scan: the dword 0x4563a0 sits at
-		// vtable+0x70, the swing end 0x456710 at +0x74). It takes `this` = that attack object and the
-		// character as its argument: it sweeps the hit volume through the character's impact manager
+		// vtable slot 28 (+0x70) of CToeInteruptor (the level's "INTE" entity class): its vtable is
+		// 0x65adc4 (COL 0x6859d4, RTTI .?AVCToeInteruptor@@), the swing end 0x456710 at +0x74. TASK 29
+		// corrected the address - TASK 23's "0x659568" belongs to a different class. It takes `this` =
+		// that attack object and the character as its argument: it sweeps the hit volume through the
+		// character's impact manager
 		// (+0x30c), sets character+0x2bc, plays the "attack" animation event and moves the object's state
 		// (+0x14) to the swing state.
 		// The weapon ENTITY the character holds (character+0x704[4], class CToeWeapon<X>) does not carry
@@ -1410,7 +1412,8 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		}
 	} else if (!strncmp(line, "swingobj ", 9)) {
 		// swingobj <0|1> <hex object>: TEST-ONLY diagnostic (TASK 23). Calls vtable slot 28 (byte +0x70,
-		// the game's attack entry 0x4563a0, verified in the exe: the class at vtable 0x659568) of the given
+		// the game's attack entry 0x4563a0: the CToeInteruptor class, vtable 0x65adc4 - TASK 29 corrected
+		// the address) of the given
 		// object with the player's character as the argument — the same call the weapon's own attack makes.
 		int pl = 0; unsigned addr = 0;
 		if (sscanf(line + 9, "%d %x", &pl, &addr) != 2 || pl < 0 || pl > 1 || addr < 0x10000) {

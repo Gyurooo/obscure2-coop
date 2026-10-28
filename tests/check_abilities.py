@@ -288,15 +288,20 @@ def wait_for(fn, secs, step=0.1):
 
 
 def tp_near(pipe, m, pl, target, radii=(60.0, 45.0, 75.0, 90.0, 35.0, 110.0), away=False):
-    """Place player `pl` next to `target` facing it, through the mod's safe tp."""
+    """Place player `pl` next to `target` facing it, through the mod's safe tp.
+
+    16 angles (22.5 deg steps) instead of 8: the I015 lock pick stands on a narrow ledge and a spot
+    that is 22.5 deg away from a good one can be over the edge (TASK 29: two runs placed fine, one
+    refused all 48 spots)."""
+    import math
     hp = hpos(m, ctl_human(m, pl))
     tried = 0
     for radius in radii:
-        for ang in (0, 45, 90, 135, 180, 225, 270, 315):
+        for ang in range(0, 360, 22):
             dx, dy = hp[0] - target[0], hp[1] - target[1]
             dd = (dx * dx + dy * dy) ** 0.5 or 1.0
             base = (dx / dd, dy / dd)
-            ca, sa = __import__('math').cos(__import__('math').radians(ang)), __import__('math').sin(__import__('math').radians(ang))
+            ca, sa = math.cos(math.radians(ang)), math.sin(math.radians(ang))
             ux, uy = base[0] * ca - base[1] * sa, base[0] * sa + base[1] * ca
             stand = (target[0] + ux * radius, target[1] + uy * radius, target[2])
             sign = -1.0 if away else 1.0
@@ -310,6 +315,16 @@ def tp_near(pipe, m, pl, target, radii=(60.0, 45.0, 75.0, 90.0, 35.0, 110.0), aw
 
 def press_a(pipe, user, hold=0.2):
     bot.press(pipe, user, 'A', hold)
+
+
+def press_action(pipe, user, hold=0.25):
+    """The button that starts a use depends on the *side* the object reported (TASK 29, decompile
+    FUN_004cf940 128180-128240): the interaction scan's pass 1 (interaction type 1, the front side)
+    takes the winner only while A (+0xf) is pressed, pass 2 (type 2, the back side) only while Y
+    (+0x11) is pressed. `check_abilities` cannot know which side the safe tp produced, so it presses
+    both and the game picks the pass that scored. A alone left the I015 lock pick untouched even
+    though the object had reported type 2 (`+0x104 = 2`, FINDINGS_28)."""
+    bot.press(pipe, user, 'A,Y', hold)
 
 
 def shots(host, guest, base):
@@ -358,6 +373,16 @@ def main():
             continue
         e, kind = min(mine, key=lambda x: d3(epos(m_own, x[0]), hpos(m_own, me)))
         print('abilities: %s -> %s %s' % (label, kind, describe(m_own, e, kind)))
+        # Which pad does the acting copy really deliver? Press the left stick up on each XInput user
+        # and measure the character: without this, a failed press says nothing (TASK 29).
+        for user in (0, 1):
+            p0 = hpos(m_own, ctl_human(m_own, pl))
+            pipe_own.cmd('pad %d 0 0 30000' % user)
+            time.sleep(0.6)
+            pipe_own.cmd('pad %d 0' % user)
+            time.sleep(0.3)
+            p1 = hpos(m_own, ctl_human(m_own, pl))
+            print('  pad reach: XInput user %d moves the character %.2f units' % (user, d3(p0, p1)))
         ok, how = tp_near(pipe_own, m_own, pl, epos(m_own, e))
         print('abilities: tp %s: %s' % (label, how))
         if not ok:
@@ -385,17 +410,22 @@ def main():
         def try_presses(n, why):
             nonlocal started, acted
             for i in range(n):
-                press_a(pipe_own, 0)
-                time.sleep(0.45)
-                now = (snap_obj(m_own, e), door_snaps(m_own, epos(m_own, e)))
-                if u32(m_own, me + 0x2bc) == e:
-                    started = True
-                    print('  %s: action started on press %d (character linked to the object)' % (why, i + 1))
-                    return True
-                if now != before:
-                    acted = True
-                    print('  %s: the object changed on press %d' % (why, i + 1))
-                    return True
+                # The acting copy may see its own pad as XInput user 0 or 1 (host copy: the character
+                # is player 1 -> user 0; guest copy: the mod maps the guest's pad to user 1), so
+                # press both and keep the one that changes anything.
+                for user in (0, 1):
+                    press_action(pipe_own, user)
+                    time.sleep(0.45)
+                    now = (snap_obj(m_own, e), door_snaps(m_own, epos(m_own, e)))
+                    if u32(m_own, me + 0x2bc) == e:
+                        started = True
+                        print('  %s: action started on press %d (pad %d, character linked to the object)'
+                              % (why, i + 1, user))
+                        return True
+                    if now != before:
+                        acted = True
+                        print('  %s: the object changed on press %d (pad %d)' % (why, i + 1, user))
+                        return True
             return False
 
         if not try_presses(2, 'facing the object'):

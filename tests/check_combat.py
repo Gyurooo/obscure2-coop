@@ -43,7 +43,9 @@ BTN = {'A': 0x1000, 'B': 0x2000, 'X': 0x4000, 'Y': 0x8000, 'LB': 0x100, 'RB': 0x
        'UP': 0x1, 'DOWN': 0x2, 'LEFT': 0x4, 'RIGHT': 0x8}
 SLOT_PAD = {0: 'UP', 1: 'RIGHT', 2: 'DOWN', 3: 'LEFT'}      # slot <- D-pad button (TASK 22, run_f4)
 MELEE = ('UberBeat', 'Beat', 'Club', 'Stick', 'ChainSaw', 'Contact', 'Taser')
-ATTACK_VT = 0x659568      # vtable whose slot 28 is the game's attack start 0x4563a0 (exe scan)
+ATTACK_VT = 0x65ADC4      # CToeInteruptor (tag INTE): its slot 28 is the attack start 0x4563a0.
+#                           TASK 29: FINDINGS_23's 0x659568 is a different class - the table that
+#                           holds 0x4563a0 starts at 0x65ADC4 (COL 0x6859d4, RTTI .?AVCToeInteruptor@@).
 COMBO = [7.0, 8.0, 14.0]  # GAME_MECHANICS.md: the bat's 3-hit combo
 LEVELS = [l.strip() for l in os.environ.get('OBSCOOP_COMBAT_LEVELS', 'J001:317,J000:314').split(',')]
 LEVELS = [(l.split(':')[0], int(l.split(':')[1])) for l in LEVELS if ':' in l]
