@@ -27,6 +27,12 @@ static unsigned rd32(unsigned addr)
 static unsigned game_obj(void) { return rd32(0x6c3068); }
 static unsigned world_obj(void) { unsigned g = game_obj(); return g ? rd32(g + 0x378) : 0; }
 
+// TASK 30: the world's scripted-event state (defined with the rest of the scene code further down).
+#define INV_ENERGY 0xc88   // inventory (world+0x1790) + 0xc88: the battery/energy float Cslh_EnergySet writes
+static volatile LONG g_scene_sent, g_scene_rcv, g_scene_skips, g_scene_left, g_scene_stuck, g_scene_missed, g_energy_sets;
+static int scene_local_cinematic(void);
+static void scene_tick(void);
+
 // Fills out with the characters in the human manager; returns how many.
 static int world_humans(unsigned *out, int max)
 {
@@ -1966,6 +1972,12 @@ static void host_send_state(void)
 		}
 		c->wcur = rd32(hs[i] + 0x714);                   // the slot in the hand
 	}
+	// TASK 30: the battery/energy a story event sets (Cslh_EnergySet -> inventory+0xc88) is host-owned.
+	unsigned inv = rd32(world_obj() + 0x1790);
+	if (inv && !IsBadReadPtr((const void *)(uintptr_t)(inv + INV_ENERGY), 4)) {
+		memcpy(&p.energy, (const void *)(uintptr_t)(inv + INV_ENERGY), 4);
+		p.energy_valid = 1;
+	}
 	net_send(PKT_STATE, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
 	InterlockedIncrement(&g_snd_states);
 }
@@ -2466,6 +2478,19 @@ static void guest_apply_state(void)
 	unsigned hs[MAX_CH];
 	int n = world_humans(hs, MAX_CH);
 	unsigned mine = player_human(1);
+	// TASK 30: the battery/energy the host's copy has (a story EnergySet, or the usual drain) is host-owned.
+	if (st.energy_valid) {
+		unsigned inv = rd32(w + 0x1790);
+		if (inv && !IsBadWritePtr((void *)(uintptr_t)(inv + INV_ENERGY), 4)) {
+			float cur;
+			memcpy(&cur, (const void *)(uintptr_t)(inv + INV_ENERGY), 4);
+			float d = cur - st.energy;
+			if (d > 0.01f || d < -0.01f) {
+				memcpy((void *)(uintptr_t)(inv + INV_ENERGY), &st.energy, 4);
+				InterlockedIncrement(&g_energy_sets);
+			}
+		}
+	}
 	for (int i = 0; i < (int)st.n && i < MAX_CH; i++) {
 		for (int k = 0; k < n; k++) {
 			if (rd32(hs[k] + H_TAG) != st.ch[i].tag)
@@ -2545,6 +2570,8 @@ static void guest_send_char(void)
 {
 	if (g_role != 2 || !g_peer_ok)
 		return;
+	if (scene_local_cinematic())
+		return;   // TASK 30: in a scripted event the script owns this character; do not stream it as pad-driven
 	static DWORD last;
 	DWORD now = GetTickCount();
 	if (now - last < 8)
@@ -3260,8 +3287,287 @@ static void guest_follow_own_player(void)
 	unsigned me = player_human(1);
 	if (!cam || !me || rd32(cam + 0x17c) == me || rd32(game_obj() + 0x310) != 1)
 		return;
+	if (scene_local_cinematic())
+		return;   // TASK 30: a scripted event owns the camera on this copy; do not pull it to the player
 	((void(__fastcall *)(void *, void *, unsigned))0x530960)((void *)(uintptr_t)cam, NULL, me);
 	InterlockedIncrement(&g_cam_sets);
+}
+
+
+// ---- scripted events: cutscenes, FMV/kine, scripted camera, dialogs (TASK 30) ------------------------
+// The world keeps a scripted-event state machine (FINDINGS_30 §2): world+0x11c is the level state
+// (1 normal, 5 pause menu, 6 cinematic presentation, 0x11 game over) and world+0x12c the scene playback
+// kind (0 none, 6 kine, 7, 8 noe scene, 0xd). A cutscene, an FMV, a scripted camera and a story scene all
+// go through these two fields, and every one of them ends with the same LOCAL input: the skip (ESCAPE,
+// START or A). The mod therefore never writes them. It mirrors them across the link (PKT_SCENE) and, when
+// the peer's copy has left a scene this copy is still in, presses the game's own skip here, so the game's
+// own exit path (and its cleanup) always runs. Decided policy: either player may skip; a skip by either
+// player skips on both.
+#define W_STATE 0x11c
+#define W_SCENE 0x12c
+#define W_FLAGS 0x130
+#define W_SA 0x138
+#define W_SB 0x13c
+#define W_SD 0x118
+#define W_NAME 0x140   // a noe scene's name string (FUN_004b2890 copies it here)
+
+static DWORD g_scene_enter_tick;
+
+typedef struct { DWORD t_ms, level, state, scene, flags, a, b, d, name4, cine; DWORD tick; } scene_info;
+
+// 1 when a state pair means "a scripted event is being presented on this copy". The pause menu (5) and
+// the game-over state (0x11) are local states, not scripted events: pausing must not stop or skip the peer.
+static int scene_cinematic(unsigned state, unsigned scene)
+{
+	return state == 6 || scene != 0;
+}
+
+static void scene_read(scene_info *s)
+{
+	memset(s, 0, sizeof *s);
+	s->tick = GetTickCount();
+	unsigned w = world_obj();
+	if (!w || IsBadReadPtr((const void *)(uintptr_t)w, W_NAME + 4))
+		return;
+	s->level = rd32(w + 4);
+	s->state = rd32(w + W_STATE);
+	s->scene = rd32(w + W_SCENE);
+	s->flags = rd32(w + W_FLAGS);
+	s->a = rd32(w + W_SA);
+	s->b = rd32(w + W_SB);
+	s->d = rd32(w + W_SD);
+	s->name4 = rd32(w + W_NAME);   // the noe scene's name, 4 bytes ("POSI" etc.): the scene's identity there
+	s->cine = (DWORD)scene_cinematic(s->state, s->scene);
+}
+
+static int scene_local_cinematic(void)
+{
+	unsigned w = world_obj();
+	if (!w || IsBadReadPtr((const void *)(uintptr_t)w, W_SD + 4))
+		return 0;
+	return scene_cinematic(rd32(w + W_STATE), rd32(w + W_SCENE));
+}
+
+// ---- the peer's copy ------------------------------------------------------------------------------
+static CRITICAL_SECTION g_scene_cs;
+static scene_info g_peer_scene;
+static volatile LONG g_peer_scene_valid;
+static DWORD g_peer_last_cine_a, g_peer_last_cine_n;   // the identity of the peer's last scripted event
+
+static void peer_on_scene(const char *buf, int n)
+{
+	const pkt_scene *p = (const pkt_scene *)buf;
+	if (n != (int)sizeof *p)
+		return;
+	EnterCriticalSection(&g_scene_cs);
+	g_peer_scene.t_ms = p->t_ms;
+	g_peer_scene.level = p->level;
+	g_peer_scene.state = p->state;
+	g_peer_scene.scene = p->scene;
+	g_peer_scene.flags = p->flags;
+	g_peer_scene.a = p->a;
+	g_peer_scene.b = p->b;
+	g_peer_scene.d = p->d;
+	g_peer_scene.name4 = p->name4;
+	g_peer_scene.cine = p->cine;
+	g_peer_scene.tick = GetTickCount();
+	if (p->cine) {
+		g_peer_last_cine_a = p->a;
+		g_peer_last_cine_n = p->name4;
+	}
+	g_peer_scene_valid = 1;
+	LeaveCriticalSection(&g_scene_cs);
+	InterlockedIncrement(&g_scene_rcv);
+}
+
+static void scene_send(void)
+{
+	static DWORD last, cine_until;
+	static unsigned sent_state = ~0u, sent_scene = ~0u, sent_cine = ~0u, sent_a = ~0u;
+	DWORD now = GetTickCount();
+	scene_info s;
+	scene_read(&s);
+	if (!s.level)
+		return;
+	int changed = s.state != sent_state || s.scene != sent_scene || s.cine != sent_cine || s.a != sent_a;
+	// keep talking for 3 s after leaving a scene: a lost "I left it" packet would leave the peer stuck
+	int recent = s.cine || (LONG)(cine_until - now) > 0;
+	if (!changed && (!recent || now - last < 250))
+		return;
+	last = now;
+	if (s.cine && !sent_cine) {
+		char lt[8];
+		logf("scene: this copy entered a scripted event (world state %u, scene %u, id %#x, level %s)", s.state, s.scene,
+			s.a, tag4(s.level, lt));
+	}
+	if (sent_cine && !s.cine)
+		logf("scene: this copy left the scripted event (world state %u, scene %u) after %u ms", s.state, s.scene,
+			(unsigned)(now - g_scene_enter_tick));
+	if (s.cine)
+		cine_until = now + 3000;
+	if (s.cine)
+		g_scene_enter_tick = now;
+	pkt_scene p;
+	memset(&p, 0, sizeof p);
+	p.t_ms = timeline_now();
+	p.level = s.level;
+	p.state = s.state;
+	p.scene = s.scene;
+	p.flags = s.flags;
+	p.a = s.a;
+	p.b = s.b;
+	p.d = s.d;
+	p.name4 = s.name4;
+	p.cine = s.cine;
+	net_send(PKT_SCENE, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	InterlockedIncrement(&g_scene_sent);
+	sent_state = s.state; sent_scene = s.scene; sent_cine = s.cine; sent_a = s.a;
+}
+
+// ---- the skip ---------------------------------------------------------------------------------------
+// Pressed only while this copy is in a scripted event. ESCAPE is what the game's own cinematic takes
+// (OBSERVED, FINDINGS_30 §5); START and A are the pad buttons the game also accepts. Each is held for
+// ~150 ms and the next is tried 160 ms later, so the sequence cannot look like a double press.
+static int g_skip_step;
+static DWORD g_skip_t0;
+static int g_skip_failed;                 // the ladder did not take for this scene identity: do not retry it
+static DWORD g_skip_fail_a, g_skip_fail_n;
+
+static void scene_vpad(unsigned buttons, int on)
+{
+	int pad = g_role == 2 ? g_local_pad : 0;   // the pad this copy's own player is on
+	vpad_set(pad, on, on ? buttons : 0, 0, 0, 0, 0, 0, 0);
+}
+
+// The keyboard path needs BOTH: g_vkeys feeds the polled key state (DirectInput GetDeviceState, which is
+// what the cinematic's own input check reads) and keyq_push feeds the buffered records (menus). The pipe
+// `key` command sets both, which is why an ESCAPE sent by a test works; only pushing the queue does not
+// move the polled state at all (TASK 30: the first live run's forwarded skip never took because of this).
+static void scene_key(int down)
+{
+	g_vkeys[0x01] = (BYTE)(down ? 1 : 0);
+	keyq_push(0x01, down);
+}
+
+static void scene_skip_release(void)
+{
+	scene_key(0);
+	scene_vpad(0x10, 0);
+	scene_vpad(0x1000, 0);
+}
+
+static void scene_skip_begin(const char *why)
+{
+	if (g_skip_step)
+		return;
+	scene_info s;
+	scene_read(&s);
+	{
+		char lt[8];
+		logf("scene: %s (world state %u, scene %u, id %#x, level %s): pressing the game's own skip here", why, s.state,
+			s.scene, s.a, tag4(s.level, lt));
+	}
+	g_skip_step = 1;
+	g_skip_t0 = GetTickCount();
+	scene_key(1);   // ESCAPE down
+	InterlockedIncrement(&g_scene_skips);
+}
+
+static void scene_skip_frame(void)
+{
+	if (!g_skip_step)
+		return;
+	DWORD el = GetTickCount() - g_skip_t0;
+	if (!scene_local_cinematic()) {
+		scene_skip_release();
+		logf("scene: the local copy left the scripted event %lu ms after the skip was pressed", (unsigned long)el);
+		InterlockedIncrement(&g_scene_left);
+		g_skip_step = 0;
+		return;
+	}
+	if (g_skip_step == 1 && el >= 140) { keyq_push(0x01, 0); g_skip_step = 2; }
+	if (g_skip_step == 2 && el >= 300) { scene_vpad(0x10, 1); g_skip_step = 3; }        // START
+	if (g_skip_step == 3 && el >= 450) { scene_vpad(0x10, 0); g_skip_step = 4; }
+	if (g_skip_step == 4 && el >= 750) { scene_vpad(0x1000, 1); g_skip_step = 5; }      // A
+	if (g_skip_step == 5 && el >= 900) { scene_vpad(0x1000, 0); g_skip_step = 6; }
+	if (g_skip_step == 6 && el >= 2500) {
+		scene_skip_release();
+		scene_info s;
+		scene_read(&s);
+		logf("scene: still in the scripted event after the skip ladder (world state %u)", s.state);
+		InterlockedIncrement(&g_scene_stuck);
+		g_skip_failed = 1;
+		g_skip_fail_a = s.a;
+		g_skip_fail_n = s.name4;
+		g_skip_step = 0;
+	}
+}
+
+// Game thread, both roles: mirror this copy's state and leave a scene the peer has already left.
+static void scene_tick(void)
+{
+	scene_send();
+	scene_skip_frame();
+	scene_info peer;
+	int have;
+	EnterCriticalSection(&g_scene_cs);
+	peer = g_peer_scene;
+	have = g_peer_scene_valid;
+	DWORD last_a = g_peer_last_cine_a, last_n = g_peer_last_cine_n;
+	LeaveCriticalSection(&g_scene_cs);
+	if (!have)
+		return;
+	scene_info me;
+	scene_read(&me);
+	if (!me.cine) {
+		if (peer.cine && me.level && peer.level == me.level) {
+			static DWORD logged_a, logged_n;
+			if (logged_a != peer.a || logged_n != peer.name4) {
+				logged_a = peer.a;
+				logged_n = peer.name4;
+				InterlockedIncrement(&g_scene_missed);
+				logf("scene: the peer is in a scripted event (state %u, scene %u, id %#x) and this copy is not",
+						peer.state, peer.scene, peer.a);
+			}
+		}
+		return;
+	}
+	if (peer.cine)
+		return;   // both copies are in it
+	if (!me.level || peer.level != me.level)
+		return;   // a different level: not the same event
+	// Only the event the peer itself was in counts: a peer that never reported a scripted event has none to
+	// leave together, and this copy must not skip a cutscene the peer simply did not see (yet).
+	if (!last_a && !last_n)
+		return;
+	if (last_a != me.a || (last_n && last_n != me.name4))
+		return;   // the peer's last scripted event was a different one
+	if (GetTickCount() - peer.tick > 3000)
+		return;   // stale: the peer is not talking any more
+	if (g_skip_failed && g_skip_fail_a == me.a && g_skip_fail_n == me.name4)
+		return;   // the skip ladder already failed for this exact event; do not hammer it
+	scene_skip_begin("the peer's copy has left the scripted event and this copy is still in it");
+}
+
+
+// Pipe `scene` / `sync`: this copy's and the peer's scripted-event state (TASK 30).
+static void scene_status(char *reply, size_t replysz)
+{
+	scene_info me, peer;
+	int have;
+	scene_read(&me);
+	EnterCriticalSection(&g_scene_cs);
+	peer = g_peer_scene;
+	have = g_peer_scene_valid;
+	LeaveCriticalSection(&g_scene_cs);
+	char l1[8], l2[8], a1[8], a2[8];
+	_snprintf(reply, replysz,
+		"scene local state %u scene %u id %s level %s cine %u | peer %s state %u scene %u id %s level %s cine %u"
+		" | sent %ld rcv %ld skips %ld left %ld stuck %ld missed %ld energy %ld",
+		(unsigned)me.state, (unsigned)me.scene, tag4(me.a, a1), tag4(me.level, l1), (unsigned)me.cine,
+		have ? "" : "(none)", (unsigned)peer.state, (unsigned)peer.scene, tag4(peer.a, a2), tag4(peer.level, l2),
+		(unsigned)peer.cine, g_scene_sent, g_scene_rcv, g_scene_skips, g_scene_left, g_scene_stuck, g_scene_missed,
+		g_energy_sets);
 }
 
 
@@ -3873,6 +4179,7 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_iuse_cs);
 	InitializeCriticalSection(&g_aptq_cs);   // TASK 28
 	InitializeCriticalSection(&g_apt_cs);     // TASK 28 pipe `aptdone`
+	InitializeCriticalSection(&g_scene_cs);   // TASK 30 (rx thread / game thread / pipe thread)
 }
 
 static void frame_tick(void)
@@ -3926,7 +4233,9 @@ static void frame_tick(void)
 		host_send_state();
 		host_send_npcs();
 		host_send_progress(0);
-		host_apply_remote_char();   // the guest's own character: this copy follows what the guest streams
+		if (!scene_local_cinematic())
+			host_apply_remote_char();   // TASK 30: in a scripted event the script owns both characters
+		scene_tick();                   // TASK 30: mirror the world's scripted-event state / apply a skip
 		peer_apply_pickups();
 		prop_tick();                // TASK 26: chairs/boxes: carry and break state
 		apt_tick();                 // TASK 28: character abilities on level objects
@@ -3940,6 +4249,7 @@ static void frame_tick(void)
 		peer_apply_pickups();
 		prop_tick();                // TASK 26: chairs/boxes: carry and break state
 		apt_tick();                 // TASK 28: character abilities on level objects
+		scene_tick();               // TASK 30: mirror the world's scripted-event state / apply a skip
 		guest_follow_own_player();
 		guest_record_history();
 		guest_debug_p1();

@@ -469,6 +469,7 @@ static void net_status(char *reply, size_t replysz);
 static void net_pause_set(DWORD ms);   // net.c: test-only link pause (`netpause <ms>`)
 static void net_rx_drop_set(DWORD ms);   // net.c: test-only receive-only drop (`netdroprx <ms>`)
 static void sync_status(char *reply, size_t replysz);
+static void scene_status(char *reply, size_t replysz);   // sync.c, TASK 30
 static void props_dump(char *reply, size_t replysz);
 
 
@@ -1203,6 +1204,11 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		LeaveCriticalSection(&g_vpad_cs);
 	} else if (!strncmp(line, "sync", 4)) {
 		sync_status(reply, replysz);
+	} else if (!strncmp(line, "scene", 5)) {
+		// TASK 30: the world's scripted-event state (cutscene / FMV / scripted camera / dialog) on this copy
+		// and on the peer, plus the skip counters. Read-only; a test uses it to see both copies leave a
+		// scene together.
+		scene_status(reply, replysz);
 	} else if (!strncmp(line, "props", 5)) {
 		// Test/diagnostic (TASK 27): this copy's breakable/carryable prop table, so a check can print what
 		// each copy thinks a chair is (entity, broken, carrier, position) when a break does not propagate.
