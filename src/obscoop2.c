@@ -990,6 +990,12 @@ static void watch_start(DWORD addr, DWORD ms)
 //   key <DIK hex> <0|1>                             virtual keyboard key up/down
 //   mouse <dx> <dy> <buttons hex>                   add mouse movement, set button bits
 //   loadsave <name>                                 run the game's own menu Load for that save file
+//   swing <0|1>                                     start the selected weapon's own attack (the game's
+//                                                   "attack" vtable entry of CToeWeapon, 0x4563a0).
+//                                                   TEST-ONLY: no pad button, key or mouse button was
+//                                                   found that reaches the game's attack action in the
+//                                                   shipped input map (TASK 22), so the fight test drives
+//                                                   the game's own swing with this.
 //   tp <0|1> x y [z dx dy]                          SAFE teleport: the game thread places the character,
 //                                                   watches the physics settle it on a floor within 8 units
 //                                                   of z and restores the old position (with the reason)
@@ -1186,6 +1192,53 @@ static void handle_command(char *line, char *reply, size_t replysz)
 				float cur = *(float *)(uintptr_t)(h + 0x320);
 				((void(__thiscall *)(void *, float))vt[9])((void *)(uintptr_t)h, life - cur);
 				_snprintf(reply, replysz, "ok life %d %.1f (delta %.1f)", pl, life, life - cur);
+			}
+		}
+	} else if (!strncmp(line, "swing ", 6)) {
+		// swing <0|1>: start the selected weapon's own attack. FUN_004563a0 (the "attack" entry of the
+		// CToeWeapon vtable, right before the swing end FUN_00456710) takes the weapon as `this` and the
+		// character as its argument: it queries the character's impact manager (character+0x30c), sets
+		// character+0x2bc, the weapon's state (+0x14 = 4) and requests the "K3LA" swing animation.
+		// TEST-ONLY (TASK 22): no pad button, key or mouse button reached the game's attack action in the
+		// shipped input map, so the combat test starts the game's own swing through this command.
+		int pl = 0;
+		if (sscanf(line + 6, "%d", &pl) != 1 || pl < 0 || pl > 1) {
+			_snprintf(reply, replysz, "error swing <0|1>");
+		} else {
+			unsigned h = player_human(pl);
+			if (!h) {
+				_snprintf(reply, replysz, "error swing: no character (in game?)");
+			} else {
+				unsigned sel = *(unsigned *)(uintptr_t)(h + 0x714);
+				unsigned wp = sel < 4 ? *(unsigned *)(uintptr_t)(h + 0x704 + 4 * sel) : 0;
+				if (!wp || IsBadReadPtr((void *)(uintptr_t)wp, 0x160)) {
+					_snprintf(reply, replysz, "error swing: no weapon in slot %u", sel);
+				} else {
+					void **vt = *(void ***)(uintptr_t)wp;
+					int slot = -1, pair = 0;
+					if (vt && !IsBadReadPtr(vt, 0x400))
+						for (int i = 0; i < 0x100; i++) {
+							if ((unsigned)(uintptr_t)vt[i] != 0x4563a0)
+								continue;
+							slot = i;
+							pair = (unsigned)(uintptr_t)vt[i + 1] == 0x456710;
+							break;
+						}
+					if (slot < 0) {
+						_snprintf(reply, replysz,
+							"error swing: slot %u weapon %p has no attack entry (vt %p: %#x %#x %#x %#x)",
+							sel, (void *)(uintptr_t)wp, vt, vt ? (unsigned)(uintptr_t)vt[0] : 0,
+							vt ? (unsigned)(uintptr_t)vt[1] : 0, vt ? (unsigned)(uintptr_t)vt[2] : 0,
+							vt ? (unsigned)(uintptr_t)vt[3] : 0);
+					} else {
+						unsigned before = *(unsigned *)(uintptr_t)(wp + 0x14);
+						((void(__fastcall *)(void *, void *, void *))vt[slot])((void *)(uintptr_t)wp, NULL,
+							(void *)(uintptr_t)h);
+						_snprintf(reply, replysz, "ok swing %d slot %u weapon %p vtslot %d%s state %u -> %u", pl,
+							sel, (void *)(uintptr_t)wp, slot, pair ? "+end" : "", before,
+							*(unsigned *)(uintptr_t)(wp + 0x14));
+					}
+				}
 			}
 		}
 	} else if (!strncmp(line, "views", 5)) {

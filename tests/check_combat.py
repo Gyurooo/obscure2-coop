@@ -1,39 +1,48 @@
-"""TASK 21: combat sync on two live copies — player attacks, enemy position/animation/life/death.
+"""TASK 21/22: combat sync on two live copies — player attacks, enemy position/animation/life/death.
 
 The pair is already in save 01 (I100) when this runs (tests/run_pair.sh did the menu load). The HOST
 changes level to a combat level the game itself produced (the J002 door's own destination data:
 `J001 317 1`, fallback `J000 314 1`); the guest follows (TASK 20). Then:
 
-  * control probe: 1.2 s of each stick direction on the host's player 1 — a level that has not given
-    control (story intro) is reported and the next level is tried;
+  * control probe: 1.2 s of each ANALOG STICK direction on the host's player 1. (TASK 22: the old probe
+    pressed the D-PAD, which in this game only selects weapon slots — it never moved the character and
+    made the world look frozen.)
   * per enemy on BOTH copies: class, position, life (+0x320), AI/death state (+0x2dc), last attacker
     (+0x750), AI state (controller +0x30c -> +0x98);
-  * the attack button is found by standing next to enemy A (`tp`, facing it) and trying X, B, Y, A, LB,
-    RB and the two analog triggers until the enemy's life drops;
+  * the attack input: standing next to enemy A (`tp`, facing it), X, B, Y, A, LB, RB, the two analog
+    triggers and a moving left mouse button are tried; if none of them damages the enemy or starts a
+    swing, the fight is driven with the test-only pipe command `swing <player>` (the game's own attack
+    entry 0x4563a0 of the selected weapon, src/obscoop2.c) on BOTH copies;
   * phase 1: the HOST's player 1 attacks enemy A until it dies;
-  * phase 2: the GUEST's player 2 attacks enemy B until it dies (both copies' player 2 teleported);
-  * every press samples both copies: enemy life/state, the attacking player's animation state (+0x2dc).
+  * phase 2: the GUEST's player 2 attacks enemy B until it dies;
+  * every swing samples both copies: enemy life/state, the attacker's animation state (+0x2dc) and the
+    selected weapon's state (+0x14, 4 while the swing runs).
 
 Asserts on BOTH copies: the same enemies, life within 1.0 during the fight, both enemies dead at the
-end, no enemy alive on one copy and dead on the other, player life equal, and attack animation samples
-that match. Read-only apart from the safe `tp`, the pad presses and the host's level change.
+end, no enemy alive on one copy and dead on the other, the same life drop per hit on both copies (no
+double damage), player life equal, and attack animation/weapon-state samples that match. Read-only apart
+from the safe `tp`, the input presses and the host's level change.
 
 Usage: python -I check_combat.py <host pid> <guest pid>
 """
+import ctypes
+import ctypes.wintypes as W
 import os
 import struct
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bot import Pipe, shot
+from bot import Pipe, write_png
 from peek import Proc
 
 GAME = 0x6c3068
 LEVELS = [('J001', 317), ('J000', 314)]   # both are door destinations recorded in TASK 20
 BTN = {'A': 0x1000, 'B': 0x2000, 'X': 0x4000, 'Y': 0x8000, 'LB': 0x100, 'RB': 0x200,
        'UP': 0x1, 'DOWN': 0x2, 'LEFT': 0x4, 'RIGHT': 0x8}
+STICK = {'LEFT': (-30000, 0), 'RIGHT': (30000, 0), 'UP': (0, 30000), 'DOWN': (0, -30000)}
 TOL = 1.0
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def tag(v):
@@ -106,6 +115,16 @@ def player(m, pl):
     return hs[pl] if pl < len(hs) else 0
 
 
+def weapon_state(m, pl):
+    """The selected weapon's +0x14: 4 while the swing that FUN_004563a0 starts is running."""
+    h = player(m, pl)
+    if not h:
+        return 0
+    sel = u32(m, h + 0x714)
+    wp = u32(m, h + 0x704 + 4 * sel) if sel < 4 else 0
+    return u32(m, wp + 0x14) if wp else 0
+
+
 def rec(m, a):
     ctl, la = u32(m, a + 0x30c), u32(m, a + 0x750)
     return dict(addr=a, cls=rtti(m, a), tag=tag(u32(m, a + 0x14)), pos=pos_char(m, a),
@@ -134,6 +153,8 @@ def dist(a, b):
 
 
 def press_btn(pipe, btn, hold=0.5):
+    """A pad button (or trigger) as the local player holds it: `pad <local user 0>` is player 1 on the
+    host and player 2 on the guest (src/obscoop2.c XInputGetState, g_local_pad = 0)."""
     if btn == 'RT':
         pipe.cmd('pad 0 0 0 0 0 0 0 255')
     elif btn == 'LT':
@@ -141,14 +162,25 @@ def press_btn(pipe, btn, hold=0.5):
     else:
         pipe.cmd('pad 0 %x' % BTN[btn])
     time.sleep(hold)
-    pipe.cmd('pad 0 0')
+    pipe.cmd('pad 0')
 
 
-def stick(pipe, btn, hold=1.2):
-    press_btn(pipe, btn, hold)
+def mouse_click(pipe, hold=0.5):
+    """Left mouse button WITH movement: some devices only become 'active' after motion."""
+    pipe.cmd('mouse 60 0 1')
+    time.sleep(hold)
+    pipe.cmd('mouse 0 0 0')
 
 
-def tp_near(pipe, m, pl, target, who, back=28.0):
+def stick(pipe, name, hold=1.2):
+    lx, ly = STICK[name]
+    pipe.cmd('pad 0 0 %d %d' % (lx, ly))
+    time.sleep(hold)
+    pipe.cmd('pad 0')
+    time.sleep(0.2)
+
+
+def tp_near(pipe, m, pl, target, who, back=22.0):
     h = player(m, pl)
     if not h:
         return 'no character'
@@ -157,6 +189,77 @@ def tp_near(pipe, m, pl, target, who, back=28.0):
     d = (dx * dx + dy * dy) ** 0.5 or 1.0
     x, y = target[0] - dx / d * back, target[1] - dy / d * back
     return pipe.cmd('tp %d %.3f %.3f %.3f %.3f %.3f' % (pl, x, y, target[2], target[0] - x, target[1] - y))
+
+
+# ---- foreground screenshots (topmost + a real click, then PrintWindow) ---------------------------
+user32 = ctypes.WinDLL('user32', use_last_error=True)
+gdi32 = ctypes.WinDLL('gdi32')
+WNDENUMPROC = ctypes.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
+user32.SetWindowPos.argtypes = [W.HWND, W.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+user32.SetWindowPos.restype = W.BOOL
+user32.GetWindowRect.argtypes = [W.HWND, ctypes.POINTER(W.RECT)]
+user32.GetClientRect.argtypes = [W.HWND, ctypes.POINTER(W.RECT)]
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.mouse_event.argtypes = [W.DWORD, W.DWORD, W.DWORD, W.DWORD, ctypes.c_size_t]
+
+
+def window_of(pid):
+    found = []
+
+    def cb(hwnd, _):
+        p = W.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+        if p.value == pid and user32.IsWindowVisible(hwnd):
+            r = W.RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(r))
+            found.append((r.right * r.bottom, hwnd))
+        return True
+    user32.EnumWindows(WNDENUMPROC(cb), 0)
+    found.sort(reverse=True)
+    return found[0][1] if found else None
+
+
+class BIH(ctypes.Structure):
+    _fields_ = [('biSize', W.DWORD), ('biWidth', W.LONG), ('biHeight', W.LONG), ('biPlanes', W.WORD),
+                ('biBitCount', W.WORD), ('biCompression', W.DWORD), ('biSizeImage', W.DWORD),
+                ('biXPelsPerMeter', W.LONG), ('biYPelsPerMeter', W.LONG), ('biClrUsed', W.DWORD),
+                ('biClrImportant', W.DWORD)]
+
+
+def capture(pid, path):
+    """A picture of the game window with the window in the FOREGROUND (a backgrounded D3D9 window hands
+    out black frames). Returns the non-black fraction."""
+    hwnd = window_of(pid)
+    if not hwnd:
+        raise RuntimeError('no window for pid %d' % pid)
+    user32.ShowWindow(hwnd, 4)                                            # SW_SHOWNOACTIVATE
+    user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)   # TOPMOST, no move/size
+    r = W.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(r))
+    x, y = (r.left + r.right) // 2, (r.top + r.bottom) // 2
+    user32.SetCursorPos(x, y)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)   # a real click activates the window
+    user32.mouse_event(0x0004, 0, 0, 0, 0)
+    time.sleep(0.35)
+    r = W.RECT()
+    user32.GetClientRect(hwnd, ctypes.byref(r))
+    w, hh = r.right, r.bottom
+    wdc = user32.GetDC(hwnd)
+    mdc = gdi32.CreateCompatibleDC(wdc)
+    bmp = gdi32.CreateCompatibleBitmap(wdc, w, hh)
+    gdi32.SelectObject(mdc, bmp)
+    user32.PrintWindow(hwnd, mdc, 3)   # PW_CLIENTONLY | PW_RENDERFULLCONTENT
+    bih = BIH(ctypes.sizeof(BIH), w, -hh, 1, 32, 0, 0, 0, 0, 0, 0)
+    buf = (ctypes.c_ubyte * (w * hh * 4))()
+    gdi32.GetDIBits(mdc, bmp, 0, hh, buf, ctypes.byref(bih), 0)
+    gdi32.DeleteObject(bmp)
+    gdi32.DeleteDC(mdc)
+    user32.ReleaseDC(hwnd, wdc)
+    px = bytes(buf)
+    frac = sum(1 for i in range(0, len(px), 4 * 97) if px[i] + px[i + 1] + px[i + 2] > 24) / (len(px) // (4 * 97))
+    write_png(path, w, hh, px)
+    user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0001 | 0x0002)   # NOTOPMOST
+    return frac * 100.0
 
 
 h, g = int(sys.argv[1]), int(sys.argv[2])
@@ -171,17 +274,19 @@ def problem(msg):
 
 
 def control_probe(m):
-    """Best displacement over the four stick directions (one direction can be a wall)."""
+    """Best displacement over the four ANALOG STICK directions (one direction can be a wall)."""
     hh = player(m, 0)
     if not hh:
         return 0.0
     best = 0.0
+    per = []
     for d in ('LEFT', 'RIGHT', 'UP', 'DOWN'):
         a = pos_char(m, hh)
         stick(host, d, 1.2)
-        time.sleep(0.2)
         b = pos_char(m, hh)
         best = max(best, dist(a, b))
+        per.append('%s %.1f' % (d, dist(a, b)))
+    print('   stick: %s' % ', '.join(per))
     return best
 
 
@@ -191,8 +296,7 @@ def enemy_line(m):
 
 
 def track(ref, m=None):
-    """The same enemy on copy m: nearest of the same class to the last known position. Updates the
-    reference position, so a moving enemy stays tracked across the fight."""
+    """The same enemy on copy m: nearest of the same class to the last known position."""
     mm = m or mh
     best, bd = ref, 1e30
     for o in enemies(mm):
@@ -214,26 +318,108 @@ def now_b(m=None):
     return track(enemy_b, m)
 
 
+ATTACK = None   # dict(kind='pad'|'mouse'|'swing', name=...)
+MELEE = ('UberBeat', 'Beat', 'Club', 'Stick', 'ChainSaw', 'Contact')   # melee weapon classes
+DPAD = {0: 'UP', 1: 'RIGHT', 2: 'DOWN', 3: 'LEFT'}                    # slot <- D-pad (run_f4)
+
+
+def select_melee(pipe, m, pl):
+    """Select a MELEE weapon slot with the D-pad — the one pad input that reaches the game (run_f4).
+    The swing entry 0x4563a0 is the melee attack start, so the ranged slots (CrossBow, Taser, ...) are
+    switched away from first. The D-pad of the copy that owns this player also reaches the other copy
+    through the pad stream. Returns (slot, description)."""
+    h = player(m, pl)
+    if not h:
+        return None, 'no character'
+    sel = u32(m, h + 0x714)
+    pick = None
+    for i in range(4):
+        wp = u32(m, h + 0x704 + 4 * i)
+        cls = rtti(m, wp) if wp else ''
+        if wp and any(k in cls for k in MELEE):
+            pick = i
+            break
+    if pick is None:
+        return sel, 'no melee weapon in slots (selected %d)' % sel
+    if pick != sel:
+        press_btn(pipe, DPAD[pick], 0.25)
+        time.sleep(0.8)
+    wp = u32(m, h + 0x704 + 4 * pick)
+    return pick, 'slot %d %s' % (pick, rtti(m, wp) if wp else '-')
+
+
+def strike(pl, pipe_for_pad, hold=0.6):
+    """One attack by player pl (0 = player 1, 1 = player 2). Returns a one-line description."""
+    if ATTACK['kind'] == 'pad':
+        press_btn(pipe_for_pad, ATTACK['name'], hold)
+        return 'pad %s' % ATTACK['name']
+    if ATTACK['kind'] == 'mouse':
+        mouse_click(pipe_for_pad, hold)
+        return 'left mouse'
+    # The game's own attack entry (FUN_004563a0) on BOTH copies, so both simulate the same swing.
+    r1 = host.cmd('swing %d' % pl)
+    r2 = guest.cmd('swing %d' % pl)
+    return 'swing %d [host: %s | guest: %s]' % (pl, r1, r2)
+
+
+def watch_swing(pl, pipe_for_pad, which, hold=0.6):
+    """One attack with samples of both copies while it runs: enemy life, attacker anim, weapon state."""
+    get = now_a if which == 'A' else now_b
+    a0 = get(mh)
+    a0g = match(mg, a0)
+    life0_h = a0['life']
+    life0_g = a0g['life'] if a0g else -1
+    samples = []
+    t0 = time.time()
+    desc = strike(pl, pipe_for_pad, hold)
+    while time.time() - t0 < hold:
+        samples.append((u32(mh, player(mh, pl) + 0x2dc), weapon_state(mh, pl),
+                        u32(mg, player(mg, pl) + 0x2dc), weapon_state(mg, pl)))
+        time.sleep(0.1)
+    time.sleep(0.3)
+    a1 = get(mh)
+    a1g = match(mg, a1)
+    return dict(desc=desc, life0_h=life0_h, life1_h=a1['life'], state1_h=a1['state'],
+                life0_g=life0_g, life1_g=a1g['life'] if a1g else -1,
+                state1_g=a1g['state'] if a1g else -1, samples=samples)
+
+
 def discover_attack(target):
-    """Stand next to the enemy and try each button; the one that lowers its life is the attack."""
+    """Stand next to the enemy and try each real input; a swing is detected on the selected weapon's
+    +0x14 (4 = the state FUN_004563a0 starts) or on the enemy's life. If nothing works, use `swing`."""
+    global ATTACK
     print('   tp host player 1 next to it: %s' % tp_near(host, mh, 0, target['pos'], 'host'))
-    for btn in ('X', 'B', 'Y', 'A', 'LB', 'RB', 'RT', 'LT'):
+    for kind, name in (('pad', 'X'), ('pad', 'B'), ('pad', 'Y'), ('pad', 'A'), ('pad', 'LB'),
+                       ('pad', 'RB'), ('pad', 'RT'), ('pad', 'LT'), ('mouse', 'LMB')):
         before = track(target)['life']
+        ws_max = anim_max = 0
         for _ in range(3):
-            press_btn(host, btn, 0.5)
-            time.sleep(0.3)
+            if kind == 'pad':
+                press_btn(host, name, 0.45)
+            else:
+                mouse_click(host, 0.45)
+            time.sleep(0.25)
+            ws_max = max(ws_max, weapon_state(mh, 0))
+            anim_max = max(anim_max, u32(mh, player(mh, 0) + 0x2dc))
         after = track(target)
-        print('   %-3s enemy life %.1f -> %.1f  last attacker %s  state %#x  player anim %#x'
-              % (btn, before, after['life'], after['la'], after['state'],
-                 u32(mh, player(mh, 0) + 0x2dc) if player(mh, 0) else 0))
-        if after['life'] < before - 0.4:
-            print('   *** the attack button is %s' % btn)
-            return btn
-    return None
+        print('   %-4s enemy life %.1f -> %.1f  state %#x  attacker anim max %#x  weapon state max %#x'
+              % (name, before, after['life'], after['state'], anim_max, ws_max))
+        if after['life'] < before - 0.4 or ws_max == 4:
+            ATTACK = dict(kind=kind, name=name)
+            print('   *** the attack input is %s (%s)' % (name, kind))
+            return ATTACK
+    ATTACK = dict(kind='swing', name='swing')
+    print('   no pad button, trigger or mouse button started a swing (all 9 tried above)')
+    print('   -> using the test-only `swing` command (the game\'s own attack entry 0x4563a0) on both copies')
+    print('   melee slot: host player 1 -> %s' % (select_melee(host, mh, 0)[1],))
+    print('   first swing reply: %s' % host.cmd('swing 0'))
+    print('   guest reply: %s' % guest.cmd('swing 0'))
+    time.sleep(0.6)
+    return ATTACK
 
 
 def prepare(lvl, arrive):
-    """Wait for the level both copies were sent to, pick the enemies and find the attack button."""
+    """Wait for the level both copies were sent to, pick the enemies and find the attack input."""
     global enemy_a, enemy_b, two_enemies
     arrive()
     print('arrived: host %s (mode %d) | guest %s (mode %d)'
@@ -309,7 +495,7 @@ if attack is None:
     if attack:
         lvl = 'H000'
 if attack is None:
-    problem('no enemy could be hurt in any combat level; the attack button was not identified')
+    problem('no enemy could be hurt in any combat level; the attack input was not identified')
     print('\nRESULT: no enemy could be hurt in any combat level -> combat not proven')
     print('sync host: %s' % host.cmd('sync'))
     print('sync guest: %s' % guest.cmd('sync'))
@@ -317,35 +503,48 @@ if attack is None:
 
 
 # ---- the fight ----------------------------------------------------------------------------------
-def sample(tagline, pl_h, pl_g):
-    ra, ga = now_a(mh), match(mg, now_a(mh))
-    rb, gb = now_b(mh), match(mg, now_b(mh))
-    ah = u32(mh, player(mh, pl_h) + 0x2dc) if player(mh, pl_h) else 0
-    ag = u32(mg, player(mg, pl_g) + 0x2dc) if player(mg, pl_g) else 0
-    print('   %-10s A h %6.1f/%#7x  g %6.1f/%#7x | B h %6.1f/%#7x  g %6.1f/%#7x | attack anim p%d h %#x g %#x %s'
-          % (tagline, ra['life'], ra['state'], ga['life'] if ga else -1, ga['state'] if ga else 0,
-             rb['life'], rb['state'], gb['life'] if gb else -1, gb['state'] if gb else 0,
-             pl_h + 1, ah, ag, 'SAME' if ah == ag else 'DIFF'))
-    return (ra, ga, rb, gb, ah, ag)
-
-
 def fight(name, pipe, pl_h, pl_g, target, m_target, which):
-    print('\n== %s: player %d attacks %s' % (name, pl_h + 1, target['cls']))
+    """pl_h = the player index on the host copy, pl_g = ... on the guest copy (both copies simulate
+    both players, so the same index is used for the swings)."""
+    global ATTACK
+    print('\n== %s: player %d attacks %s (input: %s)'
+          % (name, pl_h + 1, target['cls'], ATTACK['name']))
     print('   tp: %s' % tp_near(pipe, m_target, pl_h, target['pos'], name))
     if pipe is not host:
         print('   tp peer: %s' % tp_near(host, mh, pl_g, target['pos'], 'peer'))
+    if ATTACK['kind'] == 'swing':
+        print('   melee slot: %s -> %s' % (name, select_melee(pipe, m_target, pl_h)[1]))
+        time.sleep(0.6)
+        print('   swing on both copies: host %s | guest %s'
+              % (host.cmd('swing %d' % pl_h), guest.cmd('swing %d' % pl_g)))
+        time.sleep(0.5)
+    # a foreground picture of the two copies during a swing (the task asks to look at it)
+    for pid, who in ((h, 'host'), (g, 'guest')):
+        r = host.cmd('swing %d' % pl_h) if pid == h else guest.cmd('swing %d' % pl_g)
+        time.sleep(0.15)
+        try:
+            os.makedirs(os.path.join(HERE, 'shots'), exist_ok=True)
+            frac = capture(pid, os.path.join(HERE, 'shots', 'combat_%s.png' % who))
+            print('   shot %s: %.1f%% non-black (swing reply %s)' % (who, frac, r))
+        except Exception as e:
+            print('   shot %s failed: %s' % (who, e))
     samples = []
-    anim_eq = anim_nz = 0
+    drops = []
+    anim_eq = anim_nz = ws_eq = ws_nz = 0
     for i in range(14):
-        press_btn(pipe, attack, 0.55)
-        time.sleep(0.35)
-        s = sample('press %d' % (i + 1), pl_h, pl_g)
+        s = watch_swing(pl_h, pipe, which)
         samples.append(s)
-        if s[4] == s[5]:
-            anim_eq += 1
-            if s[4] != 0:
-                anim_nz += 1
-        if (s[0]['life'] if pipe is host else s[2]['life']) <= 0:
+        print('   swing %2d %-6s: host life %6.1f -> %6.1f st %#x | guest life %6.1f -> %6.1f st %#x'
+              % (i + 1, 'ok', s['life0_h'], s['life1_h'], s['state1_h'], s['life0_g'], s['life1_g'], s['state1_g']))
+        drops.append((s['life0_h'] - s['life1_h'], s['life0_g'] - s['life1_g']))
+        for (ah, wh, ag, wg) in s['samples']:
+            if ah == ag:
+                anim_eq += 1
+                anim_nz += ah != 0
+            if wh == wg:
+                ws_eq += 1
+                ws_nz += wh != 0
+        if s['life1_h'] <= 0:
             break
         if i == 6:   # enemy may have moved; walk up again
             t = now_a() if which == 'A' else now_b()
@@ -364,18 +563,25 @@ def fight(name, pipe, pl_h, pl_g, target, m_target, which):
         problem('%s: death state differs host %#x guest %#x' % (name, end_h['state'], end_g['state']))
     worst = 0.0
     for s in samples:
-        if s[1]:
-            worst = max(worst, abs(s[0]['life'] - s[1]['life']))
-        if s[3]:
-            worst = max(worst, abs(s[2]['life'] - s[3]['life']))
+        for pair in ((s['life1_h'], s['life1_g']), (s['life0_h'], s['life0_g'])):
+            if pair[1] >= 0:
+                worst = max(worst, abs(pair[0] - pair[1]))
     print('   %s: worst life difference between the copies %.2f (tolerance %.1f)' % (name, worst, TOL))
     if worst > TOL:
         problem('%s: life drifted apart between the copies by %.2f' % (name, worst))
-    print('   %s: attack animation samples equal on both copies %d/%d (non-zero %d)'
-          % (name, anim_eq, len(samples), anim_nz))
-    if anim_eq < len(samples) * 0.8:
-        problem('%s: attack animation samples differ between the copies (%d/%d equal)'
-                % (name, anim_eq, len(samples)))
+    print('   %s: per-swing life drop (host | guest): %s'
+          % (name, ' '.join('%.1f|%.1f' % d for d in drops)))
+    bad = [d for d in drops if d[1] >= 0 and abs(d[0] - d[1]) > TOL and d[0] > 0.01]
+    if bad:
+        problem('%s: the life drop per hit differs between the copies (double damage?): %s' % (name, bad))
+    total = 0
+    nsamp = sum(len(s['samples']) for s in samples)
+    print('   %s: attack samples equal on both copies anim %d/%d (non-zero %d), weapon state %d/%d (non-zero %d)'
+          % (name, anim_eq, nsamp, anim_nz, ws_eq, nsamp, ws_nz))
+    if anim_eq < nsamp * 0.8:
+        problem('%s: attack animation samples differ between the copies (%d/%d equal)' % (name, anim_eq, nsamp))
+    if ws_eq < nsamp * 0.8:
+        problem('%s: weapon-state samples differ between the copies (%d/%d equal)' % (name, ws_eq, nsamp))
     return end_h
 
 
@@ -403,14 +609,6 @@ for r in enemies(mh):
                 % (r['cls'], r['life'] > 0, o['life'] > 0, r['life'], o['life']))
 print('sync host: %s' % host.cmd('sync'))
 print('sync guest: %s' % guest.cmd('sync'))
-try:
-    print('shot host: %s' % (shot(h, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'combat_host.png')),))
-except Exception as e:
-    print('shot host failed: %s' % e)
-try:
-    print('shot guest: %s' % (shot(g, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'combat_guest.png')),))
-except Exception as e:
-    print('shot guest failed: %s' % e)
 
 print('\nRESULT: %s' % ('combat OK' if not problems else 'combat FAILED'))
 for p in problems:
