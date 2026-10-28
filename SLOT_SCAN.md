@@ -91,3 +91,26 @@ Doors / destructibles seen in the level list (RTTI-classified, count per slot):
 `scan_all2.log` (this worktree's session scratch): one full block per slot with every entity, the
 class-tag histogram and both players; the table above is derived from it. The first, shorter scan
 (`scan_all.log`) shows the same picture with positions read too early.
+
+## TASK 17 Part C - forward play through the game's own doors (host copy)
+
+Tool: `tests/play_forward.py`. It walks the character with the pad (no teleport and no requested level tag)
+to the level's own doors / loading zones, presses A, waits for the transition the game performs, then
+scans the new room with the same reads as `scan_slots.py` and appends it here. "A room" is one level load;
+the counts are over the level's whole entity list (live items = `CToeItem*` with `+0x20 != 0`, `+0xa8 == 0`,
+gates 0; enemies = `CCharacter*` with life > 0; spawners = `CToeRespawn*`).
+
+| run | save slot | room | level | entities | live items | enemies | spawners | player 1 | outcome |
+|---|---|---:|---|---:|---:|---:|---:|---|---|
+| `run_a3` | 06 (game6.sav) | start | H000 | 48 | 0 | 2 (`CCharacterNPC` x2) | 2 (`CToeRespawner` x2) | (-2523.1, 386.4, 37.3) | walk blocked at (3531.2, -462.6, 17.3); no transition |
+| `run_ac1` | 10 (game9.sav) | start | I007 | 49 | 0 | 1 (`CCharacterNPCMisc`) | 0 | (-1547.3, -874.7, -7.7) | walked ~250 units, then stopped; nearest of 5 doors still 902 away; no transition |
+| `run_g1` | 05 (game5.sav) | start | G003 | 47 | 1 (only after `check_gate.py` set `+0x20 = 1`; 0 as the save has it) | 1 (`CCharacterNPCTeacher`, 1197 away) | 0 | (2799.7, 1548.8, 321.8) | walked 177 units, then stopped; loading zone still 2309 away; no transition |
+| `run_reg1` | 01 (game0.sav), pair flow | start | I100 | 30 | 0 (`CToeLoot` has `+0x20 = 0`) | 0 | 0 | (-570.8, -248.7, 0.1) | pad moved the character 0.0 units in every direction |
+
+No second room was reached in any run, so no door/loading zone transition happened and no save was made
+(the save step only runs in a room with a live item and no enemy).
+
+Why (OBSERVED, `tests/probe_control.py` on H000): the game's own menu buttons (A, A, START, B, BACK, A)
+do not change anything, the four 1-second stick presses move the character 0.0 units each, and 20 s of a
+held stick moves it 0.0 units. In I007 and G003 the character walks a few hundred units after the load and
+then stops dead. That is the same missing-collision picture FINDINGS_16 section 7 describes.

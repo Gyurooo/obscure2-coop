@@ -48,6 +48,18 @@ def press(pipe, user, names, hold=0.15):
     return r1, r2
 
 
+def tp(pipe, player, x, y, z=None):
+    """The mod's SAFE teleport (TASK 17): the game thread places the character, watches its own physics
+    settle it on a floor within 8 units of z, and restores the old position when there is none.
+
+    Returns the reply: 'ok settled at (x, y, z) after N s' or 'refused: ...' / 'error ...'.
+    Without z the current height is kept, so the character lands on whatever floor is there.
+    A test that teleports into a room must go through tests/tp_to_items.py instead (item/enemy gate)."""
+    if z is None:
+        return pipe.cmd('tp %d %.3f %.3f' % (player, x, y))
+    return pipe.cmd('tp %d %.3f %.3f %.3f' % (player, x, y, z))
+
+
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 gdi32 = ctypes.WinDLL('gdi32')
 WNDENUMPROC = ctypes.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)

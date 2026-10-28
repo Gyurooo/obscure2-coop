@@ -2010,6 +2010,186 @@ static void guest_debug_p1(void)
 	}
 }
 
+// ---- safe teleport (TASK 17 Part A) ----------------------------------------------------------------
+//
+// A plain write of the position triple at character+0x23c does stick (FINDINGS_16 section 4: the probe
+// read the written value back 1.2 s later), but it says nothing about what is under the target. On H000 a
+// teleport onto the CToeHeavyCase (z = 59.74) left the character in free fall for 468 units, and the old
+// `tp` had no way back: the character stayed in the void, so the interaction scan (+0x73c) never selected
+// the case.
+//
+// The engine's own answer to "is there floor here" is the character physics: the game's own placement
+// paths do the same thing. CToeCharacterPos (tag PPOS 0x50504f53, constructor FUN_00414140, parser
+// FUN_00414220 reading `position` into +0x104 and `player_controlled` into +0x11c) only names a position;
+// the character's physics then settles the body onto the floor. There is no separate snap call to reuse,
+// and the camera's floor pair (FUN_0057d9a0 / FUN_0057e9c0) belongs to the camera's collision object.
+//
+// So the safe tp runs on the game thread (frame_tick, one call per frame): it remembers the old position,
+// writes the target once, then samples the character every frame. It accepts only when the character
+// stays on the requested X/Y and its Z settles (10 stable frames) within TP_MAX_DROP units of the
+// requested Z for at least TP_MIN_MS; otherwise it restores the old position and prints why. That is the
+// "ground/collision query" the task asks for, with the physics as the query, plus the snap (the settled Z
+// is the floor; the reply prints it so a caller can aim the next teleport exactly).
+#define TP_IDLE 0
+#define TP_START 1
+#define TP_RUN 2
+#define TP_DONE 3
+
+#define TP_MAX_DROP 8.0f      // units: the settled floor must be within this of the requested Z
+#define TP_MAX_XY 6.0f        // units: the physics must not push the body off the target
+#define TP_MIN_MS 800         // observe at least this long before accepting a settle
+#define TP_MAX_MS 3000        // give up (and restore) after this long
+
+static CRITICAL_SECTION g_tp_cs;
+static volatile LONG g_tp_state;
+static int g_tp_pl, g_tp_have_dir;
+static float g_tp_target[3], g_tp_dir[2], g_tp_old[3], g_tp_old_dir[3];
+static DWORD g_tp_t0;
+static float g_tp_prev_z;
+static int g_tp_stable, g_tp_verdict;
+static char g_tp_msg[160];
+
+// Called on the game thread. Every exit goes through here so the pipe thread always sees a message.
+static void tp_finish(int ok, int restore)
+{
+	if (restore) {
+		unsigned h = player_human(g_tp_pl);
+		if (h) {
+			float *pos = (float *)(uintptr_t)(h + H_POS), *dir = (float *)(uintptr_t)(h + H_DIR);
+			pos[0] = g_tp_old[0]; pos[1] = g_tp_old[1]; pos[2] = g_tp_old[2];
+			if (g_tp_have_dir) { dir[0] = g_tp_old_dir[0]; dir[1] = g_tp_old_dir[1]; dir[2] = g_tp_old_dir[2]; }
+		}
+	}
+	g_tp_verdict = ok;
+	g_tp_state = TP_DONE;
+}
+
+// One frame of the teleport, on the game thread (prepended to frame_tick, so it also runs with no peer).
+static void tp_frame(void)
+{
+	LONG st = g_tp_state;
+	if (st != TP_START && st != TP_RUN)
+		return;
+	unsigned h = player_human(g_tp_pl);
+	if (!h) {
+		_snprintf(g_tp_msg, sizeof g_tp_msg, "error tp: no character for player %d", g_tp_pl + 1);
+		tp_finish(0, 0);
+		return;
+	}
+	float *pos = (float *)(uintptr_t)(h + H_POS);
+	if (st == TP_START) {
+		float *dir = (float *)(uintptr_t)(h + H_DIR);
+		g_tp_old[0] = pos[0]; g_tp_old[1] = pos[1]; g_tp_old[2] = pos[2];
+		g_tp_old_dir[0] = dir[0]; g_tp_old_dir[1] = dir[1]; g_tp_old_dir[2] = dir[2];
+		pos[0] = g_tp_target[0]; pos[1] = g_tp_target[1]; pos[2] = g_tp_target[2];
+		if (g_tp_have_dir) { dir[0] = g_tp_dir[0]; dir[1] = g_tp_dir[1]; dir[2] = 0.0f; }
+		g_tp_prev_z = pos[2];
+		g_tp_stable = 0;
+		g_tp_t0 = GetTickCount();
+		g_tp_state = TP_RUN;
+		return;
+	}
+	{
+		float x = pos[0], y = pos[1], z = pos[2];
+		int ms = (int)(GetTickCount() - g_tp_t0);
+		float dz = z - g_tp_target[2];
+		int near_xy = fabsf_(x - g_tp_target[0]) <= TP_MAX_XY && fabsf_(y - g_tp_target[1]) <= TP_MAX_XY;
+		if (fabsf_(z - g_tp_prev_z) < 0.02f)
+			g_tp_stable++;
+		else
+			g_tp_stable = 0;
+		g_tp_prev_z = z;
+		if (dz < -TP_MAX_DROP) {
+			_snprintf(g_tp_msg, sizeof g_tp_msg,
+			          "refused: no floor at (%.1f, %.1f, %.1f) - the character fell %.1f units (z %.1f); "
+			          "old position restored", g_tp_target[0], g_tp_target[1], g_tp_target[2], -dz, z);
+			tp_finish(0, 1);
+			return;
+		}
+		if (dz > TP_MAX_DROP) {
+			_snprintf(g_tp_msg, sizeof g_tp_msg,
+			          "refused: the floor at (%.1f, %.1f) is %.1f above the requested z (%.1f); old position restored",
+			          g_tp_target[0], g_tp_target[1], dz, g_tp_target[2]);
+			tp_finish(0, 1);
+			return;
+		}
+		if (!near_xy && ms > 300) {
+			_snprintf(g_tp_msg, sizeof g_tp_msg,
+			          "refused: the game moved the character away from (%.1f, %.1f) to (%.1f, %.1f); old position restored",
+			          g_tp_target[0], g_tp_target[1], x, y);
+			tp_finish(0, 1);
+			return;
+		}
+		if (ms >= TP_MIN_MS && g_tp_stable >= 10) {
+			_snprintf(g_tp_msg, sizeof g_tp_msg, "ok settled at (%.2f, %.2f, %.2f) after %.1f s", x, y, z, ms / 1000.0f);
+			tp_finish(1, 0);
+			return;
+		}
+		if (ms >= TP_MAX_MS) {
+			_snprintf(g_tp_msg, sizeof g_tp_msg,
+			          "refused: no floor at (%.1f, %.1f, %.1f) - still moving after %.1f s (now z %.1f); old position restored",
+			          g_tp_target[0], g_tp_target[1], g_tp_target[2], ms / 1000.0f, z);
+			tp_finish(0, 1);
+		}
+	}
+}
+
+// Pipe-thread side: queue the request for the game thread, wait for its verdict, return it.
+// safe = 0 keeps the old raw write (kept as `tpraw` for diagnostics).
+static int tp_request(int pl, float x, float y, float z, int have_z, float dx, float dy, int have_dir, int safe,
+                      char *reply, size_t replysz)
+{
+	unsigned h = player_human(pl);
+	if (!h) {
+		_snprintf(reply, replysz, "error tp: no character for player %d (in game?)", pl + 1);
+		return 0;
+	}
+	if (!safe) {
+		float *pos = (float *)(uintptr_t)(h + H_POS), *dir = (float *)(uintptr_t)(h + H_DIR);
+		pos[0] = x; pos[1] = y; pos[2] = have_z ? z : pos[2];
+		if (have_dir) { dir[0] = dx; dir[1] = dy; dir[2] = 0; }
+		_snprintf(reply, replysz, "ok (raw write, not checked)");
+		return 1;
+	}
+	EnterCriticalSection(&g_tp_cs);
+	if (g_tp_state == TP_START || g_tp_state == TP_RUN) {
+		LeaveCriticalSection(&g_tp_cs);
+		_snprintf(reply, replysz, "error tp: another teleport is still in flight");
+		return 0;
+	}
+	if (!have_z)
+		z = *(float *)(uintptr_t)(h + H_POS + 8);
+	g_tp_pl = pl;
+	g_tp_target[0] = x; g_tp_target[1] = y; g_tp_target[2] = z;
+	g_tp_dir[0] = dx; g_tp_dir[1] = dy;
+	g_tp_have_dir = have_dir;
+	g_tp_verdict = 0;
+	g_tp_msg[0] = 0;
+	g_tp_state = TP_START;
+	LeaveCriticalSection(&g_tp_cs);
+	{
+		DWORD t0 = GetTickCount();
+		for (;;) {
+			if (g_tp_state == TP_DONE)
+				break;
+			if (GetTickCount() - t0 > TP_MAX_MS + 2000) {
+				// The game thread never ran a frame (menu, minimised, loading): give the slot back so the
+				// next teleport is not refused as "still in flight".
+				g_tp_state = TP_IDLE;
+				_snprintf(reply, replysz, "error tp: the game did not run a frame");
+				return 0;
+			}
+			Sleep(10);
+		}
+	}
+	{
+		int ok = g_tp_verdict;
+		_snprintf(reply, replysz, "%s", g_tp_msg);
+		g_tp_state = TP_IDLE;
+		return ok;
+	}
+}
+
 // ---- frame tick (Present hook, main thread) --------------------------------------------------------
 
 static void sync_init(void)
@@ -2022,10 +2202,12 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_rcvd_cs);
 	InitializeCriticalSection(&g_rload_cs);
 	InitializeCriticalSection(&g_pick_cs);
+	InitializeCriticalSection(&g_tp_cs);
 }
 
 static void frame_tick(void)
 {
+	tp_frame();   // safe teleport: must run with no peer too (TASK 17 Part A)
 	if (!g_role)
 		return;
 	{

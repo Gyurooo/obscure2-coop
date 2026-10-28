@@ -989,6 +989,11 @@ static void watch_start(DWORD addr, DWORD ms)
 //   key <DIK hex> <0|1>                             virtual keyboard key up/down
 //   mouse <dx> <dy> <buttons hex>                   add mouse movement, set button bits
 //   loadsave <name>                                 run the game's own menu Load for that save file
+//   tp <0|1> x y [z dx dy]                          SAFE teleport: the game thread places the character,
+//                                                   watches the physics settle it on a floor within 8 units
+//                                                   of z and restores the old position (with the reason)
+//                                                   when there is none. Reply: ok settled at (...) / refused: ...
+//   tpraw <0|1> x y [z dx dy]                       old raw position write, no floor check (diagnostics only)
 //   ping                                            -> pong <pid>
 
 static void vpad_set(int user, int on, unsigned buttons, int lx, int ly, int rx, int ry, int lt, int rt)
@@ -1005,6 +1010,8 @@ static void vpad_set(int user, int on, unsigned buttons, int lx, int ly, int rx,
 
 static unsigned player_human(int player);   // sync.c
 static void request_real_load(const char *name, const char *src);   // sync.c: the game's own save load
+static int tp_request(int pl, float x, float y, float z, int have_z, float dx, float dy, int have_dir, int safe,
+                      char *reply, size_t replysz);   // sync.c: the safe teleport (TASK 17 Part A)
 
 static volatile float g_view[16];            // window.c: the last view matrix
 static volatile LONG g_view_sets, g_xf_sets;
@@ -1139,20 +1146,22 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		sync_status(reply, replysz);
 	} else if (!strncmp(line, "net", 3)) {
 		net_status(reply, replysz);
-	} else if (!strncmp(line, "tp ", 3)) {
-		// tp <player 0|1> <x> <y> [z] [dx dy]: move a player's character (test tool; the position is a plain float
-		// triple at character+0x23c, facing at +0x248).
+	} else if (!strncmp(line, "tp ", 3) || !strncmp(line, "tpsafe ", 7) || !strncmp(line, "tpraw ", 6)) {
+		// tp <player 0|1> <x> <y> [z] [dx dy]: move a player's character (test tool). SAFE by default:
+		// the game thread writes the position, samples the character's own physics for up to TP_MAX_MS and
+		// accepts only a floor within TP_MAX_DROP units of the requested z; otherwise the old position is
+		// restored and the reply says why (src/sync.c, "safe teleport"). `tpraw` is the old plain write.
+		int safe = strncmp(line, "tpraw", 5) != 0;
 		int pl = 0;
 		float v[5] = { 0, 0, 0.92f, 0, 0 };
-		int got = sscanf(line + 3, "%d %f %f %f %f %f", &pl, &v[0], &v[1], &v[2], &v[3], &v[4]);
-		unsigned h = (pl == 0 || pl == 1) ? player_human(pl) : 0;
-		if (got < 3 || !h) {
+		const char *rest = line + 3;
+		if (!strncmp(line, "tpsafe ", 7)) rest = line + 7;
+		else if (!strncmp(line, "tpraw ", 6)) rest = line + 6;
+		int got = sscanf(rest, "%d %f %f %f %f %f", &pl, &v[0], &v[1], &v[2], &v[3], &v[4]);
+		if (got < 3 || pl < 0 || pl > 1) {
 			_snprintf(reply, replysz, "error tp <0|1> x y [z dx dy] (in game?)");
 		} else {
-			float *pos = (float *)(uintptr_t)(h + H_POS), *dir = (float *)(uintptr_t)(h + H_DIR);
-			pos[0] = v[0]; pos[1] = v[1]; pos[2] = v[2];
-			if (got >= 6) { dir[0] = v[3]; dir[1] = v[4]; dir[2] = 0; }
-			_snprintf(reply, replysz, "ok");
+			tp_request(pl, v[0], v[1], v[2], got >= 4, v[3], v[4], got >= 6, safe, reply, replysz);
 		}
 	} else if (!strncmp(line, "life ", 5)) {
 		// life <0|1> <value>: call the character's own SetLife (vtable +0x24), the same path as the
