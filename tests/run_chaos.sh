@@ -16,6 +16,8 @@
 #
 # OBSCOOP_FLOW=menu: the TASK 12 flow instead of the new-game-first one — both copies stay at the main
 # menu, the host loads save 01 with the game's own LoadByName (start_menu_load.py).
+# OBSCOOP_MOVEMENT=1: also run check_movement.py — phase E right after the flow (movement while the load
+# is fresh), then phases A-D with the other checks. Off by default (it adds ~40 s and moves the players).
 #
 # Starts only its own relays and games, kills only those, and every wait has a timeout. Prints each
 # check's output verbatim.
@@ -198,6 +200,14 @@ else
 	fi
 fi
 
+MOV=0
+if [ "${OBSCOOP_MOVEMENT:-0}" = 1 ]; then MOV=1; fi
+if [ "$MOV" = 1 ]; then
+	if ! run_logged 90 "movement right after the load (phase E)" "$PY" -I "$HERE/check_movement.py" "$HP" "$GP" --early; then
+		echo "movement phase E failed"; RC=1
+	fi
+fi
+
 # ---- convergence: bounded poll, memory only --------------------------------------------------------------
 echo "== waiting up to 60 s for convergence"
 timeout 90 "$PY" -I - "$HP" "$GP" "$HERE" <<'PY' > "$RUNDIR/converge.out" 2>&1
@@ -321,6 +331,10 @@ for c in check_save.py check_party.py check_hands.py check_items.py; do
 	echo "== $c"
 	timeout 60 "$PY" -I "$HERE/$c" "$HP" "$GP" || RC=1
 done
+if [ "$MOV" = 1 ]; then
+	echo "== check_movement.py (phases A-D)"
+	timeout 120 "$PY" -I "$HERE/check_movement.py" "$HP" "$GP" --phases A,B,C,D || RC=1
+fi
 if [ "$XFER" = 1 ]; then
 	echo "== check_savexfer.py"
 	timeout 60 "$PY" -I "$HERE/check_savexfer.py" || RC=1

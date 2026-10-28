@@ -8,6 +8,10 @@
 #        sh tests/run_pair_menu.sh --host-newgame <dll> [check_script.py ...]
 #          baseline: the old flow's host action (new 2P game, then pause -> Load save 01) with the guest
 #          left at the main menu; used to show what the guest does today.
+#
+# check_movement.py is special-cased: the runner runs its phase E (movement right after the load) as soon
+# as the load script returns, then the usual A-D phases with the other checks. Any other check runs only
+# after the 20 s settle.
 DLLARG=$1
 if [ "$DLLARG" = "--host-newgame" ]; then
 	MODE=host-newgame
@@ -36,11 +40,23 @@ else
 	echo "== both at the main menu; the host loads save 01 with the game's own LoadByName"
 	$PY -I start_menu_load.py | tail -40
 fi
-sleep 20
 RC=0
+EARLY=""
+for c in "$@"; do
+	[ "$c" = check_movement.py ] && EARLY=1
+done
+if [ -n "$EARLY" ]; then
+	echo "== check_movement.py --early (phase E: movement right after the load)"
+	$PY -I check_movement.py "$(cat duo_host.pid)" "$(cat duo_guest.pid)" --early || RC=1
+fi
+sleep 20
 for c in "$@"; do
 	echo "== $c"
-	$PY -I "$c" "$(cat duo_host.pid)" "$(cat duo_guest.pid)" || RC=1
+	if [ "$c" = check_movement.py ]; then
+		$PY -I "$c" "$(cat duo_host.pid)" "$(cat duo_guest.pid)" --phases A,B,C,D || RC=1
+	else
+		$PY -I "$c" "$(cat duo_host.pid)" "$(cat duo_guest.pid)" || RC=1
+	fi
 done
 $PY -I duo.py stop | tail -2
 exit $RC

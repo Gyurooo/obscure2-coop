@@ -65,6 +65,15 @@ static volatile LONG g_item_applied;
 // A save load starts the game with only player 1 attached: the second input controller's character
 // pointer is 0, so the partner is AI and the guest's pad controls nothing. Re-attach the second human
 // to the second input controller after a load (both copies do this).
+//
+// Attaching the pointer is not enough. Request state 3 (load by name) rewrites the second character
+// record's controller tag 2CHC (0x43484332) to MTHC (0x4348544d) in the live progress table *before*
+// the world is built (decompile 98986-98989), so the partner is spawned on the shared teammate
+// controller (world+0x174c, tag MTHC) - its body is `human+8`. The input controller then points at
+// her but she still answers the teammate AI, and the pad of player 2 moves nobody (TASK 13 run 2:
+// GIR1 moved 0.0 units on both copies). Point the body at the input controller too, which is what a
+// world built for two players looks like (human+8 == *(world+0x1748)+0x764). In a real 2P world this
+// is a no-op.
 static void attach_player2(void)
 {
 	static DWORD last;
@@ -75,12 +84,23 @@ static void attach_player2(void)
 	unsigned ctl = w ? rd32(w + 0x1748) : 0;
 	unsigned mgr = w ? rd32(w + 0x175c) : 0;
 	if (!ctl || !mgr) return;
-	unsigned c1 = ctl + 4 + 0x764;
-	if (rd32(c1)) return;
+	unsigned c2 = ctl + 0x764;         // input controller 2 (an object: vtable +0, character +4, tag +0xc)
+	unsigned c2h = c2 + 4;             // the character pointer the mod writes
 	unsigned n = rd32(mgr + 4), arr = rd32(mgr + 0xc);
 	if (n < 2) return;
 	unsigned h2 = rd32(arr + 4);
-	if (h2) *(DWORD *)(uintptr_t)c1 = h2;
+	if (!h2 || IsBadWritePtr((void *)(uintptr_t)c2h, 4) || IsBadReadPtr((const void *)(uintptr_t)(h2 + 8), 4))
+		return;
+	if (!rd32(c2h))
+		*(DWORD *)(uintptr_t)c2h = h2;   // input controller 2 controls the partner
+	unsigned hc = rd32(h2 + 8);          // the controller the partner's body answers
+	if (hc && hc != c2 && rd32(hc + 0xc) == 0x4348544d && rd32(c2 + 0xc) == 0x43484332 &&
+	    !IsBadWritePtr((void *)(uintptr_t)(h2 + 8), 4)) {
+		char who[5], was[5], nowc[5];
+		*(DWORD *)(uintptr_t)(h2 + 8) = c2;
+		logf("attach: %s answered the teammate controller (%s), now the player 2 input controller (%s)",
+			tag4(rd32(h2 + H_TAG), who), tag4(0x4348544d, was), tag4(rd32(c2 + 0xc), nowc));
+	}
 }
 
 // ---- save-file transfer (host -> guest) --------------------------------------------------------
@@ -850,7 +870,11 @@ static void guest_apply_state(void)
 				memcpy(dir, st.ch[i].dir, 12);
 				InterlockedIncrement(&g_snaps);
 			} else if (!local ? err > (timed ? 0.6f : 1.0f) : (timed ? err > 0.6f : (idle ? err > 1.5f : err > 15.0f))) {
-				float kk = (!timed && local && !idle) ? 0.1f : 0.25f;
+				// A timed error is a real position error at the snapshot's time, so take half of it per
+				// snapshot (a quarter left the guest's own character ~v*dt/0.25 units behind the host's
+				// copy while walking: TASK 13 measured mean 10.7 units on loopback). Untimed local
+				// movement still gets a gentle 10 % so a late clock does not drag the player's character.
+				float kk = (!timed && local && !idle) ? 0.1f : 0.5f;
 				pos[0] += ex * kk; pos[1] += ey * kk; pos[2] += ez * kk;
 				if (timed)
 					hist_shift(st.ch[i].tag, st.t_ms, ex * kk, ey * kk, ez * kk);
