@@ -1,8 +1,9 @@
 #!/bin/sh
 # tools/build_release.sh <version>
 #
-# Builds xinput1_3.dll (the proxy mod) and obscoop-relay.exe from source, assembles the player package
-# and writes build/obscoop2-<version>.zip. Prints the package file list and the zip's SHA-256.
+# Builds xinput1_3.dll (the proxy mod) and obscoop-relay.exe from source, assembles the player package,
+# writes build/obscoop2-<version>.zip and - when OBSCOOP_ISCC is set - the installer
+# build/Obscoop2-Setup-<version>.exe. Prints the package file list and the SHA-256 of both.
 #
 # The zip is written with sorted entries and a fixed entry timestamp, so the same sources always give
 # the same file list and the same unpacked files. (The two .exe/.dll binaries themselves are not
@@ -12,10 +13,14 @@
 # Environment (no paths are baked into this file):
 #   OBSCOOP_LLVM_MINGW  the llvm-mingw bin folder that holds i686-w64-mingw32-gcc (required)
 #   OBSCOOP_STEAM_API   the 32-bit steam_api.dll the relay needs at run time (required)
+#   OBSCOOP_ISCC        the Inno Setup compiler (ISCC.exe); without it no setup exe is built
 #   OBSCOOP_OUT         output folder (default: <repo>/build)
 #   PYTHON              interpreter for the zip + hash step (default: python)
 #
-# Usage:  OBSCOOP_LLVM_MINGW=... OBSCOOP_STEAM_API=... sh tools/build_release.sh 1.3
+# Usage:  OBSCOOP_LLVM_MINGW=... OBSCOOP_STEAM_API=... OBSCOOP_ISCC=... sh tools/build_release.sh 1.7
+#
+# The zip stays what it was: unpack it and run install.ps1 by hand. The setup exe is the normal way in
+# for players (wizard, licence, game folder found by itself, save patch, registered uninstaller).
 
 set -eu
 
@@ -129,7 +134,51 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
             z.writestr(info, f.read())
 PY
 
-# ---------------------------------------------------------------- 6. report
+# ---------------------------------------------------------------- 6. the setup exe (Inno Setup)
+# package/obscoop2.iss packs the files above into the wizard. Only the version comes from here; the
+# payload is $PKG, so the setup installs exactly what is in the zip (plus obscoop.ini, and with the
+# same "never replace the player's settings" rule install.ps1 uses).
+SETUP=$OUT/Obscoop2-Setup-$VERSION.exe
+if [ -n "${OBSCOOP_ISCC:-}" ]; then
+	if [ ! -f "$OBSCOOP_ISCC" ]; then
+		echo "OBSCOOP_ISCC is set but there is no such file: $OBSCOOP_ISCC (point it at ISCC.exe)" >&2
+		exit 2
+	fi
+	for f in obscoop2.iss LICENSE.txt; do
+		if [ ! -f "$ROOT/package/$f" ]; then
+			echo "package/$f is missing" >&2
+			exit 1
+		fi
+	done
+	if [ -f "$SETUP" ]; then rm -f "$SETUP"; fi
+	echo ""
+	echo "setup exe: Inno Setup"
+	# ISCC wants Windows paths; this line is a no-op on a machine without cygpath.
+	winpath() { if command -v cygpath > /dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
+	ISCLOG=$OUT/build-$VERSION-iss.log
+	if ! "$OBSCOOP_ISCC" --define="AppVersion=$VERSION" --define="PkgDir=$(winpath "$PKG")" \
+		--output-dir="$(winpath "$OUT")" "$(winpath "$ROOT/package/obscoop2.iss")" > "$ISCLOG" 2>&1; then
+		cat "$ISCLOG" >&2
+		echo "ISCC failed (full log: $ISCLOG)" >&2
+		exit 1
+	fi
+	if grep -qi '^Warning:' "$ISCLOG"; then
+		echo "ISCC printed warnings - look at $ISCLOG" >&2
+		grep -i -A1 '^Warning:' "$ISCLOG" >&2
+		exit 1
+	fi
+	if [ ! -f "$SETUP" ]; then
+		cat "$ISCLOG" >&2
+		echo "ISCC did not produce $SETUP" >&2
+		exit 1
+	fi
+	echo "  setup  : Obscoop2-Setup-$VERSION.exe"
+else
+	echo ""
+	echo "OBSCOOP_ISCC is not set: the setup exe was not built (the zip installs by hand with install.ps1)"
+fi
+
+# ---------------------------------------------------------------- 7. report
 echo ""
 echo "package obscoop2-$VERSION ($PKG):"
 echo "$ACTUAL" | while read -r f; do
@@ -144,3 +193,16 @@ print("zip       : %s" % os.path.abspath(p))
 print("zip size  : %d bytes" % os.path.getsize(p))
 print("zip sha256: %s" % h)
 PY
+if [ -f "$SETUP" ]; then
+	"$PY" - "$SETUP" <<'PY'
+import hashlib, os, sys
+p = sys.argv[1]
+h = hashlib.sha256(open(p, 'rb').read()).hexdigest()
+print("setup     : %s" % os.path.abspath(p))
+print("setup size: %d bytes" % os.path.getsize(p))
+print("setup sha256: %s" % h)
+print("")
+print("Give players the setup exe (%s bytes) and its SHA-256." % os.path.getsize(p))
+print("The zip is the manual route (unpack, install.ps1).")
+PY
+fi
