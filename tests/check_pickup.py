@@ -25,7 +25,7 @@ never written to. If no source produces an item, the check says so and prints wh
 
 Usage: python -I check_pickup.py <host pid> <guest pid> [--host-only|--guest-only] [--spawn]
 """
-import sys, os, struct, time
+import re, sys, os, struct, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bot import Pipe, press
 from peek import Proc
@@ -195,7 +195,31 @@ def pickup_stat(pipe):
 
 
 def nearest(items, pos):
+    """Nearest live item; OBSCOOP_PICKUP_CLASS=MEDI forces a class first (TASK 20: in J003 the
+    backpack floats 16 units above the only floor, so the medikit is the one the safe tp can settle at)."""
+    pref = os.environ.get('OBSCOOP_PICKUP_CLASS', '').upper()
+    if pref:
+        for e in items:
+            if tag(e[1]).upper() == pref:
+                return e
     return min(items, key=lambda e: sum((e[4][i] - pos[i]) ** 2 for i in range(3)) ** 0.5)
+
+
+def tp_floor(pipe, pl, pos, who=''):
+    """The mod's safe tp, with one retry at the floor height the game itself reports when the target z
+    has no floor under it ('... the character fell N units (z Z)'). The item then sits a few units above
+    the character, well inside its own interaction radius (OBSERVED: J003's backpack)."""
+    r = pipe.cmd('tp %d %.3f %.3f %.3f' % (pl, pos[0], pos[1], pos[2]))
+    for _ in range(2):
+        if r.startswith('ok'):
+            return r
+        mz = re.search(r'\(z (-?[0-9.]+)\)', r)
+        if not mz:
+            return r
+        z = float(mz.group(1))
+        print('   %s: no floor at z %.2f, retry at the settled floor z %.2f' % (who or 'tp', pos[2], z))
+        r = pipe.cmd('tp %d %.3f %.3f %.3f' % (pl, pos[0], pos[1], z))
+    return r
 
 
 def dist(a, b):
@@ -251,8 +275,8 @@ def collect(phase, who, pipe, m, pl, item, other_pipe, om, other_name, hold=(), 
         for hp, hpl in hold:
             print('   tp %s player %d (keeps the collecting character in step): %s'
                   % ('peer' if hp is not pipe else who, hpl + 1,
-                     hp.cmd('tp %d %.3f %.3f %.3f' % (hpl, pos[0], pos[1], pos[2]))))
-        print('   tp %s: %s' % (who, pipe.cmd('tp %d %.3f %.3f %.3f' % (pl, pos[0], pos[1], pos[2]))))
+                     tp_floor(hp, hpl, pos, 'peer' if hp is not pipe else who)))
+        print('   tp %s: %s' % (who, tp_floor(pipe, pl, pos, who)))
         time.sleep(0.2)
         press(pipe, 0, 'A', 0.5)
         print('   pressed A (attempt %d)' % (attempt + 1))
@@ -293,10 +317,15 @@ def collect(phase, who, pipe, m, pl, item, other_pipe, om, other_name, hold=(), 
     sent = a.get('sent', 0) - before_send.get('sent', 0)
     rcv = b.get('rcv', 0) - before_rcv.get('rcv', 0)
     applied = b.get('applied', 0) - before_rcv.get('applied', 0)
+    already = b.get('already', 0) - before_rcv.get('already', 0)
     echo = b.get('sent', 0) - before_rcv.get('sent', 0)
-    print('counters this phase: collected-on-%s=%s, %s sent +%d, %s rcv +%d applied +%d, echo sent +%d' % (
-        who, got, who, sent, other_name, rcv, applied, echo))
-    r = got and peer_ok and inventory(mh) == inventory(mg) and sent >= 1 and rcv >= 1 and applied >= 1 and echo == 0
+    print('counters this phase: collected-on-%s=%s, %s sent +%d, %s rcv +%d applied +%d already +%d, echo sent +%d' % (
+        who, got, who, sent, other_name, rcv, applied, already, echo))
+    # TASK 20: a LIVE item in reach is collected by the game's own scan on BOTH copies at once, so the peer
+    # copy may have collected it before the packet arrives -> its apply path reports 'already' instead of
+    # 'applied'. Both mean the item is gone on the peer (peer_ok above reads +0xa8 there).
+    r = (got and peer_ok and inventory(mh) == inventory(mg) and sent >= 1 and rcv >= 1
+         and (applied + already) >= 1 and echo == 0)
     results.append((phase, r))
     print('phase %s: %s' % (phase, 'OK' if r else 'FAILED'))
     ok = ok and r

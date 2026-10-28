@@ -38,6 +38,43 @@ static const char *tag4(unsigned v, char *out)
 	return out;
 }
 
+// TASK 20: record a transition the game itself requested, so the pipe "level" allowlist grows from
+// real observations only. Test-only: nothing is written unless OBSCOOP_LEVELS_LOG is set (the test
+// runners set it). One line per distinct (tag, entry, flag); the file lives next to the DLL.
+static void level_record_real(unsigned level, unsigned entry, unsigned flag)
+{
+	char t[5];
+	tag4(level, t);
+	if (t[0] == '?')
+		return;
+	char line[160];
+	int existed = 1;
+	FILE *f = fopen("obscoop_levels.txt", "r");
+	if (f) {
+		char et[8];
+		unsigned e, fl;
+		while (fgets(line, sizeof line, f)) {
+			if (line[0] == '#' || sscanf(line, "%7s %u %u", et, &e, &fl) != 3)
+				continue;
+			if (!strcmp(et, t) && e == entry && fl == flag) {
+				fclose(f);
+				return;
+			}
+		}
+		fclose(f);
+	} else {
+		existed = 0;
+	}
+	f = fopen("obscoop_levels.txt", existed ? "a" : "w");
+	if (!f)
+		return;
+	if (!existed)
+		fprintf(f, "# tag entry flag - only transitions seen from a real ChangeLevel may be requested\n");
+	fprintf(f, "%s %u %u\n", t, entry, flag);
+	fclose(f);
+	logf("levels: recorded real transition %s %u %u", t, entry, flag);
+}
+
 static volatile LONG g_req_seq;   // number of requests seen, for tests
 static volatile LONG g_req_sent;  // requests forwarded to the guest (host)
 static unsigned g_last_level, g_last_entry, g_last_flag;   // host: the level the party is in, for a joining guest
@@ -70,6 +107,10 @@ static void __fastcall hk_change_level(void *game, void *edx, unsigned level, un
 	}
 	logf("request ChangeLevel level %s (0x%08x) entry %u flag %u [mode %u state %u]", tag4(level, t), level, entry, flag,
 		*(unsigned *)((BYTE *)game + 0x310), *(unsigned *)((BYTE *)game + 0x320));
+	// TASK 20: in TEST runs every transition the game itself requests is added to the pipe "level"
+	// allowlist (obscoop_levels.txt next to the DLL). A replayed transition is not a new observation.
+	if (g_role != 2 && !g_level_replay && getenv("OBSCOOP_LEVELS_LOG"))
+		level_record_real(level, entry, flag);
 	g_change_level(game, edx, level, entry, flag);
 	g_last_level = level; g_last_entry = entry; g_last_flag = flag;
 	if (g_role == 1 && g_peer_ok) {   // after a load the game asks "player 2 is joining"; accept it once

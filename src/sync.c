@@ -620,6 +620,17 @@ static void pickup_local_collect(unsigned item, unsigned ch)
 		return;
 	if (!g_peer_ok)
 		return;
+	// Both copies simulate BOTH characters, and a live world item in reach of a character is collected
+	// automatically by the interaction scan (no button). So the same character collects the same item on
+	// both copies in the same instant; without this guard each copy would also send its own pickup, and
+	// each would receive the peer's for an item it had already collected ("already collected" on both
+	// sides, one redundant packet each way). Announce only the pickups of the character this copy drives:
+	// host owns player 1, guest owns player 2 (its local pad is XInput user 0 = player 2).
+	{
+		unsigned own = player_human(g_role == 2 ? 1 : 0);
+		if (own && ch != own)
+			return;
+	}
 	unsigned w = world_obj();
 	if (!w || rd32(item + 0xa8) != 0)
 		return;

@@ -21,7 +21,9 @@ def launch(dirname, env_extra, pidfile):
     shutil.copy(dll, os.path.join(d, 'xinput1_3.dll'))
     open(os.path.join(d, 'obscoop.log'), 'w').close()
     env = dict(os.environ, SteamAppId='254480', SteamGameId='254480', OBSCOOP_BACKGROUND='1', OBSCOOP_HIDE_REAL_PADS='1',
-               OBSCOOP_WINDOWED='1', OBSCOOP_MULTI='1', OBSCOOP_UDP='27961', **({'OBSCOOP_DEBUG_SYNC': '1'} if os.environ.get('DUO_DEBUG') else {}))
+               OBSCOOP_WINDOWED='1', OBSCOOP_MULTI='1', OBSCOOP_UDP='27961',
+               OBSCOOP_LEVELS_LOG='1',   # TASK 20: append every real ChangeLevel to obscoop_levels.txt
+               **({'OBSCOOP_DEBUG_SYNC': '1'} if os.environ.get('DUO_DEBUG') else {}))
     env.update(env_extra)
     p = subprocess.Popen([os.path.join(d, 'Obscure2.exe')], cwd=d, env=env, creationflags=0x00000008 | 0x00000200)
     open(pidfile, 'w').write(str(p.pid))

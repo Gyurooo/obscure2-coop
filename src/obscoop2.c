@@ -1024,6 +1024,10 @@ static LONG g_views_n[NVIEWS], g_views_count;
 #define H_POS 0x23c
 #define H_DIR 0x248
 
+// Set while the pipe "level" command replays a transition: the hook must not record its own replay
+// as a transition the game made (TASK 20: obscoop_levels.txt grows from real calls only).
+static volatile LONG g_level_replay;
+
 // Test-only guard for the pipe "level" command: only a transition the game itself produced
 // (tag, entry, flag), listed in obscoop_levels.txt next to the DLL, may be replayed. A guessed
 // tag tears the world down and crashes the game.
@@ -1089,7 +1093,9 @@ static void handle_command(char *line, char *reply, size_t replysz)
 			if (!level_allowed(t, entry, flag)) {
 				_snprintf(reply, replysz, "error level %s %d %d not in obscoop_levels.txt (only real transitions)", tag, entry, flag);
 			} else {
+				InterlockedIncrement(&g_level_replay);
 				((void(__fastcall *)(void *, void *, unsigned, unsigned, unsigned))0x4a1c00)((void *)(uintptr_t)g, NULL, t, (unsigned)entry, (unsigned)flag);
+				InterlockedDecrement(&g_level_replay);
 				_snprintf(reply, replysz, "ok");
 			}
 		}

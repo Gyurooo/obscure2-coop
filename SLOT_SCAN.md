@@ -212,3 +212,35 @@ What the table says (OBSERVED):
 | `run_pf19b` | 09 (game8.sav) | I004 | 2435 | calibration OK (camera-relative model detected); reached **79 units** of the door's anchor and `face: character forward is 0.73 aligned`; the room's walls kept it 145 units away at the A presses (the check needs <= 80), so no door use |
 
 No door transition and no new room happened on foot in this task, so this table has no second room.
+
+## TASK 20 — levels visited through the game's own door destinations (live, no memory writes)
+
+Every destination below was read from a door entity in a save slot (`entity+0x118` = target level tag,
+`entity+4` = the entry id the door hands to `FUN_004a1c00`, flag 1) and replayed with the mod's `level`
+command, which makes exactly that call. No tag was guessed. Runs: `run_e1.log`, `run_s1.log`,
+`run_j1.log`, `run_p2.log`.
+
+| # | request | landed | entities | live items | enemies (life > 0) | spawners | save points | player 1 | kept |
+|---:|---|---|---:|---:|---:|---:|---:|---|---|
+| 1 | `I004 15509 1` | I004 | 14 | 0 | 0 | 0 | 1 | (0,0,0) NOT PLACED | walked |
+| 2 | `J000 314 1` | J000 | 16 | **1** (IDSC) | 2 (`CCharacterNPCRam`, 621/664 away) | 0 | 0 | (-1059.7, -38.6, 86.4) | recorded, combat |
+| 3 | `J001 317 1` | J001 | 51 | 0 | 7 (`CCharacterNPC`, `CCharacterNPCProgeny`) | 0 | 0 | (-793.6, 907.2, 0.7) | recorded, combat |
+| 4 | `J003 157 1` | **J003** | 36 | **2** (MEDI, BKPK) | **0** | **0** | 0 | (74.7, 3227.3, -342.0) | **picked up** |
+| 5 | `H001 130 1` | H001 | 48 | 0 | 0 | 0 | 0 | (1077.6, 348.5, 0.5) | scanned |
+| 6 | `H002 131 1` | H002 | 46 | 0 | 0 | 0 | 0 | (-361.3, -612.5, 1.6) | scanned |
+| 7 | `H003 134 1` | H003 | 47 | 0 | 1 (`CCharacterNPCTeacher`, 418 away) | 0 | 0 | (-45.0, 269.3, 1.3) | scanned |
+| 8 | `I005 155 1` | I005 | 85 | 0 | 0 | 4 (`CToeRespawner`) | 0 | (-1282.0, -86.3, 2.5) | scanned |
+| 9 | `I008 161 1` | I008 | 58 | 0 | 0 | 0 | 0 | (3346.3, -2391.3, -98.3) | scanned |
+| 10 | `I010 160 1` | I010 | 43 | 0 | 0 | 0 | 0 | (-2298.9, -1903.1, -0.7) | scanned |
+| 11 | `I012 304 1` | I012 | 43 | 0 | 0 | 0 | 0 | (67.9, 509.1, 5.9) | scanned |
+| 12 | `I010 300 1` | I010 | 43 | 0 | 0 | 0 | 0 | (-4917.1, -2462.7, 808.5) | scanned |
+| 13 | `I005 157 1` | I005 | 85 | 0 | 0 | 4 | 0 | (unchanged level: duplicate request) | not re-entered |
+
+* "Player 1 NOT PLACED" means the level was built but the entry id matched no `CToeCharacterPos`/door
+  in it, so the party stayed at the origin (only the first I004 request did that).
+* A level with enemies is recorded here and not entered on foot (owner rule). J003 is the only level
+  with live items and no enemy/spawner.
+* J003's live items: `CToeItemMedikit` (MEDI) at (6292.18, 382.32, 0.00) and `CToeItemBackpack` (BKPK)
+  at (1290.44, -2789.00, 570.56), plus a row of 16 collectable `CToeWeapon*` objects at x ≈ 6292.
+  The medikit was collected in the game's own flow (`run_p2.log`): safe `tp` to it after the
+  item/enemy gate said ALLOW, one A press, item `+0xa8` 0 → 1, `+0xc4` = the character, `+0x20` → 0.
