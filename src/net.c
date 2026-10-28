@@ -14,12 +14,15 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 6   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 7   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
+                        // 7: PKT_SAVES_DONE tells the guest when the host's save transfer is complete (the guest may then
+                        //    load a transferred save with the game's own menu path)
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
-	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14 };
+	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
+	PKT_SAVES_DONE = 15 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
 
 #pragma pack(push, 1)
@@ -50,6 +53,7 @@ typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; npc_state npc[MAX_
 static void guest_on_state(const char *buf, int n);
 static void guest_on_item(const char *buf, int n);
 static void guest_on_save(const char *buf, int n);
+static void guest_on_saves_done(void);
 static void host_on_save_ack(const char *buf, int n);
 static void host_save_begin(void);
 static void guest_on_req(const char *buf, int n);
@@ -276,6 +280,8 @@ static void net_handle(const char *buf, int n, sid_t from)
 			}
 		} else if (h->type == PKT_SAVE) {
 		guest_on_save(buf, n);
+	} else if (h->type == PKT_SAVES_DONE) {
+		guest_on_saves_done();
 	} else if (h->type == PKT_ITEM) {
 		guest_on_item(buf, n);
 	} else if (h->type == PKT_STATE) {

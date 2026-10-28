@@ -14,6 +14,9 @@
 # folder does not exist yet) and deletes them, so the host has to transfer all ten saves; check_savexfer.py
 # is added to the checks.
 #
+# OBSCOOP_FLOW=menu: the TASK 12 flow instead of the new-game-first one — both copies stay at the main
+# menu, the host loads save 01 with the game's own LoadByName (start_menu_load.py).
+#
 # Starts only its own relays and games, kills only those, and every wait has a timeout. Prints each
 # check's output verbatim.
 
@@ -182,11 +185,17 @@ if [ -z "$HP" ] || [ -z "$GP" ] || [ "$(proc_image "$HP")" != Obscure2.exe ] || 
 fi
 echo "host pid $HP, guest pid $GP"
 
-if ! run_logged 210 "both into a 2P new game" "$PY" -I "$HERE/duo_start_game.py"; then
-	echo "duo_start_game did not finish"; RC=1
-fi
-if ! run_logged 180 "host loads save 01" "$PY" -I "$HERE/start_save.py" "$HP"; then
-	echo "start_save did not finish"; RC=1
+if [ "${OBSCOOP_FLOW:-newgame}" = menu ]; then
+	if ! run_logged 300 "both at the main menu, the host loads save 01" "$PY" -I "$HERE/start_menu_load.py"; then
+		echo "start_menu_load did not finish"; RC=1
+	fi
+else
+	if ! run_logged 210 "both into a 2P new game" "$PY" -I "$HERE/duo_start_game.py"; then
+		echo "duo_start_game did not finish"; RC=1
+	fi
+	if ! run_logged 180 "host loads save 01" "$PY" -I "$HERE/start_save.py" "$HP"; then
+		echo "start_save did not finish"; RC=1
+	fi
 fi
 
 # ---- convergence: bounded poll, memory only --------------------------------------------------------------

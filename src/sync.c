@@ -97,7 +97,11 @@ static CRITICAL_SECTION g_save_cs;
 static DWORD g_save_file, g_save_next;   // the file being sent and the next offset to read
 static int g_save_eof;                   // the file's last (short or empty) chunk has been queued
 static int g_save_active, g_save_n;      // transfer running; chunks in the window, in send order
+static int g_save_done_sent;             // the "all files acked" notice was sent for this welcome
 static save_chunk g_save_win[SAVE_WINDOW];
+// Guest: the host's transfer of all ten saves has finished, so a transferred file is complete on disk and
+// the guest may load it with the game's own menu path (real load, see request_real_load below).
+static volatile LONG g_saves_done;
 
 static void save_path(char *out, size_t n, const char *name)
 {
@@ -118,6 +122,7 @@ static void host_save_begin(void)
 	g_save_next = 0;
 	g_save_eof = 0;
 	g_save_n = 0;
+	g_save_done_sent = 0;
 	LeaveCriticalSection(&g_save_cs);
 }
 
@@ -131,9 +136,16 @@ static void host_send_saves(void)
 		return;
 	}
 	if (g_save_file > 9) {   // everything was acked (or skipped); wait for the next welcome
+		int tell = !g_save_done_sent;
+		g_save_done_sent = 1;
 		g_save_active = 0;
 		g_save_n = 0;
 		LeaveCriticalSection(&g_save_cs);
+		if (tell && g_peer_ok) {   // the guest may now load any of the transferred files (real load)
+			pkt_hdr h;
+			net_send(PKT_SAVES_DONE, &h, 0);
+			logf("host: save transfer finished, the guest may load a transferred save");
+		}
 		return;
 	}
 	DWORD now = GetTickCount();
@@ -218,12 +230,20 @@ static void host_on_save_ack(const char *buf, int n)
 	LeaveCriticalSection(&g_save_cs);
 }
 
+static void guest_on_saves_done(void)
+{
+	if (InterlockedExchange(&g_saves_done, 1) == 0)
+		logf("guest: the host's save transfer is complete (transferred saves may be loaded)");
+}
+
 static void guest_on_save(const char *buf, int n)
 {
 	if (n != (int)sizeof(pkt_save)) return;   // a short packet must not make us read past data[]
 	const pkt_save *p = (const pkt_save *)buf;
 	if (!memchr(p->name, 0, sizeof p->name)) return;
 	if (strncmp(p->name, "game", 4) || strstr(p->name, "..") || p->len > SAVE_CHUNK) return;
+	if (p->off == 0 && !strcmp(p->name, "game0.sav"))   // a new transfer starts with the first file
+		InterlockedExchange(&g_saves_done, 0);
 	char path[MAX_PATH]; save_path(path, sizeof path, p->name);
 	char dir[MAX_PATH]; _snprintf(dir, sizeof dir, "%s", path);
         char *slash = strrchr(dir, '\\'); if (slash) *slash = 0;
@@ -504,6 +524,133 @@ typedef int(__fastcall *equip_weapon_t)(void *human, void *edx, void *weapon, in
 static int code_ok(unsigned addr, const BYTE *prologue, int len)
 {
 	return mem_ok((const void *)(uintptr_t)addr, len) && !memcmp((const void *)(uintptr_t)addr, prologue, len);
+}
+
+// ---- a real save load through the game's own menu path -------------------------------------------
+// The menu's Load is two calls, not one (FINDINGS_12 (a), disassembly 0x5484ef..0x548514):
+//   1. the save manager (game+0x3e4) opens the file:  manager->open(name)  = FUN_0053d9b0
+//   2. the game is asked to load what it opened:      LoadByName(name)     = FUN_004a1bd0 (state 3)
+// The game's own update (FUN_004a5f20 -> FUN_004a5520) then reads the chunks into game+0x318 and builds
+// the level itself. Replaying the pair brings a copy that sits at the main menu straight into the save,
+// so the guest builds its own world from the same file instead of having the host's world patched into a
+// default one (FINDINGS_11: empty hands, 8 vs 43 world entities).
+// Both calls must run on the game's thread: the save manager allocates and reads inside the game, and the
+// request state machine is not thread-safe. They run from the game update hook (hk_game_update, hooks.c).
+#define LOAD_WAIT_MS 10000          // how long a real load may wait for its file (the save transfer may be running)
+static CRITICAL_SECTION g_rload_cs;
+static volatile LONG g_rload_want;   // 1 = a real load is waiting for the game thread
+static char g_rload_name[32];
+static char g_rload_src[8];          // "pipe" (host test command) or "host" (a request from the host)
+static DWORD g_rload_at;             // when the load was asked for (the wait is measured from it)
+static DWORD g_real_load_at;         // guest: when this copy's own real load was issued
+static volatile LONG g_real_load_stage;   // guest: 0 none, 1 issued, 2 the world it built is up
+
+// A copy may not load a save the host is still transferring: the file would be half written. The host
+// sends PKT_SAVES_DONE when the last chunk of the last save has been acked on the guest.
+static int save_file_ready(const char *name)
+{
+	char path[MAX_PATH];
+	if (!name[0])
+		return 0;
+	save_path(path, sizeof path, name);
+	if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+		return 0;
+	if (g_role == 2 && !g_saves_done)
+		return 0;
+	return 1;
+}
+
+// Ask the game thread for a real load. Safe from the pipe thread (host test command) and from the frame
+// tick (guest: a request from the host); the calls themselves happen in game_load_tick.
+static void request_real_load(const char *name, const char *src)
+{
+	EnterCriticalSection(&g_rload_cs);
+	_snprintf(g_rload_name, sizeof g_rload_name, "%s", name ? name : "");
+	_snprintf(g_rload_src, sizeof g_rload_src, "%s", src ? src : "");
+	g_rload_at = GetTickCount();
+	InterlockedExchange(&g_rload_want, 1);
+	LeaveCriticalSection(&g_rload_cs);
+	logf("%s: real load of \"%.31s\" requested (%s)", g_role == 2 ? "guest" : "host", g_rload_name, g_rload_src);
+}
+
+// The save manager's open-by-name (FUN_0053d9b0, thiscall: ECX = manager, one stack argument).
+typedef unsigned(__fastcall *save_open_t)(void *mgr, void *edx, const char *name);
+typedef void(__fastcall *load_name_t)(void *game, void *edx, unsigned name);
+
+static int game_save_open(unsigned game, const char *name)
+{
+	static const BYTE p_open[6] = { 0x55, 0x8b, 0xec, 0x6a, 0xff, 0x68 };
+	unsigned mgr = game ? rd32(game + 0x3e4) : 0;
+	if (!mgr || IsBadReadPtr((const void *)(uintptr_t)mgr, 0x200) || !code_ok(0x53d9b0, p_open, 6))
+		return 0;
+	return (int)((save_open_t)0x53d9b0)((void *)(uintptr_t)mgr, NULL, name);
+}
+
+// Guest: is this the level the guest has just loaded itself? Then a host level request for it must not
+// rebuild the world (the file already built it); it is a "verify", not a change.
+static int guest_owns_level(unsigned level)
+{
+	if (!g_real_load_at || (LONG)(GetTickCount() - g_real_load_at) > 25000)
+		return 0;
+	unsigned w = world_obj();
+	return w && rd32(w + 4) == level;
+}
+
+// Runs on the game's own thread, every frame, in every mode (main menu included).
+static void game_load_tick(unsigned game)
+{
+	if (!game)
+		return;
+	{   // the first call proves the hook really runs at the main menu
+		static int said;
+		if (!said) {
+			said = 1;
+			logf("%s: game update hook runs (mode %u world %#x)", g_role == 2 ? "guest" : "host",
+				rd32(game + 0x310), rd32(game + 0x378));
+		}
+	}
+	if (g_role == 2 && g_real_load_stage == 1 && rd32(game + 0x310) == 1 && rd32(game + 0x320) == 0 &&
+	    rd32(game + 0x378)) {
+		char lv[5];
+		g_real_load_stage = 2;
+		logf("guest: the world this copy built from the save itself is up (level %s, %u ms after the load)",
+			tag4(rd32(rd32(game + 0x378) + 4), lv), GetTickCount() - g_real_load_at);
+	}
+	if (!g_rload_want)
+		return;
+	char name[32], src[8];
+	DWORD at;
+	EnterCriticalSection(&g_rload_cs);
+	memcpy(name, g_rload_name, sizeof name);
+	memcpy(src, g_rload_src, sizeof src);
+	at = g_rload_at;
+	LeaveCriticalSection(&g_rload_cs);
+	name[sizeof name - 1] = 0;
+	src[sizeof src - 1] = 0;
+	DWORD now = GetTickCount();
+	if (!save_file_ready(name)) {
+		if ((LONG)(now - at) < LOAD_WAIT_MS)
+			return;   // still transferring (or not there yet): keep waiting, the request stays pending
+		logf("%s: real load of \"%s\" (%s) given up after %u ms: the save file is not complete on disk",
+			g_role == 2 ? "guest" : "host", name, src, now - at);
+		InterlockedExchange(&g_rload_want, 0);
+		return;
+	}
+	InterlockedExchange(&g_rload_want, 0);
+	int opened = game_save_open(game, name);
+	logf("%s: real load of \"%s\" (%s): the game's save open %s", g_role == 2 ? "guest" : "host", name, src,
+		opened ? "ok" : "FAILED");
+	if (!opened)
+		return;
+	if (g_role == 2) {   // the guest's own load: remember it, so the host's level request does not rebuild
+		g_real_load_at = now;
+		g_real_load_stage = 1;
+	}
+	// Call the hooked entry, not the trampoline: on the host this is what forwards REQ_LOAD_NAME to the
+	// guest, exactly like a menu load does.
+	((load_name_t)0x4a1bd0)((void *)(uintptr_t)game, NULL, (unsigned)(uintptr_t)name);
+	logf("%s: real load of \"%s\" issued (mode %u request state %u)", g_role == 2 ? "guest" : "host", name,
+		rd32(game + 0x310), rd32(game + 0x320));
 }
 
 // A character's weapon object in the world, found or built the way the game's inventory pass builds it.
@@ -1056,6 +1203,8 @@ static void guest_apply_regions(void)
 #define REQ_REPEAT_MS 250
 #define REQ_REPEAT_FOR 3500
 static DWORD g_req_rep_until, g_req_rep_at, g_req_rep_level, g_req_rep_entry, g_req_rep_flag;
+static DWORD g_req_rep_kind;              // REQ_LEVEL or REQ_LOAD_NAME (a load is as important as a level change)
+static char g_req_rep_name[32];
 
 static void host_level_request_repeat(unsigned level, unsigned entry, unsigned flag)
 {
@@ -1063,6 +1212,16 @@ static void host_level_request_repeat(unsigned level, unsigned entry, unsigned f
 	g_req_rep_level = level;
 	g_req_rep_entry = entry;
 	g_req_rep_flag = flag;
+	g_req_rep_kind = REQ_LEVEL;
+	g_req_rep_until = now + REQ_REPEAT_FOR;
+	g_req_rep_at = now;
+}
+
+static void host_load_request_repeat(const char *name)
+{
+	DWORD now = GetTickCount();
+	_snprintf(g_req_rep_name, sizeof g_req_rep_name, "%s", name ? name : "");
+	g_req_rep_kind = REQ_LOAD_NAME;
 	g_req_rep_until = now + REQ_REPEAT_FOR;
 	g_req_rep_at = now;
 }
@@ -1079,6 +1238,11 @@ static void host_repeat_tick(void)
 	if (now - g_req_rep_at < REQ_REPEAT_MS)
 		return;
 	g_req_rep_at = now;
+	if (g_req_rep_kind == REQ_LOAD_NAME) {
+		net_send_req(REQ_LOAD_NAME, 0, 0, 0, g_req_rep_name);
+		InterlockedIncrement(&g_req_sent);
+		return;
+	}
 	host_send_progress(1);   // the party table must reach the guest before the level change it belongs to
 	net_send_req(REQ_LEVEL, g_req_rep_level, g_req_rep_entry, g_req_rep_flag, NULL);
 	InterlockedIncrement(&g_req_sent);
@@ -1148,7 +1312,10 @@ static int g_req_head, g_req_tail;
 static DWORD g_lvl_req_done_a, g_lvl_req_done_b, g_lvl_req_done_at;   // the last level request this copy applied
 #define REQ_LEVEL_PARTY_WAIT 3000   // how long a level request may wait for the host's party table
 #define REQ_LEVEL_DONE_MS 4500      // the host repeats a level request for REQ_REPEAT_FOR: ignore the copies longer
+#define REQ_LOAD_DONE_MS 4500       // the same for a load request (the host repeats it too)
 static unsigned g_lvl_defer_level;  // the level request currently waiting for the host party (0 = none)
+static DWORD g_ln_done_at;          // the last load request this copy took
+static char g_ln_done_name[sizeof(((pkt_req *)0)->name)];
 
 static void guest_on_req(const char *buf, int n)
 {
@@ -1167,6 +1334,18 @@ static void guest_on_req(const char *buf, int n)
 		}
 		for (int i = g_req_head; i != g_req_tail; i = (i + 1) & 7)
 			if (g_req_q[i].kind == REQ_LEVEL && g_req_q[i].a == r->a && g_req_q[i].b == r->b) {
+				LeaveCriticalSection(&g_req_cs);
+				return;
+			}
+	}
+	if (r->kind == REQ_LOAD_NAME) {   // repeated like a level request: one real load per name
+		if (g_ln_done_at && !strncmp(r->name, g_ln_done_name, sizeof g_ln_done_name) &&
+		    now - g_ln_done_at < REQ_LOAD_DONE_MS) {
+			LeaveCriticalSection(&g_req_cs);
+			return;
+		}
+		for (int i = g_req_head; i != g_req_tail; i = (i + 1) & 7)
+			if (g_req_q[i].kind == REQ_LOAD_NAME && !strncmp(g_req_q[i].name, r->name, sizeof g_req_q[i].name)) {
 				LeaveCriticalSection(&g_req_cs);
 				return;
 			}
@@ -1250,6 +1429,14 @@ static void guest_apply_requests(void)
 			else
 				logf("guest: level request %s released after %u ms: host party arrived", tag4(r.a, lv), waited);
 		}
+		if (r.kind == REQ_LEVEL && g_role == 2 && guest_owns_level(r.a)) {
+			// This copy loaded the same save itself a moment ago and built that level from the file;
+			// the host's level request for it only has to verify, not rebuild (FINDINGS_12 (c)).
+			char lv[5];
+			logf("guest: host ChangeLevel %s dropped: this copy loaded that save itself %u ms ago",
+				tag4(r.a, lv), GetTickCount() - g_real_load_at);
+			continue;
+		}
 		unsigned g = game_obj();
 		if (!g)
 			continue;
@@ -1270,7 +1457,17 @@ static void guest_apply_requests(void)
 				g_load_progress((void *)(uintptr_t)g, NULL, r.a);
 			break;
 		case REQ_LOAD_NAME:
-			logf("guest: host LoadByName \"%s\"", r.name);
+			logf("guest: host LoadByName \"%s\" (world %s)", r.name, world_obj() ? "exists" : "none");
+			if (!world_obj()) {
+				// The guest sits at the main menu (no world): a bare LoadByName (state 3) would only
+				// re-read whatever the progress object already holds. Run the game's own menu load
+				// instead — open the transferred save file, then LoadByName — on the game thread, once
+				// the file is complete (FINDINGS_12 (b)/(c)).
+				g_ln_done_at = GetTickCount();
+				_snprintf(g_ln_done_name, sizeof g_ln_done_name, "%.63s", r.name);
+				request_real_load(r.name, "host");
+				break;
+			}
 			if (g_load_name)
 				g_load_name((void *)(uintptr_t)g, NULL, (unsigned)(uintptr_t)r.name);
 			break;
@@ -1359,6 +1556,7 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_rx_cs);
 	InitializeCriticalSection(&g_req_cs);
 	InitializeCriticalSection(&g_save_cs);
+	InitializeCriticalSection(&g_rload_cs);
 }
 
 static void frame_tick(void)
@@ -1427,4 +1625,8 @@ static void sync_status(char *reply, size_t replysz)
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | prog sent %ld rcv %ld applied %ld | npc sent %ld rcv %ld applied %ld snaps %ld blends %ld unmatched %ld | cam sets %ld", g_prog_chunks_sent, g_prog_chunks_rcv, g_prog_chunks_applied, g_npc_sent, g_npc_rcv,
 			g_npc_applied, g_npc_snaps, g_npc_blends, g_npc_unmatched, g_cam_sets);
+	l = strlen(reply);
+	if (l < replysz)
+		_snprintf(reply + l, replysz - l, " | saves_done %ld | real load stage %ld at %lu", (long)g_saves_done,
+			(long)g_real_load_stage, (unsigned long)g_real_load_at);
 }

@@ -23,6 +23,13 @@ user32 = ctypes.WinDLL('user32', use_last_error=True)
 gdi32 = ctypes.WinDLL('gdi32')
 
 WNDENUMPROC = ctypes.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
+# The window helpers take pointer-sized handles; without argtypes ctypes would pass HWND_TOPMOST (-1) as
+# 0x00000000FFFFFFFF and every call would quietly fail.
+user32.SetWindowPos.argtypes = [W.HWND, W.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+user32.SetWindowPos.restype = W.BOOL
+user32.GetWindowRect.argtypes = [W.HWND, ctypes.POINTER(W.RECT)]
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.mouse_event.argtypes = [W.DWORD, W.DWORD, W.DWORD, W.DWORD, ctypes.c_size_t]
 
 
 def window_of(pid):
@@ -93,16 +100,41 @@ def capture(pid, name):
     print('%s window %x iconic %d visible %d rect %dx%d at %d,%d foreground %d' % (
         name, hwnd, user32.IsIconic(hwnd), user32.IsWindowVisible(hwnd), r.right - r.left, r.bottom - r.top,
         r.left, r.top, user32.GetForegroundWindow() == hwnd))
-    for method in ('print', 'screen'):
-        w, hh, px, ok = grab(hwnd, method)
-        frac = nonblack(px)
-        print('%s: %s -> %dx%d ok %d, non-black %.1f%%' % (name, 'PrintWindow' if method == 'print' else 'screen BitBlt',
-                                                           w, hh, ok, frac * 100))
-        if frac > 0.01:
-            break
+    w = hh = None
+    px = None
+    for attempt in range(4):
+        for method in ('print', 'screen'):
+            w, hh, px, ok = grab(hwnd, method)
+            frac = nonblack(px)
+            print('%s: %s -> %dx%d ok %d, non-black %.1f%%' % (name, 'PrintWindow' if method == 'print' else 'screen BitBlt',
+                                                               w, hh, ok, frac * 100))
+            if frac > 0.01:
+                path = os.path.join(OUT, name + '.png')
+                write_png(path, w, hh, px)
+                print('%s: %s' % (name, path))
+                user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0001 | 0x0002)   # HWND_NOTOPMOST, NOMOVE|NOSIZE
+                return w, hh, px
+        # A D3D9 window that is covered or unfocused can hand out a black frame. Put it in front (topmost,
+        # without moving or resizing it); on the last attempt also click it, because some D3D apps stop
+        # presenting while they are not the active window.
+        if attempt == 0 or attempt == 1:
+            user32.ShowWindow(hwnd, 4)   # SW_SHOWNOACTIVATE
+            ok = user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)   # HWND_TOPMOST, NOMOVE|NOSIZE|SHOWWINDOW
+            print('%s: topmost %s' % (name, ok))
+            time.sleep(1.5)
+        elif attempt == 2:
+            r = W.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            x, y = (r.left + r.right) // 2, (r.top + r.bottom) // 2
+            user32.SetCursorPos(x, y)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)   # LEFTDOWN: a real click activates the window
+            user32.mouse_event(0x0004, 0, 0, 0, 0)   # LEFTUP
+            print('%s: clicked at %d,%d to activate it' % (name, x, y))
+            time.sleep(1.5)
+    user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0001 | 0x0002)   # HWND_NOTOPMOST, NOMOVE|NOSIZE
     path = os.path.join(OUT, name + '.png')
     write_png(path, w, hh, px)
-    print('%s: %s' % (name, path))
+    print('%s: %s (still black after 4 tries)' % (name, path))
     return w, hh, px
 
 

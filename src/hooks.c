@@ -53,7 +53,9 @@ static req1_t g_load_progress, g_load_name;
 static req0_t g_to_menu;
 static party_t g_party_table;
 static void host_level_request_repeat(unsigned level, unsigned entry, unsigned flag);   // sync.c
+static void host_load_request_repeat(const char *name);   // sync.c
 static int guest_party_copy(unsigned level, BYTE *out);   // sync.c: the host's party table for this level
+static void game_load_tick(unsigned game);                // sync.c: a real save load, on the game thread
 
 static void __fastcall hk_change_level(void *game, void *edx, unsigned level, unsigned entry, unsigned flag)
 {
@@ -106,6 +108,7 @@ static void __fastcall hk_load_name(void *game, void *edx, unsigned name)
 	if (g_role == 1 && !g_apply_host_req && g_peer_ok && name) {
 		net_send_req(REQ_LOAD_NAME, 0, 0, 0, (const char *)name);
 		InterlockedIncrement(&g_req_sent);
+		host_load_request_repeat((const char *)name);   // PKT_REQ has no ack: repeat it for a moment
 	}
 }
 
@@ -165,6 +168,20 @@ static void __fastcall hk_input_update(void *self, void *edx, int dt)
 		g_input_update(self, edx, dt);
 }
 
+// The game object's per-frame update (FUN_004a5f20, prologue 55 8b ec 56 8b f1) runs in every mode,
+// the main menu included, and is where the request state machine (game+0x320) is executed. A real save
+// load needs the game's own thread (the save manager allocates and reads inside the game's memory), so
+// the pending load is issued from here, just before the state machine runs (sync.c: game_load_tick).
+typedef void(__fastcall *game_update_t)(void *, void *, int);
+static game_update_t g_game_update;
+
+static void __fastcall hk_game_update(void *game, void *edx, int dt)
+{
+	game_load_tick((unsigned)(uintptr_t)game);
+	if (g_game_update)
+		g_game_update(game, edx, dt);
+}
+
 static void install_request_hooks(void)
 {
 	static const BYTE p_change[6] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08 };
@@ -180,4 +197,7 @@ static void install_request_hooks(void)
 		"CharacterControllerInput update (0x4cf940)");
 	static const BYTE p_party[6] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08 };
 	g_party_table = (party_t)hook_entry((BYTE *)0x4a20c0, p_party, 6, (void *)hk_party_table, "party table (0x4a20c0)");
+	static const BYTE p_update[6] = { 0x55, 0x8b, 0xec, 0x56, 0x8b, 0xf1 };
+	g_game_update = (game_update_t)hook_entry((BYTE *)0x4a5f20, p_update, 6, (void *)hk_game_update,
+		"game update (0x4a5f20)");
 }

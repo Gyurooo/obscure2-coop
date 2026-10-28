@@ -988,6 +988,7 @@ static void watch_start(DWORD addr, DWORD ms)
 //   unpad <user>                                    give the user index back to the real device
 //   key <DIK hex> <0|1>                             virtual keyboard key up/down
 //   mouse <dx> <dy> <buttons hex>                   add mouse movement, set button bits
+//   loadsave <name>                                 run the game's own menu Load for that save file
 //   ping                                            -> pong <pid>
 
 static void vpad_set(int user, int on, unsigned buttons, int lx, int ly, int rx, int ry, int lt, int rt)
@@ -1003,6 +1004,7 @@ static void vpad_set(int user, int on, unsigned buttons, int lx, int ly, int rx,
 }
 
 static unsigned player_human(int player);   // sync.c
+static void request_real_load(const char *name, const char *src);   // sync.c: the game's own save load
 
 static volatile float g_view[16];            // window.c: the last view matrix
 static volatile LONG g_view_sets, g_xf_sets;
@@ -1082,6 +1084,18 @@ static void handle_command(char *line, char *reply, size_t replysz)
 				((void(__fastcall *)(void *, void *, unsigned, unsigned, unsigned))0x4a1c00)((void *)(uintptr_t)g, NULL, t, (unsigned)entry, (unsigned)flag);
 				_snprintf(reply, replysz, "ok");
 			}
+		}
+	} else if (!strncmp(line, "loadsave ", 9)) {
+		// Test-only: replay the game's own menu Load for a named save file. The menu's Load does two
+		// things (disassembly 0x5484ef..0x548514): the save manager opens the file (FUN_0053d9b0) and
+		// LoadByName (FUN_004a1bd0, request state 3) asks the game to load it. It runs on the game's own
+		// thread (game update hook), so it works from the main menu, where there is no pause menu.
+		char name[32] = "";
+		if (sscanf(line + 9, "%31s", name) != 1 || !name[0]) {
+			_snprintf(reply, replysz, "error loadsave <save file name, e.g. game0.sav>");
+		} else {
+			request_real_load(name, "pipe");
+			_snprintf(reply, replysz, "ok real load of \"%s\" requested (the game thread runs it)", name);
 		}
 	} else if (!strncmp(line, "wr ", 3)) {
 		// wr <addr hex> <hex bytes>: test-only memory write into the game process (never used by the mod).
