@@ -1040,6 +1040,7 @@ static int tp_request(int pl, float x, float y, float z, int have_z, float dx, f
 static int level_request(unsigned tag, int entry, int flag, char *reply, size_t replysz);   // sync.c: pipe `level`
 static int item_use_request(int player, unsigned tag, char *reply, size_t replysz);   // sync.c: pipe `useitem` (host)
 static int item_use_forward(int player, unsigned tag, char *reply, size_t replysz);   // sync.c: pipe `useitem` (guest)
+static int aptitude_done_request(int player, char *reply, size_t replysz);   // sync.c: pipe `aptdone` (TEST ONLY)
 
 static volatile float g_view[16];            // window.c: the last view matrix
 static volatile LONG g_view_sets, g_xf_sets;
@@ -1345,6 +1346,17 @@ static void handle_command(char *line, char *reply, size_t replysz)
 				item_use_forward(pl, tag, reply, replysz);
 			else
 				item_use_request(pl, tag, reply, replysz);
+		}
+	} else if (!strncmp(line, "aptdone", 7)) {
+		// aptdone <0|1>: TEST-ONLY (TASK 28). The lock-picking mini-game is a 3-D lock turned with the
+		// sticks and the bot cannot play it, so this runs the game's OWN completion on the acting copy:
+		// the lock's use method (vtable+0x70) with the character after the front-side flag (+0x104 = 1)
+		// its own check sets, then its stop method (vtable+0x74). Runs on the game thread.
+		int pl = -1;
+		if (sscanf(line + 7, "%d", &pl) != 1 || pl < 0 || pl > 1) {
+			_snprintf(reply, replysz, "error aptdone <0|1>");
+		} else {
+			aptitude_done_request(pl, reply, replysz);
 		}
 	} else if (!strncmp(line, "charset ", 8)) {
 		// charset <0|1> <life>: TEST-ONLY (TASK 24). Sets a PLAYER character's life through the same

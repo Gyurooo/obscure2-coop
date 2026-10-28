@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 14   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 15   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -33,9 +33,12 @@
                         //     broken state and drop item on both copies
                         // 14: TASK 27: a PKT_PROP break also names the character that was holding the prop, so the
                         //     peer finds it by the hand it is in (a carried chair's position is no identity)
+                        // 15: TASK 28, PKT_APT: an aptitude object's result (lock picked -> door unlocked, heavy
+                        //     case moved) reaches the other copy as the fields/position it changed
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
-	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20 };
+	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,
+	PKT_APT = 21 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
 
 #pragma pack(push, 1)
@@ -91,6 +94,14 @@ typedef struct { pkt_hdr h; DWORD kind; DWORD level; DWORD ch_tag; DWORD cls, id
 #define PROP_STATE_MAX 24
 typedef struct { DWORD cls, id, drop_cls, drop_id; float pos[3], drop_pos[3]; } prop_state;
 typedef struct { pkt_hdr h; DWORD level; DWORD n; prop_state e[PROP_STATE_MAX]; } pkt_props;
+// TASK 28: an aptitude object's result. kind 1 = the character just started an ability on cls/id (action;
+// the peer only logs it - the animation follows in ch_state); kind 2 = the object's result: the fields and
+// the position that changed, so the peer writes exactly those (and only where its own value still equals
+// the sender's "before"). cls/id/pos name the object (class tag +0x10, id +4, position +0x6c); ch_tag is
+// the character that ran the ability.
+#define APT_FIELDS 10
+typedef struct { pkt_hdr h; DWORD kind; DWORD level; DWORD ch_tag; DWORD cls, id; float before[3];
+                 DWORD old[APT_FIELDS], now[APT_FIELDS]; float pos[3]; } pkt_apt;
 #pragma pack(pop)
 
 static void guest_on_state(const char *buf, int n);
@@ -108,6 +119,7 @@ static void peer_on_itemuse(const char *buf, int n);
 static void host_on_char(const char *buf, int n);
 static void peer_on_prop(const char *buf, int n);
 static void guest_on_props(const char *buf, int n);
+static void peer_on_apt(const char *buf, int n);
 static unsigned rd32(unsigned addr);      // sync.c
 static unsigned world_obj(void);          // sync.c
 static int guest_need_saves(void);        // sync.c: this process has no save file from the host yet
@@ -383,6 +395,9 @@ static void net_handle(const char *buf, int n, sid_t from)
 		case PKT_PROP:
 			peer_on_prop(buf, n);   // a prop carry/break from the guest (applied on the game thread)
 			break;
+		case PKT_APT:
+			peer_on_apt(buf, n);    // an aptitude result from the guest (applied on the game thread)
+			break;
 		}
 	} else if (g_role == 2) {
 		if (!g_peer_ok) {
@@ -423,6 +438,8 @@ static void net_handle(const char *buf, int n, sid_t from)
 		peer_on_prop(buf, n);
 	} else if (h->type == PKT_PROPS) {
 		guest_on_props(buf, n);
+	} else if (h->type == PKT_APT) {
+		peer_on_apt(buf, n);
 	} else if (h->type == PKT_STATE) {
 			guest_on_state(buf, n);
 		} else if (h->type == PKT_REGION) {

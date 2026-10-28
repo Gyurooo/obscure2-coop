@@ -92,10 +92,21 @@ static void attach_player2(void)
 	unsigned c2h = c2 + 4;             // the character pointer the mod writes
 	unsigned n = rd32(mgr + 4), arr = rd32(mgr + 0xc);
 	if (n < 2) return;
-	unsigned h2 = rd32(arr + 4);
+	// TASK 28: the partner is the first human that player 1 does NOT control. The old code took manager
+	// entry 1, which is the same character when the save's controller 1 record names the second entry
+	// (I015: the old party order is BOY1, BOY2 but player 1 drives BOY2) - player 2 then controlled
+	// player 1's character and the guest had no character of its own.
+	unsigned h1 = rd32(ctl + 4);
+	unsigned h2 = 0;
+	for (unsigned i = 0; i < n && i < 8; i++) {
+		unsigned h = rd32(arr + 4 * i);
+		if (h && h != h1) { h2 = h; break; }
+	}
+	if (!h2) h2 = rd32(arr + 4);
 	if (!h2 || IsBadWritePtr((void *)(uintptr_t)c2h, 4) || IsBadReadPtr((const void *)(uintptr_t)(h2 + 8), 4))
 		return;
-	if (!rd32(c2h))
+	unsigned cur = rd32(c2h);
+	if (!cur || cur == h1)
 		*(DWORD *)(uintptr_t)c2h = h2;   // input controller 2 controls the partner
 	unsigned hc = rd32(h2 + 8);          // the controller the partner's body answers
 	if (hc && hc != c2 && rd32(hc + 0xc) == 0x4348544d && rd32(c2 + 0xc) == 0x43484332 &&
@@ -1652,6 +1663,272 @@ static void props_dump(char *reply, size_t replysz)
 	}
 }
 
+// ---- character abilities on level objects (TASK 28) ------------------------------------------------
+//
+// The aptitude objects are level entities: CToeLockPick (LCKP, Stan), CToeHeavyCase (HCAS, Sven/Kenny),
+// CToeDiscLock (DISL, Mei), CToeDocument (DOC., Amy), CToeDarkAura* (Shannon). An ability does not change
+// the synced inventory or the progress block alone: the game changes THE OBJECT (the lock is used up, the
+// case slides) and the door the object belongs to. The owner of the acting character announces the action
+// (kind 1) and, when the object's state/position changes, exactly those fields (kind 2). The other copy
+// writes a field only where its own value still equals the sender's "before", so an unrelated local change
+// is not overwritten. The mini-game itself is never run on the peer. Watched: the aptitude objects and the
+// doors near them (a picked lock / absorbed aura opens its door).
+#define APT_MAX 12
+static const unsigned APT_OFF[APT_FIELDS] = { 0x20, 0x24, 0xa8, 0x120, 0x124, 0x128, 0x184, 0x1ec, 0x1f0, 0x150 };
+
+typedef struct { unsigned ent; DWORD cls, id; DWORD v[APT_FIELDS]; float pos[3]; } apt_slot;
+static apt_slot g_apts[APT_MAX];
+static int g_apt_n;
+static DWORD g_apt_level, g_apt_scan_at;
+static volatile LONG g_apt_sent, g_apt_rcv, g_apt_applied, g_apt_actions;
+
+static int apt_class(DWORD t)
+{
+	return t == 0x4c434b50 /*LCKP*/ || t == 0x48434153 /*HCAS*/ || t == 0x4449534c /*DISL*/ ||
+	       t == 0x444f432e /*DOC.*/ || t == 0x44415552 /*DAUR*/ || t == 0x44415531 /*DAU1*/ ||
+	       t == 0x44415532 /*DAU2*/ || t == 0x44415533 /*DAU3*/;
+}
+
+static int door_class(DWORD t)
+{
+	return t == 0x444f5248 /*DORH*/ || t == 0x444f444f /*DODO*/ || t == 0x494e444f /*INDO*/;
+}
+
+static void apt_read(apt_slot *a)
+{
+	for (int i = 0; i < APT_FIELDS; i++)
+		a->v[i] = rd32(a->ent + APT_OFF[i]);
+	if (mem_ok((const void *)(uintptr_t)(a->ent + 0x6c), 12))
+		memcpy(a->pos, (const void *)(uintptr_t)(a->ent + 0x6c), sizeof a->pos);
+}
+
+static float adist(const float *a, const float *b)
+{
+	float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+	return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+
+// Rebuilds the watched table from the level entity list: aptitude objects, plus the doors near one.
+static void apt_scan(unsigned w, DWORD level)
+{
+	int was_n = g_apt_n;
+	DWORD old_level = g_apt_level;
+	apt_slot old[APT_MAX];
+	memcpy(old, g_apts, sizeof(apt_slot) * (size_t)g_apt_n);
+	g_apt_n = 0;
+	g_apt_level = level;
+	unsigned mgr = rd32(w + 0x1768);
+	unsigned node = mgr ? rd32(mgr + 8) : 0;
+	unsigned seen[600];
+	int nseen = 0;
+	while (node && nseen < 600) {
+		int dup = 0;
+		for (int k = 0; k < nseen; k++)
+			if (seen[k] == node) { dup = 1; break; }
+		if (dup)
+			break;
+		seen[nseen++] = node;
+		unsigned e = rd32(node), cls = e ? rd32(e + 0x10) : 0;
+		if (e && e > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)e, 0x200) && apt_class(cls) && g_apt_n < APT_MAX) {
+			apt_slot *a = &g_apts[g_apt_n++];
+			memset(a, 0, sizeof *a);
+			a->ent = e;
+			a->cls = cls;
+			a->id = rd32(e + 4);
+			apt_read(a);
+		}
+		node = rd32(node + 4);
+	}
+	// doors near an aptitude object (the door a picked lock / absorbed aura belongs to)
+	int apts = g_apt_n;
+	for (int pass = 0; pass < apts && g_apt_n < APT_MAX; pass++) {
+		unsigned head = mgr ? rd32(mgr + 8) : 0;
+		nseen = 0;
+		while (head && nseen < 600) {
+			int dup = 0;
+			for (int k = 0; k < nseen; k++)
+				if (seen[k] == head) { dup = 1; break; }
+			if (dup)
+				break;
+			seen[nseen++] = head;
+			unsigned e = rd32(head), cls = e ? rd32(e + 0x10) : 0;
+			head = rd32(head + 4);
+			if (!e || e <= 0x10000 || !door_class(cls) || IsBadReadPtr((void *)(uintptr_t)e, 0x200))
+				continue;
+			int have = 0;
+			for (int k = 0; k < g_apt_n; k++)
+				if (g_apts[k].ent == e) { have = 1; break; }
+			if (have || g_apt_n >= APT_MAX)
+				continue;
+			float p[3];
+			if (!mem_ok((const void *)(uintptr_t)(e + 0x6c), 12))
+				continue;
+			memcpy(p, (const void *)(uintptr_t)(e + 0x6c), sizeof p);
+			if (adist(p, g_apts[pass].pos) > 400.0f)
+				continue;
+			apt_slot *a = &g_apts[g_apt_n++];
+			memset(a, 0, sizeof *a);
+			a->ent = e;
+			a->cls = cls;
+			a->id = rd32(e + 4);
+			apt_read(a);
+		}
+	}
+	if (g_apt_n != was_n || level != old_level)
+		logf("%s: ability objects: %d watched entit%s in level %x", g_role == 2 ? "guest" : "host",
+		     g_apt_n, g_apt_n == 1 ? "y" : "ies", level);
+	if (level == old_level)   // same level: compare and announce what changed on this copy
+		for (int i = 0; i < g_apt_n; i++) {
+			apt_slot *a = &g_apts[i];
+			for (int j = 0; j < was_n; j++) {
+				if (old[j].ent != a->ent)
+					continue;
+				int fdiff = 0;
+				for (int f = 0; f < APT_FIELDS; f++)
+					if (old[j].v[f] != a->v[f])
+						fdiff = 1;
+				int pdiff = adist(old[j].pos, a->pos) > 0.5f;
+				if ((fdiff || pdiff) && !prop_applied_here(a->ent, 2500)) {
+					pkt_apt p;
+					memset(&p, 0, sizeof p);
+					p.kind = 2;
+					p.level = level;
+					p.cls = a->cls;
+					p.id = a->id;
+					memcpy(p.before, old[j].pos, sizeof p.before);
+					memcpy(p.pos, a->pos, sizeof p.pos);
+					for (int f = 0; f < APT_FIELDS; f++) {
+						p.old[f] = old[j].v[f];
+						p.now[f] = a->v[f];
+					}
+					net_send(PKT_APT, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+					InterlockedIncrement(&g_apt_sent);
+					char c[5];
+					logf("%s: ability result sent: %s id %s ent %x fields %d move %.1f",
+					     g_role == 2 ? "guest" : "host", tag4(a->cls, c), tag4(a->id, c), a->ent, fdiff,
+					     adist(old[j].pos, a->pos));
+				}
+				break;
+			}
+		}
+}
+
+// A result this copy applied from the peer must not be announced back.
+static void apt_apply_packet(const pkt_apt *p)
+{
+	unsigned best = 0;
+	float bd = 400.0f * 400.0f;
+	for (int i = 0; i < g_apt_n; i++) {
+		apt_slot *a = &g_apts[i];
+		if (a->cls != p->cls || (p->id && a->id && a->id != p->id))
+			continue;
+		float dx = a->pos[0] - p->before[0], dy = a->pos[1] - p->before[1], dz = a->pos[2] - p->before[2];
+		float d = dx * dx + dy * dy + dz * dz;
+		if (d < bd) { bd = d; best = a->ent; }
+	}
+	if (!best || IsBadWritePtr((void *)(uintptr_t)best, 0x200)) {
+		InterlockedIncrement(&g_apt_rcv);
+		return;
+	}
+	int wrote = 0;
+	for (int f = 0; f < APT_FIELDS; f++) {
+		unsigned off = APT_OFF[f];
+		if (p->old[f] == p->now[f])
+			continue;
+		if (rd32(best + off) == p->old[f]) {
+			*(DWORD *)(uintptr_t)(best + off) = p->now[f];
+			wrote++;
+		}
+	}
+	float np[3];
+	memcpy(np, (const void *)(uintptr_t)(best + 0x6c), sizeof np);
+	if (adist(np, p->before) <= 5.0f && adist(np, p->pos) > 0.1f) {
+		memcpy((void *)(uintptr_t)(best + 0x6c), p->pos, sizeof p->pos);
+		wrote++;
+	}
+	prop_mark_applied(best);
+	InterlockedIncrement(&g_apt_applied);
+	char c[5];
+	logf("%s: ability result applied: %s id %s ent %x (%d writes)", g_role == 2 ? "guest" : "host",
+	     tag4(p->cls, c), tag4(p->id, c), best, wrote);
+}
+
+static CRITICAL_SECTION g_aptq_cs;
+static pkt_apt g_aptq[16];
+static int g_aptq_head, g_aptq_tail;
+
+static void peer_on_apt(const char *buf, int n)
+{
+	if (n != (int)sizeof(pkt_apt))
+		return;
+	EnterCriticalSection(&g_aptq_cs);
+	if (((g_aptq_tail + 1) & 15) != g_aptq_head) {
+		memcpy(&g_aptq[g_aptq_tail], buf, sizeof(pkt_apt));
+		g_aptq_tail = (g_aptq_tail + 1) & 15;
+	}
+	LeaveCriticalSection(&g_aptq_cs);
+	InterlockedIncrement(&g_apt_rcv);
+}
+
+static void apt_tick(void)
+{
+	if (!g_role)
+		return;
+	unsigned w = world_obj(), g = game_obj();
+	if (!w || !g || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0)
+		return;
+	DWORD level = rd32(w + 4);
+	// apply what the peer announced (on the game thread)
+	for (;;) {
+		pkt_apt p;
+		EnterCriticalSection(&g_aptq_cs);
+		if (g_aptq_head == g_aptq_tail) {
+			LeaveCriticalSection(&g_aptq_cs);
+			break;
+		}
+		p = g_aptq[g_aptq_head];
+		g_aptq_head = (g_aptq_head + 1) & 15;
+		LeaveCriticalSection(&g_aptq_cs);
+		if (p.level == level) {
+			if (p.kind == 2) {
+				apt_apply_packet(&p);
+			} else {
+				char c[5], ch[5];
+				logf("%s: the peer's character %s started the ability on %s id %s (its animation follows)",
+				     g_role == 2 ? "guest" : "host", tag4(p.ch_tag, ch), tag4(p.cls, c), tag4(p.id, c));
+			}
+		}
+	}
+	DWORD now = GetTickCount();
+	if (now - g_apt_scan_at >= 150) {
+		g_apt_scan_at = now;
+		apt_scan(w, level);
+	}
+	// kind 1: the character this copy owns just started an ability on an aptitude object
+	unsigned me = player_human(g_role == 2 ? 1 : 0);
+	unsigned act = me ? rd32(me + 0x2bc) : 0;
+	static unsigned last_act;
+	if (act != last_act) {
+		last_act = act;
+		if (act && !IsBadReadPtr((void *)(uintptr_t)act, 0x200) && apt_class(rd32(act + 0x10))) {
+			pkt_apt p;
+			memset(&p, 0, sizeof p);
+			p.kind = 1;
+			p.level = level;
+			p.ch_tag = rd32(me + H_TAG);
+			p.cls = rd32(act + 0x10);
+			p.id = rd32(act + 4);
+			if (mem_ok((const void *)(uintptr_t)(act + 0x6c), 12))
+				memcpy(p.pos, (const void *)(uintptr_t)(act + 0x6c), sizeof p.pos);
+			net_send(PKT_APT, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+			InterlockedIncrement(&g_apt_actions);
+			char c[5], ch[5];
+			logf("%s: ability started here: %s id %s by %s", g_role == 2 ? "guest" : "host",
+			     tag4(p.cls, c), tag4(p.id, c), tag4(p.ch_tag, ch));
+		}
+	}
+}
+
 static void host_send_state(void)
 {
 	static DWORD last;
@@ -3205,6 +3482,89 @@ static int tp_request(int pl, float x, float y, float z, int have_z, float dx, f
 	}
 }
 
+// ---- TASK 28 TEST ONLY: finish a lock-picking mini-game the game's own way ---------------------------
+//
+// The CToeLockPick mini-game (FUN_004595f0, vtable+0x14) is a 3-D lock turned with the sticks; the bot
+// cannot play it. This command runs the game's OWN completion on the acting copy: the lock object's use
+// method (vtable+0x70 = FUN_0045ac10) with the character, in the state the game's own front-side check
+// sets (+0x104 = 1), then the lock's own stop method (vtable+0x74). The shipped sync never runs another
+// player's mini-game; this is a test tool like `netpause`/`netdroprx`.
+#define APT_IDLE 0
+#define APT_QUEUED 1
+#define APT_DONE 2
+#define APT_WAIT_MS 6000
+#define APT_LCKP 0x4c434b50   // "LCKP", the CToeLockPick class tag
+
+static CRITICAL_SECTION g_apt_cs;
+static volatile LONG g_apt_state, g_apt_verdict;
+static int g_apt_player;
+static char g_apt_msg[192];
+
+typedef void(__fastcall *apt_obj_t)(void *, void *, unsigned);
+
+// Game thread: complete the lock pick the character player `pl` is linked to (character+0x2bc).
+static void apt_frame(void)
+{
+	if (g_apt_state != APT_QUEUED)
+		return;
+	unsigned h = player_human(g_apt_player);
+	unsigned e = h ? rd32(h + 0x2bc) : 0;
+	unsigned cls = e ? rd32(e + 0x10) : 0;
+	char ch[5], c4[5];
+	if (!h || !e || cls != APT_LCKP || IsBadReadPtr((void *)(uintptr_t)e, 0x1c0)) {
+		_snprintf(g_apt_msg, sizeof g_apt_msg,
+		          "error aptdone: player %d is not using a lock pick (character %x action %x class %s)",
+		          g_apt_player + 1, h, e, e ? tag4(cls, c4) : "----");
+		g_apt_verdict = 0;
+		g_apt_state = APT_DONE;
+		return;
+	}
+	void **vt = *(void ***)(uintptr_t)e;
+	if (!vt || IsBadReadPtr(vt, 0x78)) {
+		_snprintf(g_apt_msg, sizeof g_apt_msg, "error aptdone: lock %x has no usable vtable", e);
+		g_apt_verdict = 0;
+		g_apt_state = APT_DONE;
+		return;
+	}
+	*(DWORD *)(uintptr_t)(e + 0x104) = 1;   // the front-side value FUN_0045a9e0 writes before its completion
+	((apt_obj_t)(uintptr_t)vt[0x70 / 4])((void *)(uintptr_t)e, NULL, h);   // the game's own completion branch
+	((apt_obj_t)(uintptr_t)vt[0x74 / 4])((void *)(uintptr_t)e, NULL, 3);   // the lock's own stop
+	_snprintf(g_apt_msg, sizeof g_apt_msg, "ok aptdone: lock %x completed through its own use+stop for %s",
+	          e, tag4(rd32(h + 0x14), ch));
+	g_apt_verdict = 1;
+	g_apt_state = APT_DONE;
+}
+
+// Pipe-thread side: queue the request for the game thread, wait for its verdict, return it.
+static int aptitude_done_request(int player, char *reply, size_t replysz)
+{
+	EnterCriticalSection(&g_apt_cs);
+	if (g_apt_state == APT_QUEUED) {
+		LeaveCriticalSection(&g_apt_cs);
+		_snprintf(reply, replysz, "error aptdone: another request is still in flight");
+		return 0;
+	}
+	g_apt_player = player & 1;
+	g_apt_msg[0] = 0;
+	g_apt_verdict = 0;
+	g_apt_state = APT_QUEUED;
+	LeaveCriticalSection(&g_apt_cs);
+	DWORD t0 = GetTickCount();
+	while (g_apt_state != APT_DONE) {
+		if (GetTickCount() - t0 > APT_WAIT_MS) {
+			g_apt_state = APT_IDLE;
+			_snprintf(reply, replysz, "error aptdone: the game thread did not run the request in %d s",
+			          APT_WAIT_MS / 1000);
+			return 0;
+		}
+		Sleep(10);
+	}
+	int ok = g_apt_verdict;
+	_snprintf(reply, replysz, "%s", g_apt_msg);
+	g_apt_state = APT_IDLE;
+	return ok;
+}
+
 // ---- level change on the game thread (pipe `level`) --------------------------------------------------
 //
 // FINDINGS_22 4.3: the pipe "level" command called the game's ChangeLevel (FUN_004a1c00) straight on the
@@ -3511,6 +3871,8 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_tp_cs);
 	InitializeCriticalSection(&g_lvl_cs);
 	InitializeCriticalSection(&g_iuse_cs);
+	InitializeCriticalSection(&g_aptq_cs);   // TASK 28
+	InitializeCriticalSection(&g_apt_cs);     // TASK 28 pipe `aptdone`
 }
 
 static void frame_tick(void)
@@ -3519,6 +3881,7 @@ static void frame_tick(void)
 	if (level_frame())   // a pipe level change was queued: run it here and leave the frame to the game
 		return;
 	tp_frame();   // safe teleport: must run with no peer too (TASK 17 Part A)
+	apt_frame();   // TASK 28 TEST ONLY: finish a queued lock-picking mini-game (pipe `aptdone`)
 	item_use_frame();   // a queued item use (pipe `useitem`, or the guest's PKT_ITEMUSE on the host)
 	if (!g_role)
 		return;
@@ -3566,6 +3929,7 @@ static void frame_tick(void)
 		host_apply_remote_char();   // the guest's own character: this copy follows what the guest streams
 		peer_apply_pickups();
 		prop_tick();                // TASK 26: chairs/boxes: carry and break state
+		apt_tick();                 // TASK 28: character abilities on level objects
 	} else {
 		attach_player2();
 		guest_apply_requests();
@@ -3575,6 +3939,7 @@ static void frame_tick(void)
 		guest_apply_npcs();
 		peer_apply_pickups();
 		prop_tick();                // TASK 26: chairs/boxes: carry and break state
+		apt_tick();                 // TASK 28: character abilities on level objects
 		guest_follow_own_player();
 		guest_record_history();
 		guest_debug_p1();
@@ -3603,6 +3968,11 @@ static void sync_status(char *reply, size_t replysz)
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | prop sent %ld rcv %ld applied %ld broke %ld drop %ld missing %ld",
 			g_prop_sent, g_prop_rcv, g_prop_applied, g_prop_broken, g_prop_drop, g_prop_missing);
+	l = strlen(reply);
+	l = strlen(reply);
+	if (l < replysz)
+		_snprintf(reply + l, replysz - l, " | apt sent %ld rcv %ld applied %ld actions %ld",
+			g_apt_sent, g_apt_rcv, g_apt_applied, g_apt_actions);
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | frames %ld", g_frames);
