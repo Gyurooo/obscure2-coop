@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 10   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 11   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -24,9 +24,11 @@
                         //    transfer sends the file the host's load named (o2.sav too), not only game0..9.sav
                         // 9: PKT_PICKUP: a placed world item collected on one copy is collected on the other (both directions)
                         // 10: npc_state carries the enemy's life (+0x320) and AI/death state (+0x2dc); the host owns them
+                        // 11: PKT_ITEMUSE: an item use on the guest's own player 2 is applied by the host (which owns the
+                        //     inventory and the character life), so it lands once and is not reverted by the next snapshot
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
-	PKT_SAVES_DONE = 15, PKT_PICKUP = 16 };
+	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
 
 #pragma pack(push, 1)
@@ -60,6 +62,10 @@ typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; npc_state npc[MAX_
 // A placed world item collected on one copy: the other copy collects the same level entity through the
 // game's own item collect method (class tag at item+0x10, id at item+4, position at item+0x6c).
 typedef struct { pkt_hdr h; DWORD level; DWORD cls; DWORD id; float pos[3]; DWORD ch_tag; } pkt_pickup;
+// A guest-side item use (TASK 24): the tag of the inventory item and the player who used it. The host
+// applies it through the game's own use method, because the inventory (PKT_ITEM) and the character life
+// (ch_state) are host-owned.
+typedef struct { pkt_hdr h; DWORD player; DWORD tag; } pkt_itemuse;
 #pragma pack(pop)
 
 static void guest_on_state(const char *buf, int n);
@@ -73,6 +79,7 @@ static void guest_on_req(const char *buf, int n);
 static void guest_on_npc(const char *buf, int n);
 static void guest_on_region(const char *buf, int n);
 static void peer_on_pickup(const char *buf, int n);
+static void peer_on_itemuse(const char *buf, int n);
 static volatile LONG g_join_pending;   // host: a guest just connected, send it the current state from the main thread
 
 #include "steam.c"
@@ -268,6 +275,9 @@ static void net_handle(const char *buf, int n, sid_t from)
 			break;
 		case PKT_PICKUP:
 			peer_on_pickup(buf, n);
+			break;
+		case PKT_ITEMUSE:
+			peer_on_itemuse(buf, n);
 			break;
 		}
 	} else if (g_role == 2) {

@@ -1032,6 +1032,8 @@ static void request_real_load(const char *name, const char *src);   // sync.c: t
 static int tp_request(int pl, float x, float y, float z, int have_z, float dx, float dy, int have_dir, int safe,
                       char *reply, size_t replysz);   // sync.c: the safe teleport (TASK 17 Part A)
 static int level_request(unsigned tag, int entry, int flag, char *reply, size_t replysz);   // sync.c: pipe `level`
+static int item_use_request(int player, unsigned tag, char *reply, size_t replysz);   // sync.c: pipe `useitem` (host)
+static int item_use_forward(int player, unsigned tag, char *reply, size_t replysz);   // sync.c: pipe `useitem` (guest)
 
 static volatile float g_view[16];            // window.c: the last view matrix
 static volatile LONG g_view_sets, g_xf_sets;
@@ -1296,6 +1298,51 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		} else {
 			g_npc_life_on = on;
 			_snprintf(reply, replysz, "ok npclife %d (enemy life/death application %s)", on, on ? "on" : "off");
+		}
+	} else if (!strncmp(line, "useitem ", 8)) {
+		// useitem <tag4> <0|1>: TEST-ONLY (TASK 24). Uses an inventory item through the game's own use
+		// method: the item object's vtable slot 28 (byte +0x70) with the character as the argument — the
+		// medikit heals maxlife*0.6 and takes one from the quantity (+0xc8), the energy drink maxlife*0.3.
+		// The host applies it on the game thread (frame_tick); a guest forwards PKT_ITEMUSE instead,
+		// because the host owns the inventory (PKT_ITEM) and the character life (ch_state).
+		char tname[8] = { 0 };
+		int pl = 0;
+		if (sscanf(line + 8, "%7s %d", tname, &pl) != 2 || strlen(tname) != 4 || pl < 0 || pl > 3) {
+			_snprintf(reply, replysz, "error useitem <tag4> <0|1>");
+		} else {
+			// Tags are stored the way tag4() prints them: the first character is the top byte ("MEDI" = 0x4d454449).
+			unsigned tag = ((unsigned char)tname[0] << 24) | ((unsigned char)tname[1] << 16) |
+			               ((unsigned char)tname[2] << 8) | (unsigned char)tname[3];
+			if (g_role == 2)
+				item_use_forward(pl, tag, reply, replysz);
+			else
+				item_use_request(pl, tag, reply, replysz);
+		}
+	} else if (!strncmp(line, "charset ", 8)) {
+		// charset <0|1> <life>: TEST-ONLY (TASK 24). Sets a PLAYER character's life through the same
+		// character life method npcset uses (vtable slot 9 = +0x24, delta semantics: life += want-before,
+		// clamped to max at +0x31c). The item-use test needs it: a medikit/energy drink only heals (and
+		// only consumes the item) while life < max, so the test lowers the life first.
+		int pl = 0;
+		float want = 0.0f;
+		if (sscanf(line + 8, "%d %f", &pl, &want) != 2 || pl < 0 || pl > 3) {
+			_snprintf(reply, replysz, "error charset <0|1> <life>");
+		} else {
+			unsigned addr = player_human(pl);
+			if (!addr || IsBadReadPtr((void *)(uintptr_t)addr, 0x330) || IsBadWritePtr((void *)(uintptr_t)(addr + 0x320), 4)) {
+				_snprintf(reply, replysz, "error charset: no character for player %d", pl);
+			} else {
+				void **vt = *(void ***)(uintptr_t)addr;
+				float before = *(float *)(uintptr_t)(addr + 0x320);
+				if (!vt || vt[9] == NULL || IsBadCodePtr((FARPROC)vt[9])) {
+					_snprintf(reply, replysz, "error charset: no life method on %x", addr);
+				} else {
+					((void(__thiscall *)(void *, float))vt[9])((void *)(uintptr_t)addr, want - before);
+					_snprintf(reply, replysz, "ok charset %d character %x life %.1f -> %.1f (asked %.1f) max %.1f",
+					          pl, addr, before, *(float *)(uintptr_t)(addr + 0x320), want,
+					          *(float *)(uintptr_t)(addr + 0x31c));
+				}
+			}
 		}
 	} else if (!strncmp(line, "npcset ", 7)) {
 		// npcset <hex npc> <life>: TEST-ONLY (TASK 23). Applies a life value to an enemy through the

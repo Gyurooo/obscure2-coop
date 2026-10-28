@@ -2314,6 +2314,213 @@ static int level_request(unsigned tag, int entry, int flag, char *reply, size_t 
 	}
 }
 
+// ---- item use, host-authoritative (task 24 ---------------------------------------------------------
+//
+// FINDINGS_24 section 4: an item is used through the item object's vtable slot 28 (byte +0x70) with the
+// character as the argument. That is the game's own path: the medikit (FUN_00450aa0) heals
+// character life (+0x320) by maxlife*0.6 through the character's own life method and takes one from the
+// item quantity (+0xc8); the energy drink (FUN_0044f6c0) heals maxlife*0.3. The whole body is guarded by
+// life < maxlife, so a use at full life neither heals nor consumes. The game keeps item+0xc8 equal to
+// the inventory entry's count (FUN_004b1000), so a consumed item is written back into entry+0xc.
+//
+// The host owns the inventory (PKT_ITEM) and the character life (ch_state): a use is applied on the HOST
+// and mirrored. A guest that uses an item (its own player 2) forwards PKT_ITEMUSE instead of applying
+// it locally — otherwise the host's next snapshot reverts the guest's heal and restores the quantity,
+// and a use applied on both copies would be counted twice.
+#define IUSE_IDLE 0
+#define IUSE_QUEUED 1
+#define IUSE_DONE 2
+#define IUSE_WAIT_MS 10000
+#define ITEM_USE_VT 0x70          // vtable slot 28 = "use on a character"
+
+static CRITICAL_SECTION g_iuse_cs;
+static volatile LONG g_iuse_state, g_iuse_verdict;
+static int g_iuse_player;
+static unsigned g_iuse_tag;
+static char g_iuse_msg[160];
+static volatile LONG g_itemuse_sent, g_itemuse_rcv, g_itemuse_applied;
+
+typedef unsigned(__stdcall *item_find_t)(unsigned tag);
+
+// The item object for an inventory entry: the game's own lookup first (FUN_004b0980 walks the created
+// objects for a class tag); when the saved item has no live object (measured: MEDI has none), build one
+// the way the game's inventory pass does - FUN_0045cdd0 creates the class instance and FUN_004b0300
+// copies flags/tag/id/quantity out of the 32-byte entry. Unlike a weapon it is NOT registered in the
+// world manager (it lives in the inventory), so it stays a hidden, collected item (+0xa8 = 1).
+static unsigned item_object(unsigned tag, unsigned entry)
+{
+	static const BYTE p_new[6] = { 0x55, 0x8b, 0xec, 0x6a, 0xff, 0x68 };
+	static const BYTE p_fill[6] = { 0x55, 0x8b, 0xec, 0x8b, 0x01, 0x8b };
+	unsigned obj = ((item_find_t)0x4b0980)(tag), w, mgr;
+	if (obj)
+		return obj;
+	if (!entry || !code_ok(0x45cdd0, p_new, 6) || !code_ok(0x4b0300, p_fill, 6))
+		return 0;
+	w = world_obj();
+	mgr = w ? rd32(w + 0x1768) : 0;
+	if (!mgr)
+		return 0;
+	obj = (unsigned)(uintptr_t)((new_weapon_t)0x45cdd0)((void *)(uintptr_t)mgr, NULL, tag);
+	if (!obj || IsBadWritePtr((void *)(uintptr_t)obj, 0x120))
+		return 0;
+	((fill_weapon_t)0x4b0300)((void *)(uintptr_t)entry, NULL, (void *)(uintptr_t)obj);
+	*(DWORD *)(uintptr_t)(obj + 0xa8) = 1;   // collected: in the inventory, not a placed world item
+	return obj;
+}
+
+// Game thread: apply one item use through the game's own use method. Returns 1 when it happened.
+static int item_use_apply(int player, unsigned tag, char *msg, size_t msg_sz)
+{
+	char t[5];
+	unsigned w = world_obj(), inv = w ? rd32(w + 0x1790) : 0, ch = player_human(player);
+	unsigned entry = 0, id = 0, n, item, vt, fn, i;
+	int qty0, qty1;
+	float before, maxlife;
+	if (!inv) {
+		_snprintf(msg, msg_sz, "error useitem: no inventory (no world yet)");
+		return 0;
+	}
+	if (!ch) {
+		_snprintf(msg, msg_sz, "error useitem: no character for player %d", player);
+		return 0;
+	}
+	n = rd32(inv + 4);
+	if (n > ITEM_MAX)
+		n = ITEM_MAX;
+	for (i = 0; i < n && !entry; i++) {
+		unsigned e = inv + 8 + i * 0x20;
+		if (rd32(e + 4) == tag) {   // entry: +0 flags, +4 tag, +8 id, +0xc count
+			entry = e;
+			id = rd32(e + 8);
+		}
+	}
+	if (!entry) {
+		_snprintf(msg, msg_sz, "error useitem: %s is not in the inventory", tag4(tag, t));
+		return 0;
+	}
+	qty0 = (int)rd32(entry + 0xc);
+	if (qty0 <= 0) {
+		_snprintf(msg, msg_sz, "error useitem: %s count is 0", tag4(tag, t));
+		return 0;
+	}
+	item = item_object(tag, entry);
+	if (!item) {
+		_snprintf(msg, msg_sz, "error useitem: no item object for %s (id %u)", tag4(tag, t), id);
+		return 0;
+	}
+	if (IsBadWritePtr((void *)(uintptr_t)(item + 0xc8), 4)) {
+		_snprintf(msg, msg_sz, "error useitem: bad item object %x for %s", item, tag4(tag, t));
+		return 0;
+	}
+	*(int *)(uintptr_t)(item + 0xc8) = qty0;   // the game keeps the item count equal to the entry count
+	vt = rd32(item);
+	fn = vt ? rd32(vt + ITEM_USE_VT) : 0;
+	if (!fn || IsBadCodePtr((FARPROC)fn)) {
+		_snprintf(msg, msg_sz, "error useitem: %s has no use method (vtable %x)", tag4(tag, t), vt);
+		return 0;
+	}
+	before = *(float *)(uintptr_t)(ch + 0x320);
+	maxlife = *(float *)(uintptr_t)(ch + 0x31c);
+	((void(__thiscall *)(void *, void *))fn)((void *)(uintptr_t)item, (void *)(uintptr_t)ch);
+	qty1 = *(int *)(uintptr_t)(item + 0xc8);
+	if (qty1 != qty0)
+		*(int *)(uintptr_t)(entry + 0xc) = qty1;   // one was consumed: write it back like the inventory pass does
+	_snprintf(msg, msg_sz, "ok useitem %s on player %d: life %.1f -> %.1f (max %.1f), count %d -> %d",
+	          tag4(tag, t), player, before, *(float *)(uintptr_t)(ch + 0x320), maxlife, qty0, qty1);
+	return 1;
+}
+
+// Any thread: hand a use to the game thread. One request at a time; a second one while one is queued is
+// dropped (an item use is not something to queue up).
+static void item_use_queue(int player, unsigned tag)
+{
+	EnterCriticalSection(&g_iuse_cs);
+	if (g_iuse_state != IUSE_QUEUED) {
+		g_iuse_player = player;
+		g_iuse_tag = tag;
+		g_iuse_msg[0] = 0;
+		g_iuse_verdict = 0;
+		g_iuse_state = IUSE_QUEUED;
+	}
+	LeaveCriticalSection(&g_iuse_cs);
+}
+
+// Game thread (frame_tick): apply a queued use.
+static void item_use_frame(void)
+{
+	if (g_iuse_state != IUSE_QUEUED)
+		return;
+	g_iuse_verdict = item_use_apply(g_iuse_player, g_iuse_tag, g_iuse_msg, sizeof g_iuse_msg);
+	if (g_iuse_verdict)
+		InterlockedIncrement(&g_itemuse_applied);
+	logf("%s: %s", g_role == 2 ? "guest" : "host", g_iuse_msg);
+	g_iuse_state = IUSE_DONE;
+}
+
+// Pipe-thread side (host or solo): queue the use, wait for the game thread's verdict.
+static int item_use_request(int player, unsigned tag, char *reply, size_t replysz)
+{
+	DWORD t0;
+	if (!world_obj()) {
+		_snprintf(reply, replysz, "error useitem: no world yet");
+		return 0;
+	}
+	EnterCriticalSection(&g_iuse_cs);
+	if (g_iuse_state == IUSE_QUEUED) {
+		LeaveCriticalSection(&g_iuse_cs);
+		_snprintf(reply, replysz, "error useitem: another use is still in flight");
+		return 0;
+	}
+	LeaveCriticalSection(&g_iuse_cs);
+	item_use_queue(player, tag);
+	t0 = GetTickCount();
+	while (g_iuse_state != IUSE_DONE) {
+		if (GetTickCount() - t0 > IUSE_WAIT_MS) {
+			g_iuse_state = IUSE_IDLE;
+			_snprintf(reply, replysz, "error useitem: the game thread did not run the request in %d s",
+			          IUSE_WAIT_MS / 1000);
+			return 0;
+		}
+		Sleep(10);
+	}
+	{
+		int ok = g_iuse_verdict;
+		_snprintf(reply, replysz, "%s", g_iuse_msg);
+		g_iuse_state = IUSE_IDLE;
+		return ok;
+	}
+}
+
+// Host network thread: the guest's own player used an item - apply it here, where the state is owned.
+static void peer_on_itemuse(const char *buf, int n)
+{
+	const pkt_itemuse *p = (const pkt_itemuse *)buf;
+	if (n != (int)sizeof *p || p->player > 3)
+		return;
+	InterlockedIncrement(&g_itemuse_rcv);
+	logf("host: guest asked for an item use (player %u, tag %u)", p->player, p->tag);
+	item_use_queue((int)p->player, p->tag);
+}
+
+// Guest: ask the host to apply a use instead of applying it here.
+static int item_use_forward(int player, unsigned tag, char *reply, size_t replysz)
+{
+	char t[5];
+	pkt_itemuse u;
+	memset(&u, 0, sizeof u);
+	u.player = (DWORD)player;
+	u.tag = tag;
+	if (!g_peer_ok) {
+		_snprintf(reply, replysz, "error useitem: no link to the host");
+		return 0;
+	}
+	net_send(PKT_ITEMUSE, &u, (WORD)(sizeof u - sizeof(pkt_hdr)));
+	InterlockedIncrement(&g_itemuse_sent);
+	_snprintf(reply, replysz, "ok useitem %s on player %d: forwarded to the host (it owns the inventory and the life)",
+	          tag4(tag, t), player);
+	return 1;
+}
+
 // ---- frame tick (Present hook, main thread) --------------------------------------------------------
 
 static void sync_init(void)
@@ -2328,6 +2535,7 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_pick_cs);
 	InitializeCriticalSection(&g_tp_cs);
 	InitializeCriticalSection(&g_lvl_cs);
+	InitializeCriticalSection(&g_iuse_cs);
 }
 
 static void frame_tick(void)
@@ -2335,6 +2543,7 @@ static void frame_tick(void)
 	if (level_frame())   // a pipe level change was queued: run it here and leave the frame to the game
 		return;
 	tp_frame();   // safe teleport: must run with no peer too (TASK 17 Part A)
+	item_use_frame();   // a queued item use (pipe `useitem`, or the guest's PKT_ITEMUSE on the host)
 	if (!g_role)
 		return;
 	{
