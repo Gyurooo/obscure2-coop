@@ -138,3 +138,77 @@ re-aim ~6 times a second); it then walked 8335-11332 units on I007 and reached t
 What remains open is the door interaction itself: a `CToeDoor` that is eligible for the game's interaction
 scan (p20 = 1, gates 0, radius 200) is never selected at 61-70 units and does not open on A (FINDINGS_18
 §5).
+
+## TASK 17 Part C - forward play on the host copy (pid 34268, save slot 3)
+
+Walked to the level's own doors/loading zones with the pad (no teleport, no level tag requested).
+Every room the game put the player in is listed; a room with enemies was left and recorded.
+
+| # | room | level | entities | live items | enemies | spawners | items | player 1 |
+|---:|---|---|---:|---:|---:|---:|---|---|
+| 1 | start | J002 | 40 | 0 | 0 | 0 | - | (296.4, 757.3, -7.0) |
+
+
+## TASK 17 Part C - forward play on the host copy (pid 20320, save slot 8)
+
+Walked to the level's own doors/loading zones with the pad (no teleport, no level tag requested).
+Every room the game put the player in is listed; a room with enemies was left and recorded.
+
+| # | room | level | entities | live items | enemies | spawners | items | player 1 |
+|---:|---|---|---:|---:|---:|---:|---|---|
+| 1 | start | I004 | 14 | 0 | 0 | 0 | - | (671.2, 182.7, 0.7) |
+
+
+## TASK 19 — the interaction after a save load: every slot in one launch
+
+Tool: `tests/probe_slots19.py` (new). One host copy, all ten save slots, `loadsave gameN.sav` (the
+mod's replay of the menu's Load). For every level it prints the door and the save point with the fields
+their own eligibility check reads and then stands the character **40 units from the door's interaction
+anchor `+0x10c` / from the save point's position, facing it exactly** (`tp` takes `dx dy`), presses A and
+reads the entity's own use field **`+0xc4`** (the use functions `FUN_0042c2b0` / `FUN_0046e830` store the
+character there). No level tag is requested and the only write is the mod's own safe `tp`.
+
+| slot | file | level | door class | door `+0x24` | door USED? | save point `+0x14` | save point USED? | live items / enemies / spawners near the player |
+|---:|---|---|---|---:|---|---:|---|---|
+| 01 | game0.sav | I100 | CToeDoor | 1 | no | 3 | no | 0 / 0 / 0 |
+| 02 | game1.sav | I015 | CToeDoor | **0** | no (game refuses: `+0x24 == 0`) | 3 | no | 0 / 0 / 0 |
+| 03 | game2.sav | D003 | — | — | — | 3 | no | 0 / 0 / 0 |
+| 04 | game3.sav | J002 | CToeDoubleDoor | 1 | **USED** | 3 | no | 0 / 0 / 0 |
+| 05 | game4.sav | J005 | CToeDoubleDoor | 1 | no | 3 | no | 0 / 0 / 0 |
+| 06 | game5.sav | G003 | — | — | — | 3 | no | 0 / 0 / 0 |
+| 07 | game6.sav | H000 | — (live enemy 291 u away) | — | — | 3 | — | 0 / 1 / 0 |
+| 08 | game7.sav | H006 | CToeDoor | 1 | **USED** | 3 | no | 0 / 0 / 0 |
+| 09 | game8.sav | I004 | CToeDoor | 1 | **USED** | 3 | no | 0 / 0 / 0 |
+| 10 | game9.sav | I007 | CToeDoor | **0** | no (game refuses: `+0x24 == 0`) | 3 | no | 0 / 0 / 0 |
+
+What the table says (OBSERVED):
+
+* **A door after a save load does work.** In J002, H006 and I004 the game's own use function took the
+  character the moment it stood inside the door's 80-unit reach (`+0x10c`) and faced the door - the two
+  conditions `FUN_0042a480` actually tests. That is the answer to TASK 18 §5: its `+0x73c` measurement
+  could not see a door use, its walker stopped 60-80 units off the *rendered* position (not the anchor)
+  and never guaranteed the facing.
+* **The I007 door (slot 10, TASK 18's target) is disabled by the game**: `entity+0x24 == 0`, and
+  `FUN_0042a480` returns 0 on its first line for that. I015's door is the same. No player can use them
+  in those saves.
+* **I100 and J005 stay unexplained**: a door with `+0x24 = 1`, no gates, the character 37-40 units from
+  the anchor with the facing dot at +0.97..+1.00 and still no use. The only unmeasured gate left is the
+  scan's own `character->vtable+0x90(2)` (`FUN_004dca40`), which looks up level objects and returns 0
+  when one of them is present (DERIVED). Recorded as UNKNOWN.
+* **No save point fired anywhere.** Every `CToeSavePoint` has `+0x24 = 1`, `+0xb8 = 0`, `+0x150 = 1`,
+  `+0x14 = 3` and sits 97-443 units above the character's floor. The disassembly of `FUN_0046e6c0`
+  (0x46e6c0-0x46e825) shows **no `+0x14` compare** - the decompile's `entity+0x14 == 0` clause does not
+  exist in the machine code - so the remaining candidates are the 2-D facing (satisfied: the placement
+  faced the entity) and `entity+0x15c -> FUN_00484e70(character+0x23c)`, a spatial test the character
+  could not satisfy because the safe `tp` put it on the floor below the save point's ledge.
+* **No level has a live collectable item** (0 in all ten), the same result SLOT_SCAN §1 recorded in
+  TASK 15: the item entities in these saves are carried objects with `+0x20 = 0`.
+
+### The two walker runs in TASK 19 (fixed walker: aim at `+0x10c`, face it, read `+0xc4`)
+
+| run | slot | level | walked | outcome |
+|---|---|---:|---:|---|
+| `run_pf19a` | 04 (game3.sav) | J002 | 0 | stick calibration failed in this room ("right" only +20 deg from "up", not camera-relative) and the walker got stuck on a wall 115 units from the start; never reached the door (466 away) |
+| `run_pf19b` | 09 (game8.sav) | I004 | 2435 | calibration OK (camera-relative model detected); reached **79 units** of the door's anchor and `face: character forward is 0.73 aligned`; the room's walls kept it 145 units away at the A presses (the check needs <= 80), so no door use |
+
+No door transition and no new room happened on foot in this task, so this table has no second room.

@@ -93,14 +93,24 @@ def cam_yaw():
 
 
 def classify():
-    """Every level entity this check can use, with its position and its distance to player 1."""
+    """Every level entity this check can use, with its position and its distance to player 1.
+
+    TASK 19: a door's eligibility check `FUN_0042a480` measures the 80-unit reach to **entity+0x10c..
+    +0x114** (an interaction anchor the entity copies from its own position when it is parsed) and wants
+    `dot(character forward, entity+0x13c..+0x144) >= 0.5`; a save point (`FUN_0046e6c0`) wants
+    `dot(unit(character -> entity), character forward) > 0.5`. Both are recorded here so the walker aims
+    at and faces the right point."""
     p1 = player_pos(m, 0) or (0, 0, 0)
     out = dict(doors=[], zones=[], saves=[], sources=[], markers=[], other={})
     for e in entities(m):
         name = rtti(m, e)
         p = (f32(m, e + 0x6c), f32(m, e + 0x70), f32(m, e + 0x74))
         sane = all(abs(v) < 50000 for v in p) and any(abs(v) > 0.01 for v in p)
-        rec = dict(addr=e, rtti=name, id=tag(u32(m, e + 4)), pos=p, sane=sane, d=dist3(p, p1))
+        anchor = (f32(m, e + 0x10c), f32(m, e + 0x110), f32(m, e + 0x114))
+        if max(abs(v) for v in anchor) < 0.01 or any(abs(v) > 50000 for v in anchor):
+            anchor = None
+        rec = dict(addr=e, rtti=name, id=tag(u32(m, e + 4)), pos=p, sane=sane, d=dist3(p, p1), anchor=anchor,
+                   dir=(f32(m, e + 0x13c), f32(m, e + 0x140), f32(m, e + 0x144)))
         if name in DOOR_CLASSES:
             out['doors'].append(rec)
         elif name in ZONE_CLASSES:
@@ -362,6 +372,39 @@ class Walker:
                 break
         return self.walk_to(goal, tol=tol, limit=20.0)
 
+    def face(self, target, want=0.6, limit=4.0):
+        """Turn the character so its own forward vector (+0x248/+0x24c/+0x250, a unit vector) points at
+        `target`: the door check `FUN_0042a480` wants dot(forward, door+0x13c..+0x144) >= 0.5 and the
+        save point `FUN_0046e6c0` wants dot(unit(character -> entity), forward) > 0.5, so a character
+        that stops walking sideways never qualifies however close it stands (TASK 19). Short stick
+        bursts toward the target turn it without walking far."""
+        t0, best = time.time(), -1.0
+        while time.time() - t0 < limit:
+            p = player_pos(m, self.pl)
+            h = player_human(m, self.pl)
+            fx, fy = (f32(m, h + 0x248), f32(m, h + 0x24c)) if h else (0.0, 0.0)
+            d = (target[0] - p[0], target[1] - p[1])
+            n = (d[0] ** 2 + d[1] ** 2) ** 0.5 or 1.0
+            cur = (d[0] / n) * fx + (d[1] / n) * fy
+            best = max(best, cur)
+            if cur >= want:
+                stick_off()
+                print('   face: character forward is %.2f aligned with the target' % cur)
+                return True
+            lx, ly = self.stick_for(d)
+            stick_set(lx * 0.35, ly * 0.35)     # a nudge: turns far more than it walks
+            time.sleep(0.18)
+        stick_off()
+        print('   face: could not turn the character onto the target (best alignment %.2f)' % best)
+        return False
+
+
+def used_by(rec):
+    """The entity's own "user" field +0xc4: the base use path `FUN_00402840(character)` (called first by
+    the door's `FUN_0042c2b0` and the save point's `FUN_0046e830`) stores the character there. A door use
+    need not change the level, so this is the only reliable sign that the interaction fired."""
+    return u32(m, rec['addr'] + 0xc4)
+
 
 def wait_transition(old_level, old_world, old_pos, limit=20.0):
     """The game's own transition: a new level tag, a new world, or the character moved far."""
@@ -398,45 +441,56 @@ def interact_target():
 
 
 def try_door(rec, walker, kind, markers=()):
-    """Walk to the door/zone and use it the way a player does, then wait for the game's transition."""
+    """Walk to the door/zone and use it the way a player does, then wait for the game's transition.
+
+    TASK 19: the door's own eligibility check (`FUN_0042a480`) measures its 80-unit reach from
+    **entity+0x10c..+0x114** (an interaction anchor 54-90 units off the rendered position in the levels
+    measured) and wants `dot(character forward, door+0x13c..+0x144) >= 0.5`, so the walk goal is the
+    anchor and `Walker.face()` turns the character onto it before A. `used_by(rec)` (entity+0xc4 = the
+    character, written by the use function `FUN_0042c2b0`) catches a door that opens without a level
+    change, which level/world watching alone cannot see."""
     print('\n== %s %s id %s at (%.2f, %.2f, %.2f), %.0f away: walking there'
           % (kind, rec['rtti'], rec['id'], rec['pos'][0], rec['pos'][1], rec['pos'][2], rec['d']))
     p = player_pos(m, 0)
-    # stop ~80 units in front of the door, on the player's side, so the A press finds the door in range
-    d = (rec['pos'][0] - p[0], rec['pos'][1] - p[1])
+    aim = rec.get('anchor') or rec['pos']
+    if aim is not rec['pos'] and dist3(aim, rec['pos']) > 1.0:
+        print('   its interaction anchor +0x10c is at (%.2f, %.2f, %.2f), %.0f from the rendered position'
+              % (aim[0], aim[1], aim[2], dist3(aim, rec['pos'])))
+    d = (aim[0] - p[0], aim[1] - p[1])
     n = (d[0] ** 2 + d[1] ** 2) ** 0.5 or 1.0
-    goal = (rec['pos'][0] - d[0] / n * 80.0, rec['pos'][1] - d[1] / n * 80.0, rec['pos'][2])
+    goal = (aim[0] - d[0] / n * 45.0, aim[1] - d[1] / n * 45.0, aim[2])
     old_lv, old_w = level(m), world(m)
-    reached = walker.walk_via(goal, markers, tol=90.0)
+    reached = walker.walk_via(goal, markers, tol=60.0)
     if not reached:
-        # fall back to the door itself (a loading zone triggers on its own centre, a door may be wide)
-        reached = walker.walk_to(rec['pos'], tol=60.0, limit=20.0)
-    near = dist2d(player_pos(m, 0), rec['pos'])
+        reached = walker.walk_to(goal, tol=40.0, limit=15.0)
+    near = dist2d(player_pos(m, 0), aim)
     if not reached and near > 250.0:
-        print('   could not reach the %s (character at %s, %.0f from it)' % (kind, player_pos(m, 0), near))
+        print('   could not reach the %s (character at %s, %.0f from its anchor)' % (kind, player_pos(m, 0), near))
         return None
     if not reached:
-        print('   gave up %.0f short of the %s but that is close enough to try it' % (near, kind))
+        print('   gave up %.0f short of the %s anchor but that is close enough to try it' % (near, kind))
     old_p = player_pos(m, 0)   # the transition is measured from HERE, not from where the walk started
-    print('   at the %s: character %s (%.0f from it, its radius +0xa0 = %s), interaction scan target +0x73c = %#x (%s)'
-          % (kind, old_p, dist2d(old_p, rec['pos']), f32(m, rec['addr'] + 0xa0),
-             interact_target(), rtti(m, interact_target()) if interact_target() else '-'))
+    print('   at the %s: character %s (%.0f from its anchor, radius +0xa0 = %s, entity+0xc4 = %#x)'
+          % (kind, old_p, near, f32(m, rec['addr'] + 0xa0), used_by(rec)))
     if kind == 'door':
         for attempt in range(4):
+            walker.face(aim)
             print('   pressing A (attempt %d)' % (attempt + 1))
             press(pipe, 0, 'A', 0.4)
-            time.sleep(1.5)
-            how = wait_transition(old_lv, old_w, old_p, 6.0)
+            time.sleep(1.2)
+            how = wait_transition(old_lv, old_w, old_p, 5.0)
             if how:
                 return how
+            if player_human(m, 0) and used_by(rec) == player_human(m, 0):
+                print('   *** the door took the character (entity+0xc4 = %#x): the interaction fired'
+                      % used_by(rec))
+                return 'used (door opened, level unchanged)'
             if attempt in (0, 1):
-                # walk right onto the door itself, then press again
-                print('   no transition yet; walking onto the door itself (%s)' % (rec['pos'],))
-                if walker.walk_to(rec['pos'], tol=40.0, limit=10.0):
-                    print('   interaction scan target +0x73c = %#x (%s)'
-                          % (interact_target(), rtti(m, interact_target()) if interact_target() else '-'))
+                # step onto the anchor itself, face it again, then press once more
+                walker.walk_to(aim, tol=25.0, limit=8.0)
         print('   no transition')
         return None
+    walker.face(aim)
     return wait_transition(old_lv, old_w, old_p, 15.0)
 
 
@@ -448,11 +502,14 @@ def save_here(c):
     rec = c['saves'][0]
     print('\n== save: walking to %s id %s at (%.2f, %.2f, %.2f)'
           % (rec['rtti'], rec['id'], rec['pos'][0], rec['pos'][1], rec['pos'][2]))
-    if not walker.walk_to(rec['pos'], tol=70.0):
+    if not walker.walk_to(rec['pos'], tol=45.0):
         print('   could not reach the save point')
         return None
+    walker.face(rec['pos'])     # FUN_0046e6c0 wants dot(unit(char -> entity), forward) > 0.5
     press(pipe, 0, 'A', 0.4)
     time.sleep(2.0)
+    print('   after A: entity+0xc4 = %#x (character %#x), mode %s'
+          % (u32(m, rec['addr'] + 0xc4), player_human(m, 0), mode()))
     out = os.path.join(ROOT, 'tests', 'shots', 'save_menu.png')
     try:
         os.makedirs(os.path.dirname(out), exist_ok=True)
