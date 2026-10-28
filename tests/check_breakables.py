@@ -7,11 +7,10 @@ What it does on the level the runner loaded (the chair is a level prop, class ta
      A again (swing -> break): the carry and the break must appear on BOTH copies, and the drop item the
      break enabled must be the same entity on both;
   3. the same for player 2 (the guest's own character) on the guest copy, with the chair it owns;
-  4. the sync's apply path: with the link paused (`netpause`, both copies) the host picks up and breaks a
-     chair the guest's copy never sees; after the pause the guest must converge on its own (the carry
-     heartbeat and the once-a-second prop state packet).
+  4. (removed in TASK 27) the paused-link apply-path phase: neither `netpause` nor a receive-only drop can
+     make a copy miss the break while it stays able to play - see the note in main().
 
-Read-only memory reads, the mod's own safe `tp` (or `tpraw` when the game refuses the settle) and normal
+Read-only memory reads, the mod's own safe `tp` and normal
 pad presses; `netpause` is the existing test-only link pause. Exit 0 = PASS or SKIP, 1 = FAIL.
 Usage: python -I check_breakables.py <host pid> <guest pid>
 """
@@ -133,6 +132,26 @@ def chair_of(m, key, tol=60.0):
     return best
 
 
+def chair_index(m, e):
+    """The chair's place in the copy's entity list. Both copies build that list from the same level file in
+    the same order (every run's listing shows it), so the index is a stable name for a prop that moves -
+    a chair in a character's hand is nowhere near where it was picked up."""
+    for i, c in enumerate(chairs(m)):
+        if c == e:
+            return i
+    return -1
+
+
+def chair_same(m_own, e_own, m_oth):
+    """The other copy's chair for this one: by list index when the two lists agree (same length and the same
+    class tag at that index), else by position."""
+    co = chairs(m_oth)
+    i = chair_index(m_own, e_own)
+    if 0 <= i < len(co) and u32(m_oth, co[i] + 0x10) == u32(m_own, e_own + 0x10):
+        return co[i]
+    return chair_of(m_oth, chair_key(m_own, e_own))
+
+
 def inv_count(m):
     w = world(m)
     inv = u32(m, w + 0x1790) if w else 0
@@ -163,13 +182,15 @@ def wait_for(fn, secs, step=0.1):
     return False, time.time() - t
 
 
-def tp_near(pipe, m, pl, target, fallback_raw=True):
-    """Put player `pl` next to `target` (x, y, z), facing it; the mod's safe tp first, tpraw if the game
-    refuses every settle. Returns (ok, how)."""
+def tp_near(pipe, m, pl, target):
+    """Put player `pl` next to `target` (x, y, z), facing it, through the mod's safe tp (it waits for the
+    game's own floor settle and restores the old position when there is none). Returns (ok, how).
+    A raw write is not used: the guest's own player 2 is re-snapped from the host's stream, so `tpraw`
+    reports `ok` for a position the game undoes a frame later, and the check then stood next to nothing."""
     hp = hpos(m, ctl_human(m, pl))
     tried = 0
-    for radius in (55.0, 75.0, 95.0, 30.0):
-        for ang in ((0, 90, 180, 270) if radius != 55.0 else (0, 90, 180, 270, 45, 135, 225, 315)):
+    for radius in (55.0, 45.0, 65.0, 75.0, 40.0, 95.0):
+        for ang in ((0, 45, 90, 135, 180, 225, 270, 315) if radius == 55.0 else (0, 90, 180, 270)):
             dx, dy = hp[0] - target[0], hp[1] - target[1]
             dd = (dx * dx + dy * dy) ** 0.5 or 1.0
             base = (dx / dd, dy / dd)
@@ -181,26 +202,27 @@ def tp_near(pipe, m, pl, target, fallback_raw=True):
             tried += 1
             if r.startswith('ok'):
                 return True, 'safe tp at %.0f units (%s)' % (radius, r)
-            if tried >= 6:
-                break
-        if tried >= 6:
-            break
-    if not fallback_raw:
-        return False, 'safe tp refused'
-    dx, dy = hp[0] - target[0], hp[1] - target[1]
-    dd = (dx * dx + dy * dy) ** 0.5 or 1.0
-    stand = (target[0] + dx / dd * 45.0, target[1] + dy / dd * 45.0, target[2])
-    r = pipe.cmd('tpraw %d %.3f %.3f %.3f %.3f %.3f' % (pl, stand[0], stand[1], stand[2],
-                                                        target[0] - stand[0], target[1] - stand[1]))
-    return r.startswith('ok'), 'tpraw (the safe tp refused every spot): %s' % r
+    return False, 'safe tp refused every spot (%d tried)' % tried
 
 
 def press_a(pipe, user, hold=0.2):
     bot.press(pipe, user, 'A', hold)
 
 
+def frames(pipe):
+    """The game ticks this copy has run (the `frames` counter at the end of `sync`). A copy whose game
+    thread stopped (a hang in the game's own update) stops counting while its network thread and the pipe
+    keep answering, so this is the only way a memory-reading check can tell the two apart."""
+    s = pipe.cmd('sync')
+    i = s.find('| frames ')
+    return s[i + 9:].strip() if i >= 0 else '?'
+
+
 def usable(m):
-    return [e for e in chairs(m) if u32(m, e + 0x24) and not u32(m, e + 0xa4) and sane(epos(m, e))]
+    # a chair in a character's hand is not a target: it moves with the character and its copy on the other
+    # side can be anywhere (TASK 27 run: a carried chair drifted 119 units away from its own pickup point)
+    return [e for e in chairs(m) if u32(m, e + 0x24) and not u32(m, e + 0xa4) and not u32(m, e + 0xc4)
+            and sane(epos(m, e))]
 
 
 def main():
@@ -234,24 +256,32 @@ def main():
     def one_player(owner, other, m_own, m_oth, pipe_own, pl, label):
         """pl 0 = player 1 (host copy), pl 1 = player 2 (guest copy)."""
         me = ctl_human(m_own, pl)
-        mine = [e for e in usable(m_own) if chair_key(m_own, e) not in used]
+        mine = [e for e in usable(m_own) if chair_index(m_own, e) not in used]
         if not mine:
             print('breakables: no chair left for %s (SKIP)' % label)
             return
-        e = min(mine, key=lambda x: d3(epos(m_own, x), hpos(m_own, me)))
-        used.add(chair_key(m_own, e))
-        print('\nbreakables: %s -> chair %s' % (label, describe(m_own, e)))
-        ok, how = tp_near(pipe_own, m_own, pl, epos(m_own, e))
-        print('breakables: tp %s -> %s' % (label, how))
-        if not ok:
-            fails.append('%s: teleport refused' % label)
+        e = 0
+        ok, how = False, ''
+        for cand in sorted(mine, key=lambda x: d3(epos(m_own, x), hpos(m_own, me)))[:4]:
+            ok, how = tp_near(pipe_own, m_own, pl, epos(m_own, cand))
+            print('breakables: tp %s -> chair #%d: %s' % (label, chair_index(m_own, cand), how))
+            if ok:
+                e = cand
+                break
+        if not e:
+            fails.append('%s: no chair could be approached' % label)
             return
+        used.add(chair_index(m_own, e))
+        print('\nbreakables: %s -> chair #%d %s' % (label, chair_index(m_own, e), describe(m_own, e)))
         time.sleep(0.6)
-        key = chair_key(m_own, e)   # placing the character can push the chair
-        eo = chair_of(m_oth, key)
+
+        def other_chair():
+            return chair_same(m_own, e, m_oth)
+
+        eo = other_chair()
         if not eo:
-            print('breakables: the other copy has no chair at %s (FAIL)' % (key,))
-            fails.append('%s: the other copy has no chair at %s' % (label, key))
+            print('breakables: the other copy has no chair for #%d %s (FAIL)' % (chair_index(m_own, e), chair_key(m_own, e)))
+            fails.append('%s: the other copy has no chair for #%d' % (label, chair_index(m_own, e)))
             return
         print('  before: own %s | other %s' % (describe(m_own, e), describe(m_oth, eo)))
         # --- pick up
@@ -259,17 +289,28 @@ def main():
         for i in range(3):
             press_a(pipe_own, 0)
             okc, secs = wait_for(lambda: carry_of(m_own, pl) != 0, 1.2)
-            eo = chair_of(m_oth, key) or eo
             if okc:
                 got = True
                 break
+        if not got:
+            # the safe tp can settle the character further from the chair than the interaction reaches:
+            # place it again (it may settle closer this time) and press once more
+            ok, how = tp_near(pipe_own, m_own, pl, epos(m_own, e))
+            print('  no pickup after 3 presses; placed again: %s' % how)
+            time.sleep(0.4)
+            for i in range(2):
+                press_a(pipe_own, 0)
+                okc, secs = wait_for(lambda: carry_of(m_own, pl) != 0, 1.5)
+                if okc:
+                    got = True
+                    break
         if not got:
             print('  the action button did not pick the chair up (own carry %x)' % carry_of(m_own, pl))
             fails.append('%s: pickup did not happen' % label)
             return
         print('  picked up after %.2f s: own %s' % (secs, describe(m_own, e)))
-        okc, secs2 = wait_for(lambda: u32(m_oth, (chair_of(m_oth, key) or 0) + 0xc4) != 0, 2.5)
-        eo = chair_of(m_oth, key) or eo
+        okc, secs2 = wait_for(lambda: u32(m_oth, (other_chair() or 0) + 0xc4) != 0, 2.5)
+        eo = other_chair() or eo
         print('  carry on the other copy: %s (waited %.2f s) -> %s' %
               ('yes' if okc else 'NO', secs2, describe(m_oth, eo)))
         if not okc:
@@ -287,8 +328,8 @@ def main():
             fails.append('%s: no break' % label)
             return
         print('  broken after %.2f s: own %s' % (secs3, describe(m_own, e)))
-        okb, secs4 = wait_for(lambda: u32(m_oth, (chair_of(m_oth, key) or 0) + 0xa4) != 0, 3.0)
-        eo = chair_of(m_oth, key) or eo
+        okb, secs4 = wait_for(lambda: u32(m_oth, (other_chair() or 0) + 0xa4) != 0, 3.0)
+        eo = other_chair() or eo
         print('  break on the other copy: %s (waited %.2f s) -> %s' % ('yes' if okb else 'NO', secs4, describe(m_oth, eo)))
         if not okb:
             fails.append('%s: the other copy does not show the broken chair' % label)
@@ -306,48 +347,27 @@ def main():
         else:
             print('  drop item: none (this chair has no itemType attribute)')
 
+    # The TASK 26 "apply path" phase (break a chair while the peer cannot hear) is NOT run any more: every
+    # way of making the peer miss the packets also takes its game out of play. `netpause` (both copies)
+    # stops the paused copy's own pad from reaching its game at all (net_tick feeds the input ring and
+    # returns at its first line), and a receive-only drop (`netdroprx`) makes the game see its partner's
+    # controller vanish, which ends its prop sync and its pad handling for the rest of the session
+    # (TASK 27 runs 2 and 3). What is left to test - a break by either player reaching the other copy - is
+    # what the two phases below do, and the resend path is exercised by every break whose announcement this
+    # copy did not simulate itself.
     one_player(None, None, mh, mg, ph, 0, 'player 1 (host)')
     one_player(None, None, mg, mh, pg, 1, 'player 2 (guest)')
 
-    # --- the sync's apply path: the guest must not see the action, and must converge by itself afterwards
-    if usable(mh):
-        print('\nbreakables: apply-path test (netpause: the guest sees neither the pad nor the packets)')
-        me = ctl_human(mh, 0)
-        e = min(usable(mh), key=lambda x: d3(epos(mh, x), hpos(mh, me)))
-        ok, how = tp_near(ph, mh, 0, epos(mh, e))
-        print('  tp -> %s' % how)
-        time.sleep(0.5)
-        key = chair_key(mh, e)   # placing the character can push the chair
-        eo = chair_of(mg, key)
-        if ok and eo:
-            print('  before: host %s | guest %s' % (describe(mh, e), describe(mg, eo)))
-            print('  netpause 3500 on both copies: %s | %s' % (ph.cmd('netpause 3500'), pg.cmd('netpause 3500')))
-            time.sleep(0.2)
-            for i in range(2):
-                press_a(ph, 0)
-                time.sleep(0.9)
-            hb, gb = u32(mh, e + 0xa4), u32(mg, eo + 0xa4)
-            print('  during the pause: host broken %d carry %x | guest broken %d' % (hb, carry_of(mh, 0), gb))
-            if gb:
-                print('  INCONCLUSIVE: the guest saw the action anyway (the pause ended too early)')
-            else:
-                okb, secs = wait_for(lambda: u32(mg, (chair_of(mg, key) or 0) + 0xa4) != 0, 6.0)
-                eo = chair_of(mg, key) or eo
-                print('  after the pause: the guest converged in %.2f s: %s' % (secs, describe(mg, eo)))
-                if not okb:
-                    fails.append('apply path: the guest did not converge after the pause')
-                if not hb:
-                    fails.append('apply path: the host did not break the chair itself')
-        else:
-            print('  apply-path test skipped (no free chair or no tp)')
-
     print('\nbreakables: inventory host %d guest %d' % (inv_count(mh), inv_count(mg)))
+    print('breakables: game ticks (frames) host %s guest %s' % (frames(ph), frames(pg)))
     print('breakables: sync host  %s' % ph.cmd('sync'))
     print('breakables: sync guest %s' % pg.cmd('sync'))
     if fails:
         print('breakables FAIL:')
         for f in fails:
             print('  - ' + f)
+        print('breakables: props host  %s' % ph.cmd('props'))
+        print('breakables: props guest %s' % pg.cmd('props'))
         return 1
     print('breakables OK (chairs picked up, swung and broken on both copies; %d chair(s) checked)' % len(used))
     return 0

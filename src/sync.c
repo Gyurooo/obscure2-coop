@@ -61,6 +61,10 @@ static LONG g_stat_n;
 static volatile LONG g_snd_states, g_rcv_states, g_applied, g_snaps, g_blends, g_skipped_level, g_timed_corr;
 static volatile LONG g_req_applied;
 static volatile LONG g_item_applied;
+// Game ticks this copy has run. `sync` prints it: a copy whose game thread stopped (a hang in the game's
+// own update, a modal dialog) stops counting while its network thread and pipe keep answering, which is
+// otherwise invisible to a test that only reads memory.
+static volatile LONG g_frames;
 
 // A save load starts the game with only player 1 attached: the second input controller's character
 // pointer is 0, so the partner is AI and the guest's pad controls nothing. Re-attach the second human
@@ -870,54 +874,105 @@ static DWORD g_prop_level;                 // the level the table was built in
 // without announcing them (they are the level's state, not a break this copy performed).
 static DWORD g_prev_level;
 static float g_prop_pos[PROP_MAX][3];
+static unsigned char g_prop_listed[PROP_MAX];   // 1 = the manager's lists hold this prop right now
+
+// A prop pointer is only used when the object is still alive and still the class it was: an entity that
+// was rebuilt (level change) or freed must never be called through.
+static int prop_alive(unsigned e, DWORD cls)
+{
+	return e && e > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)e, 0x120) && rd32(e + 0x10) == cls;
+}
+
+// The live fields of the prop in slot `i` (the same offsets the packet names: class +0x10, id +4,
+// broken +0xa4, carrier +0xc4, drop +0x118, position +0x6c).
+static void prop_refresh(int i)
+{
+	unsigned e = g_props[i].ent;
+	g_props[i].cls = rd32(e + 0x10);
+	g_props[i].id = rd32(e + 4);
+	g_props[i].broken = rd32(e + 0xa4);
+	g_props[i].carrier = rd32(e + 0xc4);
+	g_props[i].drop = rd32(e + 0x118);
+	const float *ep = (const float *)(uintptr_t)(e + 0x6c);
+	g_prop_pos[i][0] = ep[0];
+	g_prop_pos[i][1] = ep[1];
+	g_prop_pos[i][2] = ep[2];
+}
 
 // Rebuilds the prop table from the manager's two lists (mgr+8 = the level's own entities, mgr+0x18 = the
 // objects the world build adds; pickup_find_entity walks both for the same reason). Cheap enough to run
 // 6-7 times a second (a level has < 60 entities); a pointer is never kept across a level change.
+//
+// TASK 27: a prop that the lists do not show right now is KEPT (as long as it is alive and still the same
+// class) instead of being dropped. The break/carry packets name a prop by class + position, and a carried
+// chair's position is wherever the hand is: while the chair is out of the table the peer's next packet can
+// only match the nearest *other* chair that is still listed.
 static void prop_scan(unsigned w, DWORD level)
 {
 	unsigned mgr = rd32(w + 0x1768);
 	int was_n = g_prop_n;
+	DWORD old_level = g_prop_level;
+	prop_slot old[PROP_MAX];
+	memcpy(old, g_props, sizeof(prop_slot) * (size_t)g_prop_n);
 	g_prop_n = 0;
 	g_prop_level = level;
-	if (!mgr)
-		return;
-	for (int h = 0; h < 2; h++) {
-		unsigned head = rd32(mgr + (h == 0 ? 8 : 0x18));
-		unsigned node_seen[3] = { 0, 0, 0 };
-		int nseen = 0;
-		for (unsigned node = head, guard = 0; node && guard < 4000; guard++) {
-			int dup = 0;
-			for (int s = 0; s < nseen; s++)
-				if (node_seen[s] == node)
-					dup = 1;
-			if (dup)
-				break;   // a node seen before: the list loops, stop (node_seen keeps the last few)
-			if (nseen < 3)
-				node_seen[nseen++] = node;
-			unsigned e = rd32(node);
-			unsigned nx = rd32(node + 4);
+	if (mgr)
+		for (int h = 0; h < 2; h++) {
+			unsigned head = rd32(mgr + (h == 0 ? 8 : 0x18));
+			unsigned node_seen[3] = { 0, 0, 0 };
+			int nseen = 0;
+			for (unsigned node = head, guard = 0; node && guard < 4000; guard++) {
+				int dup = 0;
+				for (int s = 0; s < nseen; s++)
+					if (node_seen[s] == node)
+						dup = 1;
+				if (dup)
+					break;   // a node seen before: the list loops, stop (node_seen keeps the last few)
+				if (nseen < 3)
+					node_seen[nseen++] = node;
+				unsigned e = rd32(node);
+				unsigned nx = rd32(node + 4);
+				int have = 0;
+				for (int k = 0; k < g_prop_n; k++)
+					if (g_props[k].ent == e)
+						have = 1;
+				if (e && e > 0x10000 && !have && prop_class_tag(rd32(e + 0x10)) && g_prop_n < PROP_MAX) {
+					int i = g_prop_n++;
+					g_props[i].ent = e;
+					g_prop_listed[i] = 1;
+					prop_refresh(i);
+				}
+				if (nx == node)
+					break;
+				node = nx;
+			}
+		}
+	if (level == old_level)   // same level: keep the props the lists left out (carried, re-parented)
+		for (int i = 0; i < was_n && g_prop_n < PROP_MAX; i++) {
 			int have = 0;
 			for (int k = 0; k < g_prop_n; k++)
-				if (g_props[k].ent == e)
+				if (g_props[k].ent == old[i].ent)
 					have = 1;
-			if (e && e > 0x10000 && !have && prop_class_tag(rd32(e + 0x10)) && g_prop_n < PROP_MAX) {
-				prop_slot *p = &g_props[g_prop_n++];
-				p->ent = e;
-				p->cls = rd32(e + 0x10);
-				p->id = rd32(e + 4);
-				p->broken = rd32(e + 0xa4);
-				p->carrier = rd32(e + 0xc4);
-				p->drop = rd32(e + 0x118);
-				const float *ep = (const float *)(uintptr_t)(e + 0x6c);
-				g_prop_pos[g_prop_n - 1][0] = ep[0];
-				g_prop_pos[g_prop_n - 1][1] = ep[1];
-				g_prop_pos[g_prop_n - 1][2] = ep[2];
-			}
-			if (nx == node)
-				break;
-			node = nx;
+			if (have || !prop_alive(old[i].ent, old[i].cls))
+				continue;
+			int n = g_prop_n++;
+			g_props[n].ent = old[i].ent;
+			g_prop_listed[n] = 0;
+			prop_refresh(n);
 		}
+	// A prop whose broken flag the game cleared again (the 20 s respawn of FUN_00413c00) is worth a line:
+	// the copies must end up the same way here too.
+	for (int i = 0; i < g_prop_n; i++) {
+		for (int j = 0; j < was_n; j++)
+			if (old[j].ent == g_props[i].ent) {
+				if (old[j].broken && !g_props[i].broken) {
+					char c[5], i4[5];
+					logf("%s: prop went back to whole: %s id %s ent %x (the game respawned it)",
+						g_role == 2 ? "guest" : "host", tag4(g_props[i].cls, c), tag4(g_props[i].id, i4),
+						g_props[i].ent);
+				}
+				break;
+			}
 	}
 	if (g_prop_n != was_n || level != g_prev_level) {
 		char lv[5];
@@ -927,20 +982,33 @@ static void prop_scan(unsigned w, DWORD level)
 }
 
 // The prop a packet names: same class tag, and (when the packet has one) the same id; the nearest to the
-// announced position decides among same-class entities (chair ids are often 0).
+// announced position decides among same-class entities (chair ids are often 0). Every candidate is checked
+// against the live object, so a pointer kept from an earlier scan can never be called on a dead object.
 static unsigned prop_find(DWORD cls, DWORD id, const float *pp)
 {
 	unsigned best = 0;
 	float bd = 400.0f * 400.0f;   // a prop further away than this is not the one the packet means
 	for (int i = 0; i < g_prop_n; i++) {
 		prop_slot *p = &g_props[i];
-		if (p->cls != cls || (id && p->id != id))
+		if (p->cls != cls || (id && p->id != id) || !prop_alive(p->ent, cls))
 			continue;
 		float dx = g_prop_pos[i][0] - pp[0], dy = g_prop_pos[i][1] - pp[1], dz = g_prop_pos[i][2] - pp[2];
 		float d = dx * dx + dy * dy + dz * dz;
 		if (d < bd) { bd = d; best = p->ent; }
 	}
 	return best;
+}
+
+// The CHAI-like object a character holds (character+0x2bc), when it is of the class the packet names. A
+// carried prop is identified exactly by this, not by a position that moves with the hand.
+static unsigned prop_held_chair(unsigned ch, DWORD cls)
+{
+	if (!ch || IsBadReadPtr((void *)(uintptr_t)(ch + 0x2bc), 4))
+		return 0;
+	unsigned cur = rd32(ch + 0x2bc);
+	if (!prop_alive(cur, cls) || cur == ch)
+		return 0;
+	return cur;
 }
 
 // The item entity at +0x118 (the one the break enabled) or, when it is 0, none.
@@ -1018,18 +1086,75 @@ static void prop_align_drop(unsigned ent, DWORD dcls, DWORD did, const float *dp
 		tag4(dcls, a), tag4(did, b), local ? "another item" : "none");
 }
 
+// A break this copy applied from a packet is not its own news. Echoing it back is harmless in itself, but
+// an echo of a mis-matched break hides the real one, and an echo of the peer's break fights its own state
+// resend, so the entities applied here are remembered and not announced again for a moment.
+static unsigned g_applied_ent[8];
+static DWORD g_applied_at[8];
+static int g_applied_next;
+
+static void prop_mark_applied(unsigned ent)
+{
+	g_applied_ent[g_applied_next] = ent;
+	g_applied_at[g_applied_next] = GetTickCount();
+	g_applied_next = (g_applied_next + 1) & 7;
+}
+
+static int prop_applied_here(unsigned ent, DWORD within)
+{
+	DWORD now = GetTickCount();
+	for (int i = 0; i < 8; i++)
+		if (g_applied_ent[i] == ent && now - g_applied_at[i] < within)
+			return 1;
+	return 0;
+}
+
+// The state a break leaves behind, written directly instead of running FUN_00412140. That routine also
+// spawns the splinter effect, plays the sound and releases the chair's collision object; calling it from
+// the frame hook is what TASK 26 already reported as "hung the host in an early run", and in TASK 27 the
+// guest's game stopped updating at the exact tick it applied the host's break while its network thread
+// kept logging. What a break means for the player and for the sync is its state:
+//   +0xa4 = 1 (broken: can-interact refuses, the save records it),
+//   +0x24 = 0 (not usable - what the game's own break leaves),
+//   +0x12c = 0 (the respawn timer FUN_00413c00 counts up to 20000),
+//   the mesh hidden through its own vtable slot 33 (the break's `(*(+0x84))(0)`),
+//   the collision object's slot 17 (`(+0x44)(0)`, the call the attach already makes) disabled.
+// The drop item entity is enabled by prop_align_drop with the item's own slots 34/32/33, as before.
+static int prop_break_state(unsigned ent)
+{
+	if (!ent || IsBadReadPtr((void *)(uintptr_t)ent, 0x130))
+		return 0;
+	unsigned mesh = rd32(ent + 0x34);
+	if (mesh && !IsBadReadPtr((void *)(uintptr_t)mesh, 8)) {
+		void **mvt = *(void ***)(uintptr_t)mesh;
+		if (mvt && !IsBadReadPtr(mvt, 34 * sizeof(void *)) && mvt[33])
+			((void(__fastcall *)(void *, void *, int))mvt[33])((void *)(uintptr_t)mesh, NULL, 0);
+	}
+	unsigned col = rd32(ent + 0x68);
+	if (col && !IsBadReadPtr((void *)(uintptr_t)col, 8)) {
+		void **cvt = *(void ***)(uintptr_t)col;
+		if (cvt && !IsBadReadPtr(cvt, 18 * sizeof(void *)) && cvt[17])
+			((void(__fastcall *)(void *, void *, int))cvt[17])((void *)(uintptr_t)col, NULL, 0);
+	}
+	*(DWORD *)(uintptr_t)(ent + 0x24) = 0;
+	*(DWORD *)(uintptr_t)(ent + 0x12c) = 0;
+	*(DWORD *)(uintptr_t)(ent + 0xa4) = 1;
+	return 1;
+}
+
 static void prop_apply_break(unsigned ent, DWORD dcls, DWORD did, const float *dpos, int host_word)
 {
 	// A prop the other copy broke and this one also broke (the normal case) is already flagged: nothing to
 	// do, and no log line - the host repeats its state once a second.
 	if (!rd32(ent + 0xa4)) {
-		void **vt = *(void ***)(uintptr_t)ent;
-		if (vt && !IsBadReadPtr(vt, 26 * sizeof(void *))) {
-			char c[5], i[5];
-			((void(__fastcall *)(void *, void *))vt[25])((void *)(uintptr_t)ent, NULL);   // the game's own break
+		const float *ep = (const float *)(uintptr_t)(ent + 0x6c);
+		char c[5], i[5];
+		if (prop_break_state(ent)) {
+			prop_mark_applied(ent);
 			InterlockedIncrement(&g_prop_broken);
-			logf("%s: prop break applied: %s id %s -> broken now %u", g_role == 2 ? "guest" : "host",
-				tag4(rd32(ent + 0x10), c), tag4(rd32(ent + 4), i), rd32(ent + 0xa4));
+			logf("%s: prop break applied: %s id %s ent %x at (%.1f,%.1f,%.1f) -> broken now %u",
+				g_role == 2 ? "guest" : "host", tag4(rd32(ent + 0x10), c), tag4(rd32(ent + 4), i), ent,
+				ep[0], ep[1], ep[2], rd32(ent + 0xa4));
 		}
 	}
 	prop_align_drop(ent, dcls, did, dpos, host_word);
@@ -1049,6 +1174,9 @@ static unsigned human_exact(unsigned tag)
 
 // Carry: attach the prop to that character (slot 28) or detach what it holds (slot 29), the game's own
 // methods. `ent` 0 = the character holds nothing.
+// TASK 27: a BROKEN prop is never detached. The game keeps a broken chair linked in the hand on purpose
+// (FUN_00411f80/FUN_00412010 do not touch +0xa4), so the owner's "nothing carried" heartbeat must not keep
+// calling the game's detach on it every 500 ms - that is a game call we simply do not need.
 static void prop_apply_carry(unsigned ch, unsigned ent)
 {
 	if (!ch || IsBadReadPtr((void *)(uintptr_t)(ch + 0x2bc), 4)) {
@@ -1060,6 +1188,8 @@ static void prop_apply_carry(unsigned ch, unsigned ent)
 	if (cur == ent)
 		return;
 	if (cur && !IsBadReadPtr((void *)(uintptr_t)cur, 0xcc)) {
+		if (rd32(cur + 0xa4))
+			return;   // a broken chair stays where the break left it
 		void **vt = *(void ***)(uintptr_t)cur;
 		if (vt && !IsBadReadPtr(vt, 30 * sizeof(void *)) && vt[28] == (void *)(uintptr_t)PROP_ATTACH_CHAIR)
 			((void(__fastcall *)(void *, void *))vt[29])((void *)(uintptr_t)cur, NULL);   // detach
@@ -1095,6 +1225,107 @@ static void peer_on_prop(const char *buf, int n)
 	InterlockedIncrement(&g_prop_rcv);
 }
 
+// Applies one prop packet on the game thread. 1 = done with it (applied, or it was not this copy's
+// business); 0 = the prop it names is not in the table yet - the caller retries, because the table is
+// rebuilt every 150 ms and a prop can be missing from one scan.
+static int prop_apply_packet(const pkt_prop *pp)
+{
+	int host_word = g_role == 2;   // the packet came from the host
+	unsigned ch = pp->ch_tag ? human_exact(pp->ch_tag) : 0;
+	unsigned ent = 0;
+	if (pp->kind == 3 && ch) {
+		ent = prop_held_chair(ch, pp->cls);   // a carried prop is named exactly by the hand it is in
+		if (ent && pp->id && rd32(ent + 4) != pp->id)
+			ent = 0;
+	}
+	if (!ent)
+		ent = prop_find(pp->cls, pp->id, pp->pos);
+	if (pp->kind == 1 || pp->kind == 2) {
+		if (!ch && pp->ch_tag) {
+			InterlockedIncrement(&g_prop_missing);
+			char ct[5];
+			logf("%s: prop carry packet: no character %s here",
+				g_role == 2 ? "guest" : "host", tag4(pp->ch_tag, ct));
+			return 1;
+		}
+		if (!ent && pp->kind == 1)
+			return 0;   // the prop is not in the table yet: try again after the next scan
+		if (pp->kind == 1) {
+			char c[5], i4[5], ct[5];
+			const float *ep = (const float *)(uintptr_t)(ent + 0x6c);
+			logf("%s: prop carry packet: prop %s id %s -> ent %x (%.1f,%.1f,%.1f), character %s %x (holds %x)",
+				g_role == 2 ? "guest" : "host", tag4(pp->cls, c), tag4(pp->id, i4), ent, ep[0], ep[1], ep[2],
+				tag4(pp->ch_tag, ct), ch, ch ? rd32(ch + 0x2bc) : 0);
+		}
+		prop_apply_carry(ch, pp->kind == 1 ? ent : 0);
+		InterlockedIncrement(&g_prop_applied);
+		return 1;
+	}
+	if (pp->kind != 3)
+		return 1;
+	if (!ent) {
+		// keep the retry cheap: the announcement arrives three times and the host repeats its state
+		// once a second, so a prop that never shows up is reported, not waited for forever
+		return 0;
+	}
+	// Do not break it this instant: this copy usually performs the same break itself within a frame, and
+	// a second call to the game's break while its own action runs is not safe. Wait 350 ms; if the prop
+	// is still whole then, this copy really missed the action.
+	{
+		char c[5], i4[5], ct[5];
+		const float *ep = (const float *)(uintptr_t)(ent + 0x6c);
+		logf("%s: prop break packet: %s id %s -> ent %x (%.1f,%.1f,%.1f) carrier %s broken %u",
+			g_role == 2 ? "guest" : "host", tag4(pp->cls, c), tag4(pp->id, i4), ent, ep[0], ep[1], ep[2],
+			pp->ch_tag ? tag4(pp->ch_tag, ct) : "none", rd32(ent + 0xa4));
+	}
+	prop_defer_break(ent, pp->drop_cls, pp->drop_id, pp->drop_pos, host_word);
+	InterlockedIncrement(&g_prop_applied);
+	return 1;
+}
+
+// A packet whose prop was not in the table is retried a few times before it is counted as missing.
+typedef struct { pkt_prop p; DWORD at; int tries; } prop_retry;
+static prop_retry g_retry[4];
+
+static void prop_retry_add(const pkt_prop *p)
+{
+	int slot = -1;
+	for (int i = 0; i < 4; i++)
+		if (!g_retry[i].at || (LONG)(GetTickCount() - g_retry[i].at) > 3000) { slot = i; break; }
+	if (slot < 0) {   // no free slot: reuse the one that has been waiting longest
+		slot = 0;
+		for (int i = 1; i < 4; i++)
+			if ((LONG)(g_retry[i].at - g_retry[slot].at) < 0)
+				slot = i;
+		InterlockedIncrement(&g_prop_missing);
+	}
+	memset(&g_retry[slot], 0, sizeof g_retry[slot]);
+	g_retry[slot].p = *p;
+	g_retry[slot].at = GetTickCount() + 120;
+}
+
+static void prop_retry_tick(void)
+{
+	DWORD now = GetTickCount();
+	for (int i = 0; i < 4; i++) {
+		if (!g_retry[i].at || (LONG)(now - g_retry[i].at) < 0)
+			continue;
+		if (prop_apply_packet(&g_retry[i].p)) {
+			g_retry[i].at = 0;
+			continue;
+		}
+		if (++g_retry[i].tries > 8) {
+			g_retry[i].at = 0;
+			InterlockedIncrement(&g_prop_missing);
+			logf("%s: prop %s never turned up in this level (announced %d times)",
+				g_role == 2 ? "guest" : "host", g_retry[i].p.kind == 3 ? "break" : "carry",
+				g_retry[i].tries);
+			continue;
+		}
+		g_retry[i].at = now + 150;
+	}
+}
+
 static void peer_apply_props(void)
 {
 	for (;;) {
@@ -1124,36 +1355,8 @@ static void peer_apply_props(void)
 		LeaveCriticalSection(&g_prop_cs);
 		if (rd32(w + 4) != g_prop_level)
 			prop_scan(w, rd32(w + 4));   // a level change since the last scan
-		unsigned ent = prop_find(p.cls, p.id, p.pos);
-		int host_word = g_role == 2;   // the packet came from the host
-		if (p.kind == 1 || p.kind == 2) {
-			unsigned ch = human_exact(p.ch_tag);
-			if (!ent && p.kind == 1) {
-				InterlockedIncrement(&g_prop_missing);
-				char c[5];
-				logf("%s: prop carry packet: no prop %s (level %s)", g_role == 2 ? "guest" : "host",
-					tag4(p.cls, c), "here");
-				continue;
-			}
-			if (p.kind == 1) {
-				char c[5], ct[5];
-				logf("%s: prop carry packet: prop %s id %s -> ent %x, character %s %x (holds %x)",
-					g_role == 2 ? "guest" : "host", tag4(p.cls, c), tag4(p.id, (char[5]){ 0 }), ent,
-					tag4(p.ch_tag, ct), ch, ch ? rd32(ch + 0x2bc) : 0);
-			}
-			prop_apply_carry(ch, p.kind == 1 ? ent : 0);
-			InterlockedIncrement(&g_prop_applied);
-		} else if (p.kind == 3) {
-			if (!ent) {
-				InterlockedIncrement(&g_prop_missing);
-				continue;
-			}
-			// Do not break it this instant: this copy usually performs the same break itself within a
-			// frame, and a second call to the game's break while its own action runs is not safe. Wait
-			// 350 ms; if the prop is still whole then, this copy really missed the action.
-			prop_defer_break(ent, p.drop_cls, p.drop_id, p.drop_pos, host_word);
-			InterlockedIncrement(&g_prop_applied);
-		}
+		if (!prop_apply_packet(&p))
+			prop_retry_add(&p);
 	}
 }
 
@@ -1287,7 +1490,7 @@ static unsigned prop_held_by(unsigned ch)
 
 // Break announcements wait here and are repeated: UDP is not reliable and a break is rare, so three
 // copies over ~160 ms cost nothing and survive a lost packet.
-typedef struct { DWORD cls, id, drop_cls, drop_id; float pos[3], drop_pos[3]; DWORD next_send; int left; } prop_rep;
+typedef struct { DWORD cls, id, drop_cls, drop_id, ch_tag; float pos[3], drop_pos[3]; DWORD next_send; int left; } prop_rep;
 static prop_rep g_rep[8];
 static int g_rep_n;
 static DWORD g_prop_scan_at;
@@ -1295,11 +1498,20 @@ static DWORD g_prop_scan_at;
 static void prop_announce_break(int i, DWORD now)
 {
 	unsigned drop = prop_drop_of(g_props[i].ent);
-	if (g_rep_n < 8) {
-		prop_rep *r = &g_rep[g_rep_n++];
+	prop_rep *r = 0;
+	for (int k = 0; k < g_rep_n; k++)   // a finished announcement's slot is free again
+		if (g_rep[k].left <= 0) { r = &g_rep[k]; break; }
+	if (!r && g_rep_n < 8)
+		r = &g_rep[g_rep_n++];
+	if (!r)
+		r = &g_rep[0];
+	{
 		memset(r, 0, sizeof *r);
 		r->cls = g_props[i].cls;
 		r->id = g_props[i].id;
+		// The character that was holding it (a broken chair stays linked in the hand): the peer identifies
+		// a carried prop by the hand it is in, which survives any position drift. 0 when it lies on the floor.
+		r->ch_tag = prop_alive(g_props[i].carrier, r->cls) ? rd32(g_props[i].carrier + H_TAG) : 0;
 		r->drop_cls = drop ? rd32(drop + 0x10) : 0;
 		r->drop_id = drop ? rd32(drop + 4) : 0;
 		memcpy(r->pos, g_prop_pos[i], sizeof r->pos);
@@ -1309,8 +1521,11 @@ static void prop_announce_break(int i, DWORD now)
 		r->left = 3;
 	}
 	char c[5], i4[5], dc[5];
-	logf("%s: prop broken here: %s id %s drop %s", g_role == 2 ? "guest" : "host",
-		tag4(g_props[i].cls, c), tag4(g_props[i].id, i4), drop ? tag4(rd32(drop + 0x10), dc) : "none");
+	logf("%s: prop broken here: %s id %s ent %x at (%.1f,%.1f,%.1f) carrier %s drop %s",
+		g_role == 2 ? "guest" : "host", tag4(g_props[i].cls, c), tag4(g_props[i].id, i4), g_props[i].ent,
+		g_prop_pos[i][0], g_prop_pos[i][1], g_prop_pos[i][2],
+		g_props[i].carrier ? tag4(rd32(g_props[i].carrier + H_TAG), dc) : "none",
+		drop ? tag4(rd32(drop + 0x10), c) : "none");
 }
 
 static void prop_tick(void)
@@ -1327,6 +1542,7 @@ static void prop_tick(void)
 		prop_scan(w, level);
 	peer_apply_props();
 	prop_tick_pending();
+	prop_retry_tick();
 	if (g_role == 1)
 		host_send_prop_state(level);
 	else
@@ -1384,6 +1600,8 @@ static void prop_tick(void)
 			for (int i = 0; i < g_prop_n; i++) {
 				if (!g_props[i].broken)
 					continue;
+				if (prop_applied_here(g_props[i].ent, 2500))
+					continue;   // this copy applied it from the peer: not its own news
 				int was_broken = 0;
 				for (int j = 0; j < old_n; j++)
 					if (old_ent[j] == g_props[i].ent) {
@@ -1405,6 +1623,7 @@ static void prop_tick(void)
 		p.level = level;
 		p.cls = r->cls;
 		p.id = r->id;
+		p.ch_tag = r->ch_tag;
 		memcpy(p.pos, r->pos, sizeof p.pos);
 		p.drop_cls = r->drop_cls;
 		p.drop_id = r->drop_id;
@@ -1413,6 +1632,23 @@ static void prop_tick(void)
 		InterlockedIncrement(&g_prop_sent);
 		r->left--;
 		r->next_send = now + 80;
+	}
+}
+
+// Test/diagnostic only (pipe `props`): this copy's prop table - index, entity, class, id, broken flag,
+// carrier, position and whether the manager's lists hold it right now. It reads only the table, so it
+// cannot fault while the game thread rebuilds it.
+static void props_dump(char *reply, size_t replysz)
+{
+	size_t l = 0;
+	l += (size_t)_snprintf(reply + l, replysz - l, "props %d in level %08lx:", g_prop_n, (unsigned long)g_prop_level);
+	for (int i = 0; i < g_prop_n && i < 20 && l + 110 < replysz; i++) {
+		char c[5], i4[5];
+		l += (size_t)_snprintf(reply + l, replysz - l, " #%d %x %s/%s %s%s b%u c%x (%.1f,%.1f,%.1f)", i,
+			g_props[i].ent, tag4(g_props[i].cls, c), tag4(g_props[i].id, i4),
+			g_prop_listed[i] ? "" : "unlisted ", g_props[i].broken ? "BROKEN" : "whole",
+			(unsigned)g_props[i].broken, (unsigned)g_props[i].carrier,
+			g_prop_pos[i][0], g_prop_pos[i][1], g_prop_pos[i][2]);
 	}
 }
 
@@ -3279,6 +3515,7 @@ static void sync_init(void)
 
 static void frame_tick(void)
 {
+	InterlockedIncrement(&g_frames);   // a game thread that stops shows as a frozen count in `sync`
 	if (level_frame())   // a pipe level change was queued: run it here and leave the frame to the game
 		return;
 	tp_frame();   // safe teleport: must run with no peer too (TASK 17 Part A)
@@ -3366,4 +3603,7 @@ static void sync_status(char *reply, size_t replysz)
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | prop sent %ld rcv %ld applied %ld broke %ld drop %ld missing %ld",
 			g_prop_sent, g_prop_rcv, g_prop_applied, g_prop_broken, g_prop_drop, g_prop_missing);
+	l = strlen(reply);
+	if (l < replysz)
+		_snprintf(reply + l, replysz - l, " | frames %ld", g_frames);
 }

@@ -467,7 +467,9 @@ static volatile LONG g_peer_ok;
 static volatile LONG g_ever_connected;   // guest: linked at least once; a lost link must not let our pad drive player 1
 static void net_status(char *reply, size_t replysz);
 static void net_pause_set(DWORD ms);   // net.c: test-only link pause (`netpause <ms>`)
+static void net_rx_drop_set(DWORD ms);   // net.c: test-only receive-only drop (`netdroprx <ms>`)
 static void sync_status(char *reply, size_t replysz);
+static void props_dump(char *reply, size_t replysz);
 
 
 static volatile float g_cam_yaw;
@@ -1200,6 +1202,10 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		LeaveCriticalSection(&g_vpad_cs);
 	} else if (!strncmp(line, "sync", 4)) {
 		sync_status(reply, replysz);
+	} else if (!strncmp(line, "props", 5)) {
+		// Test/diagnostic (TASK 27): this copy's breakable/carryable prop table, so a check can print what
+		// each copy thinks a chair is (entity, broken, carrier, position) when a break does not propagate.
+		props_dump(reply, replysz);
 	} else if (!strncmp(line, "netpause", 8)) {
 		long ms = -1;
 		sscanf(line + 8, "%ld", &ms);
@@ -1208,6 +1214,15 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		} else {
 			net_pause_set((DWORD)ms);
 			_snprintf(reply, replysz, "ok net paused for %ld ms (0 = cleared)", ms);
+		}
+	} else if (!strncmp(line, "netdroprx", 9)) {
+		long ms = -1;
+		sscanf(line + 9, "%ld", &ms);
+		if (ms < 0 || ms > 600000) {
+			_snprintf(reply, replysz, "error netdroprx <ms 0..600000> (test-only: drop what arrives, keep sending)");
+		} else {
+			net_rx_drop_set((DWORD)ms);
+			_snprintf(reply, replysz, "ok incoming packets dropped for %ld ms (0 = cleared)", ms);
 		}
 	} else if (!strncmp(line, "net", 3)) {
 		net_status(reply, replysz);

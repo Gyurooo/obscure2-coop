@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 13   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 14   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -31,6 +31,8 @@
                         //     the host player 1) so the other copy follows the owner instead of re-simulating it
                         // 13: TASK 26, PKT_PROP: breakable/carryable props (chairs and cases) keep the same carried /
                         //     broken state and drop item on both copies
+                        // 14: TASK 27: a PKT_PROP break also names the character that was holding the prop, so the
+                        //     peer finds it by the hand it is in (a carried chair's position is no identity)
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20 };
@@ -140,6 +142,26 @@ static int net_paused(void)
 {
 	DWORD until = (DWORD)g_net_pause_until;
 	return until && (LONG)(GetTickCount() - until) < 0;
+}
+// TASK 27: `netdroprx <ms>` drops only what arrives (the send path keeps running) - the shape of "packets
+// lost while the link is up". Measured in TASK 27: the copy that drops its own incoming packets also loses
+// the partner's controller from the game's point of view, and it stops applying prop packets for the rest of
+// the session, so check_breakables.py no longer drives a phase with it (see FINDINGS_27 §5). Kept as a test
+// switch next to `netpause` for "lost datagram" experiments.
+static volatile LONG g_net_rx_drop_until;
+static int net_rx_dropped(void)
+{
+	DWORD until = (DWORD)g_net_rx_drop_until;
+	return until && (LONG)(GetTickCount() - until) < 0;
+}
+static void net_rx_drop_set(DWORD ms)
+{
+	LONG until = ms ? (LONG)(GetTickCount() + ms) : 0;
+	InterlockedExchange(&g_net_rx_drop_until, until);
+	if (ms)
+		logf("net: incoming packets dropped for %lu ms (test)", (unsigned long)ms);
+	else
+		logf("net: incoming packets accepted again (test)");
 }
 static void net_pause_set(DWORD ms)
 {
@@ -274,7 +296,7 @@ static void net_send_req(DWORD kind, unsigned a, unsigned b, unsigned c, const c
 static void net_handle(const char *buf, int n, sid_t from)
 {
 	const pkt_hdr *h = (const pkt_hdr *)buf;
-	if (net_paused())   // test-only link pause: nothing arrives either
+	if (net_paused() || net_rx_dropped())   // test-only link pause: nothing arrives either
 		return;
 	if (n < (int)sizeof *h || h->magic != NET_MAGIC || h->version != NET_VERSION ||
 		(int)(sizeof *h + h->len) != n) {
@@ -678,6 +700,6 @@ static void net_status(char *reply, size_t replysz)
 			g_steam_session_requests, g_steam_accepted, g_steam_refused, g_steam_tx_fail, g_last_candidates);
 	l = strlen(reply);
 	if (l < replysz)
-		_snprintf(reply + l, replysz - l, " paused %d guest_level %08lx", net_paused(),
+		_snprintf(reply + l, replysz - l, " paused %d rxdrop %d guest_level %08lx", net_paused(), net_rx_dropped(),
 			(unsigned long)(g_role == 1 ? g_hello_level : 0));
 }
