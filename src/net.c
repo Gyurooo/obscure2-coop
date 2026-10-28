@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 12   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 13   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -29,9 +29,11 @@
                         // 12: TASK 25: PKT_HELLO carries the guest's level / in-level / need-saves (a reconnect resumes
                         //     without a reload); PKT_CHAR: each side streams the character it owns (the guest player 2,
                         //     the host player 1) so the other copy follows the owner instead of re-simulating it
+                        // 13: TASK 26, PKT_PROP: breakable/carryable props (chairs and cases) keep the same carried /
+                        //     broken state and drop item on both copies
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
-	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18 };
+	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
 
 #pragma pack(push, 1)
@@ -76,6 +78,17 @@ typedef struct { pkt_hdr h; DWORD level; DWORD cls; DWORD id; float pos[3]; DWOR
 // applies it through the game's own use method, because the inventory (PKT_ITEM) and the character life
 // (ch_state) are host-owned.
 typedef struct { pkt_hdr h; DWORD player; DWORD tag; } pkt_itemuse;
+// A breakable/carryable level prop (TASK 26). kind 1 = this character carries it, 2 = it carries nothing,
+// 3 = it just broke. cls/id/pos name the prop (class tag at +0x10, id at +4, position at +0x6c); ch_tag
+// names the character for a carry; drop_cls/drop_id/drop_pos name the item entity the break enabled
+// (0 = the break produced none).
+typedef struct { pkt_hdr h; DWORD kind; DWORD level; DWORD ch_tag; DWORD cls, id; float pos[3];
+                 DWORD drop_cls, drop_id; float drop_pos[3]; } pkt_prop;
+// The host's prop state once a second (TASK 26): every prop that is broken and the drop it enabled, so a
+// break announcement lost with a packet, or made while the link was paused, still reaches the guest.
+#define PROP_STATE_MAX 24
+typedef struct { DWORD cls, id, drop_cls, drop_id; float pos[3], drop_pos[3]; } prop_state;
+typedef struct { pkt_hdr h; DWORD level; DWORD n; prop_state e[PROP_STATE_MAX]; } pkt_props;
 #pragma pack(pop)
 
 static void guest_on_state(const char *buf, int n);
@@ -91,6 +104,8 @@ static void guest_on_region(const char *buf, int n);
 static void peer_on_pickup(const char *buf, int n);
 static void peer_on_itemuse(const char *buf, int n);
 static void host_on_char(const char *buf, int n);
+static void peer_on_prop(const char *buf, int n);
+static void guest_on_props(const char *buf, int n);
 static unsigned rd32(unsigned addr);      // sync.c
 static unsigned world_obj(void);          // sync.c
 static int guest_need_saves(void);        // sync.c: this process has no save file from the host yet
@@ -343,6 +358,9 @@ static void net_handle(const char *buf, int n, sid_t from)
 		case PKT_CHAR:
 			host_on_char(buf, n);   // the character the guest owns (player 2), streamed to its copy here
 			break;
+		case PKT_PROP:
+			peer_on_prop(buf, n);   // a prop carry/break from the guest (applied on the game thread)
+			break;
 		}
 	} else if (g_role == 2) {
 		if (!g_peer_ok) {
@@ -379,6 +397,10 @@ static void net_handle(const char *buf, int n, sid_t from)
 		guest_on_item(buf, n);
 	} else if (h->type == PKT_PICKUP) {
 		peer_on_pickup(buf, n);
+	} else if (h->type == PKT_PROP) {
+		peer_on_prop(buf, n);
+	} else if (h->type == PKT_PROPS) {
+		guest_on_props(buf, n);
 	} else if (h->type == PKT_STATE) {
 			guest_on_state(buf, n);
 		} else if (h->type == PKT_REGION) {
