@@ -614,6 +614,9 @@ static void net_rx_drop_set(DWORD ms);   // net.c: test-only receive-only drop (
 static void sync_status(char *reply, size_t replysz);
 static void scene_status(char *reply, size_t replysz);   // sync.c, TASK 30
 static void props_dump(char *reply, size_t replysz);
+static int menu_input_active(void);                    // sync.c, TASK 36: a shared menu is up (merge both pads)
+static int menu_paused(void);                          // sync.c, TASK 36: the menu stops the characters
+static void menu_status(char *reply, size_t replysz);  // sync.c, TASK 36: the menu state (pipe `menu`)
 
 
 static volatile float g_cam_yaw;
@@ -769,6 +772,79 @@ static void merge_pad(xstate *dst, const xstate *src)
 	if (src->ry) dst->ry = src->ry;
 }
 
+// ---- shared menus: the pad side (TASK 36) ------------------------------------------------------------
+// While a menu is up (sync.c menu_input_active) the game must see BOTH players' pads on BOTH copies: the
+// pause menu and the inventory read player 1's pad only, so otherwise player 2 cannot move the cursor at
+// all (measured, FINDINGS_36 §7). Every copy has both pads (its own and the streamed one), and each copy
+// computes the same OR of the two, so both games run the same menu input and stay in lockstep.
+// g_last_ret keeps the RAW state (before merging) so a merged pad cannot be merged back into itself.
+// The pulse is the convergence press from sync.c menu_tick (a short button press on one pad).
+static volatile DWORD g_menu_pulse_until;
+static volatile LONG g_menu_pulse_user = -1, g_menu_pulse_btn, g_menu_pulse_rt;
+static xstate g_last_ret[2];
+static volatile DWORD g_last_ret_at[2];
+
+static void menu_pulse_start(int user, unsigned buttons, int rt, DWORD ms)
+{
+	g_menu_pulse_user = user & 1;
+	g_menu_pulse_btn = (LONG)buttons;
+	g_menu_pulse_rt = rt;
+	g_menu_pulse_until = GetTickCount() + ms;
+}
+
+static void menu_pulse_apply(DWORD user, xstate *s)
+{
+	DWORD until = g_menu_pulse_until;
+	if (!until || (int)user != (int)g_menu_pulse_user || (LONG)(GetTickCount() - until) >= 0)
+		return;
+	s->buttons |= (WORD)g_menu_pulse_btn;
+	if (g_menu_pulse_rt > (LONG)s->rt)
+		s->rt = (BYTE)g_menu_pulse_rt;
+}
+
+static void menu_merge(DWORD user, xstate *s)
+{
+	if (user > 1 || !menu_input_active())
+		return;
+	int other = 1 - (int)user;
+	DWORD at = g_last_ret_at[other];
+	if (!at || GetTickCount() - at > 250)
+		return;   // the other pad was not polled recently: nothing reliable to merge
+	xstate o;
+	EnterCriticalSection(&g_vpad_cs);
+	o = g_last_ret[other];
+	LeaveCriticalSection(&g_vpad_cs);
+	s->buttons |= (WORD)(o.buttons & (user == 1 ? ~0x0010u : 0xffffu));   // START stays player 1's:
+	                                                                     // on player 2 it is "leave the game"
+	if (o.lt > s->lt) s->lt = o.lt;
+	if (o.rt > s->rt) s->rt = o.rt;
+	if (menu_paused()) {
+		// the inventory and the pause menu stop the characters: merge the sticks too (either player moves)
+		int lx = (int)s->lx + (int)o.lx, ly = (int)s->ly + (int)o.ly;
+		if (lx > 32767) lx = 32767;
+		if (lx < -32768) lx = -32768;
+		if (ly > 32767) ly = 32767;
+		if (ly < -32768) ly = -32768;
+		s->lx = (SHORT)lx;
+		s->ly = (SHORT)ly;
+	}
+}
+
+// Every user<2 return of XInputGetState goes through here: keep the raw pad, merge the other player's pad
+// while a menu is up, and inject the menu pulse.
+static DWORD pad_finish(DWORD user, void *state)
+{
+	if (user < 2) {
+		EnterCriticalSection(&g_vpad_cs);
+		g_last_ret[user] = *(xstate *)state;
+		g_last_ret_at[user] = GetTickCount();
+		LeaveCriticalSection(&g_vpad_cs);
+		menu_merge(user, (xstate *)state);
+		menu_pulse_apply(user, (xstate *)state);
+	}
+	return ERROR_SUCCESS;
+}
+
 DWORD WINAPI XInputGetState(DWORD user, void *state)
 {
 	load_xinput();
@@ -790,7 +866,7 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			} else {
 				drop_remote_start((xstate *)state);
 			}
-			return ERROR_SUCCESS;
+			return pad_finish(user, state);
 		}
 		if (user == 0) {
 			if (g_peer_ok && !in_level) {   // menus and loading screens: this PC's own pad, so the friend can start their game
@@ -810,7 +886,7 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			}
 			if (accept_pulse_on())
 				((xstate *)state)->buttons |= 0x1000;   // TASK 34: the guest's own join dialog too
-			return ERROR_SUCCESS;
+			return pad_finish(user, state);
 		}
 		memset(state, 0, sizeof(xstate));
 		if (g_vpad_on[g_local_pad]) {
@@ -827,7 +903,7 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		// a host ChangeLevel in the first soak). Pulse A on both pads of this copy for 150 ms, once.
 		if (accept_pulse_on())
 			((xstate *)state)->buttons |= 0x1000;
-		return ERROR_SUCCESS;
+		return pad_finish(user, state);
 	}
 	if (g_role == 2)
 		return ERROR_DEVICE_NOT_CONNECTED;
@@ -838,7 +914,7 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		int down = p1_down();
 		if (user == 0 && down) {
 			memset(state, 0, sizeof(xstate));
-			return ERROR_SUCCESS;
+			return pad_finish(user, state);
 		}
 		memset(state, 0, sizeof(xstate));
 		ring_get(user == 0 ? &g_ring_p1 : &g_ring_p2, t_apply, (xstate *)state);
@@ -854,7 +930,7 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			drop_remote_start((xstate *)state);
 		}
 		InterlockedIncrement(&g_virtual_reads[user & 3]);
-		return ERROR_SUCCESS;
+		return pad_finish(user, state);
 	}
 	if (user < 4 && g_vpad_on[user]) {
 		int down = g_role == 1 && p1_down();
@@ -863,7 +939,7 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		if (user == 0 && down) {
 			memset(state, 0, sizeof(xstate));
 			LeaveCriticalSection(&g_vpad_cs);
-			return ERROR_SUCCESS;
+			return pad_finish(user, state);
 		}
 		memcpy(state, &g_vpad[user], sizeof(xstate));
 		if (g_role == 1 && user != 0 && down && g_vpad_on[0])
@@ -880,7 +956,7 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			drop_remote_look((xstate *)state);
 			drop_remote_start((xstate *)state);
 		}
-		return ERROR_SUCCESS;
+		return pad_finish(user, state);
 	}
 	DWORD r = (real_XInputGetState && !g_hide_real_pads) ? real_XInputGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
 	return r;
@@ -1378,6 +1454,8 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		          g_netpad.rx, g_netpad.ry, (unsigned long)(GetTickCount() - g_netpad_tick), (int)g_peer_ok,
 		          g_vpad[1].lx, g_vpad[1].ly, g_vpad[1].rx, g_vpad[1].ry, g_vpad_on[1]);
 		LeaveCriticalSection(&g_vpad_cs);
+	} else if (!strncmp(line, "menu", 4)) {
+		menu_status(reply, replysz);   // TASK 36: this copy's and the peer's menu state (tests)
 	} else if (!strncmp(line, "sync", 4)) {
 		sync_status(reply, replysz);
 	} else if (!strncmp(line, "scene", 5)) {

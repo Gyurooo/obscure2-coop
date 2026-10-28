@@ -4280,7 +4280,9 @@ static void host_levelask_tick(void)
 #define DOORU_QUEUED 1
 #define DOORU_DONE 2
 #define DOORU_PLACED 3
-#define DOORU_WAIT_MS 8000
+#define DOORU_WAIT_MS 15000
+#define DOORU_SETTLE_MS 400
+#define DOORU_MAX_DOORS 3
 static volatile LONG g_dooru_state, g_dooru_verdict;
 static int g_dooru_player;
 static DWORD g_dooru_at;
@@ -4289,6 +4291,21 @@ static float g_dooru_door_pos[3];
 static float g_dooru_anchor[3], g_dooru_face[3];   // the door's interaction anchor and normal
 static int g_dooru_tries;
 static char g_dooru_msg[200];
+// TASK 36: candidate doors and placement spots. A refusal is retried on the same door from another spot,
+// and a door whose use runs but does not take the user (its +0x120 lock branch) is left for the next door.
+static unsigned g_dooru_doors[DOORU_MAX_DOORS];
+static int g_dooru_ndoors, g_dooru_di, g_dooru_spot;
+
+// The places a use is attempted from, as (depth along the door's own normal, sideways offset). The game's
+// check (FUN_0042a480) wants the character within 80 units of the door's anchor (+0x10c) and its forward
+// along +0x13c, so every spot keeps both. TASK 36: the Z now comes from the ANCHOR - the old placement
+// kept the character's own Z, and the check's distance is 3-D, so a character on a ramp or another floor
+// stayed 113 units away while the 2-D placement looked right (measured in J001, five retries, same value).
+static const float g_dooru_spots[][2] = {
+	{ 55.0f, 0.0f }, { 40.0f, 0.0f }, { 68.0f, 0.0f }, { 25.0f, 0.0f },
+	{ -45.0f, 0.0f }, { 0.0f, 45.0f }, { 0.0f, -45.0f },
+};
+#define DOORU_NSPOTS ((int)(sizeof g_dooru_spots / sizeof g_dooru_spots[0]))
 
 // The slot of the chosen door in the CURRENT table (0 when it is gone: a level change rebuilt the world).
 static door_slot *dooru_slot(void)
@@ -4362,98 +4379,162 @@ static int door_use_run(unsigned h, door_slot *best, float bd)
 	((void(__fastcall *)(void *, void *, void *))f70)((void *)(uintptr_t)e, NULL, (void *)(uintptr_t)h);
 	g_door_prev = 0;   // the watch sees this use as its own and announces it to the peer
 	InterlockedIncrement(&g_dooru_verdict);
-	_snprintf(g_dooru_msg, sizeof g_dooru_msg, "ok usedoor player %d door %s id %x ent %x (%.1f units away)",
-		g_dooru_player, tag4(best->tag, c), (unsigned)best->id, e, bd);
-	logf("usedoor: %s", g_dooru_msg);
-	return 1;
+	// TASK 36: FUN_0042c2b0 has an early branch (door+0x120 != 0) that only plays the "cannot use" sound and
+	// clears the user, so a use can pass the gate and still do nothing. The use is only proven by the state
+	// it leaves: door+0xc4 = the character and character+0x2bc = the door.
+	if (!IsBadReadPtr((void *)(uintptr_t)e, 0x150) && rd32(e + 0xc4) == h) {
+		_snprintf(g_dooru_msg, sizeof g_dooru_msg,
+		          "ok usedoor player %d door %s id %x ent %x (%.1f units away, spot %d, door %d/%d)",
+		          g_dooru_player, tag4(best->tag, c), (unsigned)best->id, e, bd, g_dooru_spot,
+		          g_dooru_di + 1, g_dooru_ndoors);
+		logf("usedoor: %s", g_dooru_msg);
+		return 1;
+	}
+	{
+		unsigned locked = !IsBadReadPtr((void *)(uintptr_t)(e + 0x120), 4) ? rd32(e + 0x120) : 0;
+		unsigned en = !IsBadReadPtr((void *)(uintptr_t)(e + 0x24), 4) ? rd32(e + 0x24) : 0;
+		unsigned busy = !IsBadReadPtr((void *)(uintptr_t)(e + 0xb8), 4) ? rd32(e + 0xb8) : 0;
+		unsigned ur = !IsBadReadPtr((void *)(uintptr_t)(e + 0xc4), 4) ? rd32(e + 0xc4) : 0;
+		_snprintf(g_dooru_msg, sizeof g_dooru_msg,
+		          "error usedoor: the game ran the use but the door did not take the user (enabled %u busy %u "
+		          "locked %u user %x, spot %d)", en, busy, locked, ur, g_dooru_spot);
+		logf("usedoor: %s", g_dooru_msg);
+	}
+	return 2;
 }
 
 // The door's own check (FUN_0042a480) wants the character within 80 units of the door's interaction anchor
-// (door+0x10c) and its forward vector pointing at the door (dot >= 0.5). The test character usually spawns
-// far from the nearest door, so this places it 55 units in front of the anchor along the door's own normal
-// (door+0x13c) and turns it to the door, then lets a few frames of the game's own physics settle it before
-// the use runs (the game thread only; test-only path).
+// (door+0x10c) and its forward vector pointing along the door's normal (dot >= 0.5). The test character
+// usually spawns far from the nearest door, so the mod places it, lets a few frames of the game's own
+// physics settle it and then runs the use - on the game thread only (test-only path).
+// TASK 36: the attempts walk a list of candidate doors (nearest first, in the state the use can run in) and
+// a list of spots per door (g_dooru_spots). Each attempt is verified after the settle (the character must
+// still be within the check's reach and facing) and after the use (the door must have taken the character
+// as its user), so a spot the game's physics rejects or a door whose +0x120 branch does nothing moves on to
+// the next candidate instead of failing the whole request.
+static void dooru_pick_doors(unsigned h)
+{
+	float pp[3] = { 0, 0, 0 };
+	g_dooru_ndoors = 0;
+	g_dooru_di = 0;
+	g_dooru_spot = 0;
+	if (!IsBadReadPtr((const void *)(uintptr_t)(h + H_POS), 12))
+		memcpy(pp, (const void *)(uintptr_t)(h + H_POS), sizeof pp);
+	for (int pass = 0; pass < 2 && g_dooru_ndoors < DOORU_MAX_DOORS; pass++) {
+		// pass 0: only doors whose state FUN_0042c2b0's normal path accepts; pass 1: the rest, as a fallback
+		for (;;) {
+			int idx = -1;
+			float bd = 4000.0f;
+			for (int i = 0; i < g_door_n; i++) {
+				if (pass == 0 && !dooru_usable(g_doors[i].ent))
+					continue;
+				int dup = 0;
+				for (int k = 0; k < g_dooru_ndoors; k++)
+					if (g_dooru_doors[k] == g_doors[i].ent) { dup = 1; break; }
+				if (dup)
+					continue;
+				float d = adist(g_doors[i].pos, pp);
+				if (d < bd) { bd = d; idx = i; }
+			}
+			if (idx < 0 || g_dooru_ndoors >= DOORU_MAX_DOORS)
+				break;
+			g_dooru_doors[g_dooru_ndoors++] = g_doors[idx].ent;
+		}
+	}
+	logf("usedoor: %d candidate door(s) for player %d", g_dooru_ndoors, g_dooru_player);
+}
+
 static void door_use_frame(void)
 {
 	if (g_dooru_state != DOORU_QUEUED && g_dooru_state != DOORU_PLACED)
 		return;
-	if (g_dooru_state == DOORU_PLACED) {
-		if (GetTickCount() - g_dooru_at < 500)
-			return;   // let the character land on the floor
-		unsigned h = player_human(g_dooru_player);
-		door_slot *best = dooru_slot();
-		if (!h || !best) {
-			if (g_dooru_tries < 5) {
-				g_dooru_state = DOORU_QUEUED;   // look again
-				g_dooru_ent = 0;
-				return;
-			}
-			g_dooru_state = DOORU_DONE;
-			_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: the character or door vanished");
-			return;
-		}
-		unsigned pos = h + H_POS;
-		float pp[3] = { 0, 0, 0 };
-		if (!IsBadReadPtr((const void *)(uintptr_t)pos, 12))
-			memcpy(pp, (const void *)(uintptr_t)pos, sizeof pp);
-		if (door_use_run(h, best, adist(g_dooru_door_pos, pp))) {
-			g_dooru_state = DOORU_DONE;
-			g_dooru_ent = 0;
-			return;
-		}
-		if (g_dooru_tries < 5) {
-			// TASK 35: the game's own gate refused - the spot the character landed on is not usable from
-			// there. Place it again from another distance; the log above says which input failed.
-			// TASK 35: the SAME door (a re-selection found a busier neighbour door on a retry).
-			g_dooru_state = DOORU_QUEUED;
-			return;
-		}
-		g_dooru_state = DOORU_DONE;
-		g_dooru_ent = 0;
-		return;
-	}
-	logf("usedoor: the game thread is running the request (player %d)", g_dooru_player);
-	g_dooru_verdict = 0;
 	unsigned w = world_obj();
 	if (!w || !rd32(w + 4)) {
 		g_dooru_state = DOORU_DONE;
 		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: not in a level");
 		return;
 	}
-	if (w != g_door_world || rd32(w + 4) != g_door_level)
+	if (w != g_door_world || rd32(w + 4) != g_door_level) {
 		door_scan(w, rd32(w + 4));
+		g_dooru_ndoors = 0;   // the entities are new: pick again
+		g_dooru_ent = 0;
+	}
 	unsigned h = player_human(g_dooru_player);
 	if (!h) {
 		g_dooru_state = DOORU_DONE;
 		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: player %d has no character", g_dooru_player);
 		return;
 	}
-	unsigned pos = h + H_POS;
-	float pp[3] = { 0, 0, 0 };
-	if (!IsBadReadPtr((const void *)(uintptr_t)pos, 12))
-		memcpy(pp, (const void *)(uintptr_t)pos, sizeof pp);
-	door_slot *best = dooru_slot();
-	float bd = 0.0f;
-	if (!best) {
-		bd = 4000.0f;
-		for (int i = 0; i < g_door_n; i++) {   // a door the game's use can actually run
-			if (!dooru_usable(g_doors[i].ent))
-				continue;
-			float d = adist(g_doors[i].pos, pp);
-			if (d < bd) { bd = d; best = &g_doors[i]; }
-		}
-		for (int i = 0; i < g_door_n && !best; i++) {   // none in that state: the nearest, as before
-			float d = adist(g_doors[i].pos, pp);
-			if (d < bd) { bd = d; best = &g_doors[i]; }
-		}
+	if (g_dooru_state == DOORU_PLACED) {
+		if (GetTickCount() - g_dooru_at < DOORU_SETTLE_MS)
+			return;   // let the character land on the floor
+		door_slot *best = dooru_slot();
 		if (!best) {
+			g_dooru_ndoors = 0;   // the door vanished with a level change: pick again
+			g_dooru_ent = 0;
+			g_dooru_state = DOORU_QUEUED;
+			return;
+		}
+		float pp[3] = { 0, 0, 0 }, fw[3] = { 0, 0, 0 };
+		if (!IsBadReadPtr((const void *)(uintptr_t)(h + H_POS), 12))
+			memcpy(pp, (const void *)(uintptr_t)(h + H_POS), sizeof pp);
+		if (!IsBadReadPtr((const void *)(uintptr_t)(h + H_DIR), 12))
+			memcpy(fw, (const void *)(uintptr_t)(h + H_DIR), sizeof fw);
+		float dx = pp[0] - g_dooru_anchor[0], dy = pp[1] - g_dooru_anchor[1], dz = pp[2] - g_dooru_anchor[2];
+		float d3 = sqrtf(dx * dx + dy * dy + dz * dz);
+		float dot = fw[0] * g_dooru_face[0] + fw[1] * g_dooru_face[1] + fw[2] * g_dooru_face[2];
+		if (d3 > 78.0f || dot < 0.5f) {
+			logf("usedoor: spot %d did not hold (%.1f units from the anchor, facing dot %.2f): next spot",
+			     g_dooru_spot, d3, dot);
+			g_dooru_spot++;
+			g_dooru_state = DOORU_QUEUED;
+			return;
+		}
+		int v = door_use_run(h, best, adist(g_dooru_door_pos, pp));
+		if (v == 1) {
+			g_dooru_state = DOORU_DONE;
+			g_dooru_ent = 0;
+			return;
+		}
+		if (v == 2)
+			g_dooru_spot = DOORU_NSPOTS;   // the use ran but the door stayed shut: another spot will not help
+		else
+			g_dooru_spot++;
+		g_dooru_state = DOORU_QUEUED;
+		return;
+	}
+	if (!g_dooru_ndoors) {
+		dooru_pick_doors(h);
+		if (!g_dooru_ndoors) {
 			g_dooru_state = DOORU_DONE;
 			_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: no door in level %x", (unsigned)rd32(w + 4));
 			return;
 		}
-		g_dooru_ent = best->ent;
-	} else {
-		bd = adist(best->pos, pp);
+	}
+	if (g_dooru_di >= g_dooru_ndoors || g_dooru_spot >= DOORU_NSPOTS) {
+		// this door has no attempt left: the next candidate
+		g_dooru_di++;
+		g_dooru_spot = 0;
+		g_dooru_ent = 0;
+		if (g_dooru_di >= g_dooru_ndoors) {
+			if (!g_dooru_msg[0])
+				_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: no spot at the door(s) let the use run");
+			g_dooru_state = DOORU_DONE;
+			return;
+		}
+		return;
+	}
+	g_dooru_ent = g_dooru_doors[g_dooru_di];
+	door_slot *best = dooru_slot();
+	if (!best) {   // stale entry: re-pick next frame
+		g_dooru_ndoors = 0;
+		g_dooru_ent = 0;
+		return;
+	}
+	if (g_dooru_spot == 0) {
+		char c5[5];
+		logf("usedoor: the game thread is running the request (player %d, door %s ent %x, door %d/%d)",
+		     g_dooru_player, tag4(best->tag, c5), best->ent, g_dooru_di + 1, g_dooru_ndoors);
 	}
 	unsigned e = best->ent;
 	float anchor[3] = { 0, 0, 0 }, dir[3] = { 0, 0, 1 };
@@ -4464,48 +4545,31 @@ static void door_use_frame(void)
 	float n = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
 	if (n < 0.5f) { dir[0] = 0; dir[1] = 0; dir[2] = 1; n = 1.0f; }
 	dir[0] /= n; dir[1] /= n; dir[2] /= n;
-	// The door's own check (FUN_0042a480, decompile 24471-24498) wants the character within 80 units and
-	// `0.5 <= dot(character forward, door +0x13c normal)`: the character stands on the side the normal points
-	// away from and faces along the normal (FINDINGS_19 §2.2: walking "up" at a door whose normal is +Y).
-	static const float radii[5] = { 55.0f, 45.0f, 65.0f, 40.0f, 75.0f };
-	float rad = radii[g_dooru_tries < 0 ? 0 : (g_dooru_tries > 4 ? 4 : g_dooru_tries)];
-	float tx = anchor[0] - dir[0] * rad, ty = anchor[1] - dir[1] * rad, tz = pp[2];
-	float ddx = tx - pp[0], ddy = ty - pp[1];
-	// TASK 35: place whenever the character is not already standing on the spot the check wants. The old
-	// test compared the character with the TARGET (80 units); a character on the far side of the door is
-	// within 80 of the target but more than 80 from the door's anchor, so no placement happened and the
-	// gate refused forever (measured: 113 units from the anchor, five retries, same value).
-	int need_place = (ddx * ddx + ddy * ddy) > 30.0f * 30.0f;
-	if (need_place && !IsBadWritePtr((void *)(uintptr_t)pos, 24)) {
-		float np[3] = { tx, ty, tz };
-		memcpy((void *)(uintptr_t)pos, np, 12);
-		float nf[3] = { dir[0], dir[1], 0.0f };   // face along the door's normal (the check's dot >= 0.5)
-		memcpy((void *)(uintptr_t)(h + H_DIR), nf, 12);
-		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "usedoor: placed player %d %.0f units in front of door %x (was %.1f away)",
-			g_dooru_player, rad, e, bd);
-		logf("%s", g_dooru_msg);
-		g_dooru_tries++;
-		memcpy(g_dooru_door_pos, anchor, sizeof g_dooru_door_pos);
-		memcpy(g_dooru_anchor, anchor, sizeof g_dooru_anchor);
-		memcpy(g_dooru_face, dir, sizeof g_dooru_face);
-		g_dooru_at = GetTickCount();
-		g_dooru_state = DOORU_PLACED;
-		return;
-	}
-	g_dooru_face[0] = dir[0]; g_dooru_face[1] = dir[1]; g_dooru_face[2] = dir[2];
-	memcpy(g_dooru_anchor, anchor, sizeof g_dooru_anchor);
-	if (door_use_run(h, best, bd)) {
+	float depth = g_dooru_spots[g_dooru_spot][0], side = g_dooru_spots[g_dooru_spot][1];
+	float px = -dir[1], py = dir[0];   // the door's own sideways direction
+	float tx = anchor[0] - dir[0] * depth + px * side;
+	float ty = anchor[1] - dir[1] * depth + py * side;
+	float tz = anchor[2] + 4.0f;       // TASK 36: the anchor's floor, not the character's own height
+	if (IsBadWritePtr((void *)(uintptr_t)(h + H_POS), 24)) {
 		g_dooru_state = DOORU_DONE;
-		g_dooru_ent = 0;
+		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: the character's position is not writable");
 		return;
 	}
-	if (g_dooru_tries < 5) {
-		g_dooru_tries++;
-		g_dooru_state = DOORU_QUEUED;   // the gate refused: place it again from another distance
-		return;
+	float np[3] = { tx, ty, tz };
+	memcpy((void *)(uintptr_t)(h + H_POS), np, 12);
+	float nf[3] = { dir[0], dir[1], 0.0f };   // face along the door's normal (the check's dot >= 0.5)
+	memcpy((void *)(uintptr_t)(h + H_DIR), nf, 12);
+	memcpy(g_dooru_door_pos, anchor, sizeof g_dooru_door_pos);
+	memcpy(g_dooru_anchor, anchor, sizeof g_dooru_anchor);
+	memcpy(g_dooru_face, dir, sizeof g_dooru_face);
+	g_dooru_tries++;
+	{
+		char c5[5];
+		logf("usedoor: placed player %d at spot %d of door %s ent %x (depth %.0f, sideways %.0f)",
+		     g_dooru_player, g_dooru_spot, tag4(best->tag, c5), e, depth, side);
 	}
-	g_dooru_state = DOORU_DONE;
-	g_dooru_ent = 0;
+	g_dooru_at = GetTickCount();
+	g_dooru_state = DOORU_PLACED;
 }
 
 static int door_use_request(int player, char *reply, size_t replysz)
@@ -4523,6 +4587,9 @@ static int door_use_request(int player, char *reply, size_t replysz)
 	g_dooru_verdict = 0;
 	g_dooru_tries = 0;
 	g_dooru_ent = 0;
+	g_dooru_ndoors = 0;
+	g_dooru_di = 0;
+	g_dooru_spot = 0;
 	g_dooru_face[0] = g_dooru_face[1] = g_dooru_face[2] = 0.0f;
 	g_dooru_state = DOORU_QUEUED;
 	DWORD t0 = GetTickCount();
@@ -5172,6 +5239,198 @@ static int item_use_forward(int player, unsigned tag, char *reply, size_t replys
 	return 1;
 }
 
+// ---- shared menus (TASK 36) -------------------------------------------------------------------------
+// A menu is a shared session state, not a per-player screen. Each copy has ONE pause panel and ONE live
+// inventory panel (world+0x1794 / world+0x179c), and the pause menu and the inventory read PLAYER 1's pad
+// only (decompile 110548-110586: FUN_004b2b30(0x23, player 1's pad block)), so player 2 cannot drive them.
+// The state read here was measured on both copies (FINDINGS_36 §7): world+0x11c == 5 (pause menu) / 2
+// (inventory menu), controller +0xa4 == 3 (weapon wheel) / 4 (item menu).
+//
+// Rule 1 (input): while a menu is up, XInputGetState (obscoop2.c) hands the game the MERGED pad of both
+// players on BOTH copies - same input, same game logic, so the cursor and the tab move identically. Sticks
+// are merged only in the paused states (2/5); in the wheel/item menu the character can still walk, so only
+// buttons and triggers are merged there.
+// Rule 2 (convergence): both copies stream this state (PKT_MENU). If the peer is in a menu this copy is not
+// in (or left one this copy is still in), this copy pulses the same button on the right pad - the same way
+// the "guest START -> player-1 START pulse" has always worked. One pulse per correction, 400 ms apart.
+#define MENU_PERIOD_MS 250
+#define MENU_PEER_STALE_MS 1500
+#define MENU_PULSE_MS 160
+#define MENU_PULSE_GAP_MS 420
+
+static volatile LONG g_menu_state = -1, g_menu_ui0, g_menu_ui1;        // this copy (game thread writes)
+static volatile LONG g_peer_menu_state = -1, g_peer_menu_ui0, g_peer_menu_ui1, g_peer_menu_level, g_peer_menu_seq;
+static volatile DWORD g_peer_menu_at;
+static DWORD g_menu_sent_at, g_menu_sent_ui0 = (DWORD)-1, g_menu_sent_ui1 = (DWORD)-1;
+static LONG g_menu_sent_state = -1;
+static DWORD g_menu_pulse_at;
+static volatile LONG g_menu_pulses, g_menu_sent, g_menu_rcv;
+// Menu changes are ordered by a sequence number, exactly like the scene sync's leave_seq (TASK 31): every
+// LOCAL change bumps g_menu_my_seq, and a copy only corrects a divergence for a state NEWER than the one it
+// has already applied. Without the order the two copies chase each other (measured: 2 -> 1 -> 2 ... every
+// 400 ms, each copy pulsing the other). A tie goes to the host: only the guest corrects on a tie.
+static DWORD g_menu_my_seq, g_menu_seen_seq;
+
+// The world's menu state and the two controllers' UI state.
+static void menu_read(int *state, int *ui0, int *ui1)
+{
+	int st = 0, u0 = 0, u1 = 0;
+	unsigned w = world_obj();
+	if (w) {
+		unsigned s = rd32(w + 0x11c);
+		if (s < 0x40)
+			st = (int)s;
+		unsigned ctl = rd32(w + 0x1748);
+		if (ctl && !IsBadReadPtr((const void *)(uintptr_t)ctl, 0x764 + 0xa8)) {
+			unsigned a = rd32(ctl + 0xa4), b = rd32(ctl + 0x764 + 0xa4);
+			if (a < 8) u0 = (int)a;
+			if (b < 8) u1 = (int)b;
+		}
+	}
+	*state = st;
+	*ui0 = u0;
+	*ui1 = u1;
+}
+
+// The two world states measured as menus: 2 = the live inventory (CMenuInventoryLive: WEAPONS/ITEMS/TEAM and
+// the documents/map panels it opens), 5 = the pause menu. Other states (6 cinematic, 0x11 game over, the
+// load states) are NOT menus and must never be opened or closed by this code.
+static int menu_world_menu(int st)
+{
+	return st == 2 || st == 5;
+}
+
+// Called from XInputGetState (obscoop2.c) on every poll: is a menu up, so the two pads must be merged?
+// Only the two SHARED menus (inventory 2, pause 5) merge the pads: the wheel and the item menu are one
+// player's own (and last a button hold), so merging there could hand one player's A to the other player's
+// character during normal play.
+int menu_input_active(void)
+{
+	if (g_role == 0 || !g_peer_ok)
+		return 0;   // solo / no link: each pad stays its own
+	return menu_world_menu((int)g_menu_state);
+}
+
+// Called from XInputGetState: may the merged pad also move the CHARACTER? Only in the paused menu states;
+// in the wheel / item menu the characters still walk, so only buttons and triggers are merged there.
+int menu_paused(void)
+{
+	return menu_world_menu((int)g_menu_state);
+}
+
+// Pipe/status text (game thread values; the pipe thread reads them at its own risk, like the other dumps).
+static void menu_status(char *reply, size_t replysz)
+{
+	int st, ui0, ui1;
+	menu_read(&st, &ui0, &ui1);
+	_snprintf(reply, replysz,
+	          "menu local st %d ui %d/%d seq %lu | peer st %ld ui %ld/%ld seq %ld age %lu ms | sent %ld rcv %ld pulses %ld",
+	          st, ui0, ui1, (unsigned long)g_menu_my_seq, g_peer_menu_state, g_peer_menu_ui0, g_peer_menu_ui1,
+	          g_peer_menu_seq, (unsigned long)(g_peer_menu_at ? GetTickCount() - g_peer_menu_at : 0),
+	          g_menu_sent, g_menu_rcv, g_menu_pulses);
+}
+
+// Network thread: the peer's menu state (a convergence signal, not the data the menu is drawn from).
+static void peer_on_menu(const char *buf, int n)
+{
+	const pkt_menu *p = (const pkt_menu *)buf;
+	if (n != (int)sizeof *p)
+		return;
+	g_peer_menu_state = (LONG)p->state;
+	g_peer_menu_ui0 = (LONG)p->ui0;
+	g_peer_menu_ui1 = (LONG)p->ui1;
+	g_peer_menu_level = (LONG)p->level;
+	g_peer_menu_seq = (LONG)p->seq;
+	g_peer_menu_at = GetTickCount();
+	InterlockedIncrement(&g_menu_rcv);
+}
+
+// A short press of a button on one pad, through XInputGetState (obscoop2.c).
+static void menu_pulse(int user, unsigned buttons, int rt, char what)
+{
+	menu_pulse_start(user, buttons, rt, MENU_PULSE_MS);
+	g_menu_pulse_at = GetTickCount();
+	InterlockedIncrement(&g_menu_pulses);
+	logf("%s: sharing the menu: pulsing %c on player %d's pad (peer menu %ld, this copy %ld)", 
+	     g_role == 2 ? "guest" : "host", what, user + 1, g_peer_menu_state, g_menu_state);
+}
+
+// Game thread, once per frame: publish this copy's menu state and repair a divergence.
+static void menu_tick(void)
+{
+	if (g_role == 0)
+		return;
+	int st, ui0, ui1;
+	menu_read(&st, &ui0, &ui1);
+	int prev = (int)g_menu_state;
+	g_menu_state = st;
+	g_menu_ui0 = ui0;
+	g_menu_ui1 = ui1;
+	if (!g_peer_ok)
+		return;
+	DWORD now = GetTickCount();
+	int active = menu_world_menu(st) || ui0 >= 3 || ui1 >= 3;
+	int changed = st != g_menu_sent_state || (DWORD)ui0 != g_menu_sent_ui0 || (DWORD)ui1 != g_menu_sent_ui1;
+	if (st != prev)   // a LOCAL change: it becomes the newest state of the pair (see g_menu_my_seq)
+		g_menu_my_seq = (g_menu_my_seq > g_menu_seen_seq ? g_menu_my_seq : g_menu_seen_seq) + 1;
+	if (changed || (active && now - g_menu_sent_at >= MENU_PERIOD_MS)) {
+		unsigned w = world_obj();
+		pkt_menu p;
+		memset(&p, 0, sizeof p);
+		p.level = w ? rd32(w + 4) : 0;
+		p.state = (DWORD)st;
+		p.ui0 = (DWORD)ui0;
+		p.ui1 = (DWORD)ui1;
+		p.seq = g_menu_my_seq;
+		p.owner = (DWORD)(ui0 != (int)g_menu_sent_ui0 ? 0 : (ui1 != (int)g_menu_sent_ui1 ? 1 : -1));
+		net_send(PKT_MENU, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+		InterlockedIncrement(&g_menu_sent);
+		g_menu_sent_at = now;
+		g_menu_sent_state = st;
+		g_menu_sent_ui0 = (DWORD)ui0;
+		g_menu_sent_ui1 = (DWORD)ui1;
+		if (st != prev && (menu_world_menu(st) || menu_world_menu(prev)))
+			logf("%s: menu state %d -> %d (ui %d/%d, level %08lx, seq %lu)", g_role == 2 ? "guest" : "host", prev, st,
+			     ui0, ui1, (unsigned long)(w ? rd32(w + 4) : 0), (unsigned long)g_menu_my_seq);
+	}
+	if (g_peer_menu_state < 0 || now - g_peer_menu_at > MENU_PEER_STALE_MS)
+		return;
+	int pst = (int)g_peer_menu_state;
+	int pseq = (int)g_peer_menu_seq;
+	if (pseq > (int)g_menu_seen_seq) {
+		g_menu_seen_seq = (DWORD)pseq;   // the peer's newest change: this copy follows it
+	} else {
+		if (pseq < (int)g_menu_seen_seq)
+			return;                     // an older state than the one already applied: never act on it
+		if (g_role != 2)
+			return;                     // a tie: the host does not correct, so the two cannot chase each other
+	}
+	if (now - g_menu_pulse_at < MENU_PULSE_GAP_MS)
+		return;
+	unsigned w = world_obj();
+	DWORD lvl = w ? rd32(w + 4) : 0;
+	if ((DWORD)g_peer_menu_level != lvl)
+		return;   // the peer's menu state is from another level
+	if (menu_world_menu(pst) && st == 1) {
+		// the peer opened a menu this copy did not see: press the same button here
+		if (pst == 5)
+			menu_pulse(0, 0x0010, 0, 'S');    // START: the pause menu (probe: opens on both)
+		else
+			menu_pulse(0, 0x0020, 0, 'B');    // BACK: the inventory menu (probe: st 2 on both)
+		return;
+	}
+	if (pst == 1 && menu_world_menu(st)) {
+		// the peer left the menu and this copy is still in it: press the same button to leave
+		if (st == 5)
+			menu_pulse(0, 0x0010, 0, 'S');    // START leaves the pause menu (FUN_004b2770)
+		else
+			menu_pulse(0, 0x2000, 0, 'A');    // B leaves the inventory (measured: host B -> st 1 on both)
+		return;
+	}
+	// The wheel (3) / item menu (4) are not repaired here: they are one player's own pad hold, already
+	// carried by the pad stream on both copies, and a pulse there would disturb normal play.
+}
+
 // ---- frame tick (Present hook, main thread) --------------------------------------------------------
 
 static void sync_init(void)
@@ -5230,6 +5489,8 @@ static void frame_tick(void)
 		hang_phase("game code after frame_tick (no peer)");
 		return;
 	}
+	hang_phase("in menu_tick (shared menus)");
+	menu_tick();   // TASK 36: publish the menu state and make both copies show the same menu
 	{   // every 10 s: a line the testers can send along with the log
 		static DWORD last_stat;
 		DWORD now = GetTickCount();

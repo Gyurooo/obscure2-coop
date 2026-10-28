@@ -60,7 +60,9 @@ What is synced (tested on two copies on one PC)
   - the save: the host's loaded save reaches the guest, and both copies build the same world
   - the scripted events: subtitles and the "press to skip" bar, and a skip on ONE side ends the
     cutscene on BOTH    (a skip is the only input that reaches across; everything else is local)
-  - pause: START on either controller pauses both copies
+  - pause and menus: START on either controller pauses both copies; the pause menu and the inventory
+    (WEAPONS / ITEMS / TEAM, and the documents and map they open) show on BOTH screens, and BOTH players
+    can move in them and close them - each sees the same screen
 
 What is NOT synced (or not proven)
   - Attacks, enemies and combat: the bot tests could not make the test save attack at all, so combat

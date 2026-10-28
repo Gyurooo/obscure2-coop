@@ -216,6 +216,18 @@ def reset_level(save, lvl):
     print('== reset: the host loads %s again (back to %s)' % (save, lvl))
     print('   reply: %s' % HP.cmd('loadsave %s' % save))
     t0 = time.time()
+    # TASK 36: the check used to return as soon as both copies were in ONE level - which they already were
+    # right after the previous phase (and right before the load starts), so the next phase ran while the
+    # guest was still rebuilding its world and the door request answered "not in a level". Wait for the
+    # load to take the pair out of the level first, then for both to be back in one level.
+    left = False
+    while time.time() - t0 < 30:
+        if not (in_level(H) and in_level(G)):
+            left = True
+            break
+        time.sleep(0.2)
+    if not left:
+        print('   note: neither copy left the level within 30 s (the load may not have started)')
     while time.time() - t0 < 90:
         if in_level(H) and in_level(G) and tag(level(H)) == tag(level(G)):
             print('   both copies in level %s after %.1f s' % (tag(level(H)), time.time() - t0))
