@@ -1754,6 +1754,7 @@ static LSTATUS WINAPI hk_RegCreateKeyA(HKEY k, LPCSTR sub, PHKEY out)
 #include "window.c"
 #include "net.c"
 #include "hooks.c"
+#include "hang.c"   // TASK 35: the game-thread stall watchdog
 #include "sync.c"
 
 // The game refuses to start while the mutex "obscure2_lock" exists. With OBSCOOP_MULTI=1 this copy
@@ -1906,6 +1907,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 		logf("input map: %s the shipped obscoop_o2.ipt to the co-op profile", g_seeded_ipt > 0 ? "copied" : "could not copy");
 	logf("obscoop 0.2 loaded, pid %lu, game dir %s, data dir %s", GetCurrentProcessId(), g_dir, g_data);
 	crash_install();   // TASK 34: a fatal exception leaves a report (code, module+offset, stack, log tail)
+	hang_install();    // TASK 35: 3 s without a frame -> report where the game thread is
 	// Settings: obscoop.ini next to the exe, section [obscoop], key = name without OBSCOOP_. An
 	// environment variable with the full name wins (the one-PC tests use those).
 	{

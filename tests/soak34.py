@@ -6,9 +6,11 @@ until BOTH copies are in the same level, then drives movement and an attack on b
 iteration also runs the game's own door use on the host and on the guest (PKT_DOOR in both directions).
 
 The pass conditions: every iteration reached a common level on both copies, both processes are alive at
-the end, and neither log contains a crash report ("*** obscoop: FATAL EXCEPTION"). The runner then asks
-the guest to fault (pipe `crash`) and checks that the report is present and complete - that is the proof
-that the handler works.
+the end, BOTH GAME THREADS ARE STILL RUNNING (the `frames` counter in `sync` rises - TASK 34's soak
+passed while the guest's game thread was stopped), and neither log contains a crash report
+("*** obscoop: FATAL EXCEPTION") or a stall report ("*** obscoop: GAME THREAD STALLED", TASK 35). The
+runner then asks the guest to fault (pipe `crash`) and checks that the report is present and complete -
+that is the proof that the crash handler works.
 
 Usage: python -I soak34.py <host pid> <guest pid> [iterations]
 """
@@ -91,6 +93,26 @@ def count_line(pipe, what):
     return ''
 
 
+def frames(pipe):
+    """The game-thread heartbeat from `sync` (sync.c:4921). -1 when the pipe does not say."""
+    part = count_line(pipe, 'frames ')
+    try:
+        return int(part.split()[-1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def threads_running(waited=2.0):
+    """Both game threads must still run frames: sample, wait, sample again."""
+    f0 = (frames(HP), frames(GP))
+    time.sleep(waited)
+    f1 = (frames(HP), frames(GP))
+    running = (f1[0] > f0[0] >= 0) and (f1[1] > f0[1] >= 0)
+    print('game threads: host frames %s -> %s, guest %s -> %s (%s)' % (
+        f0[0], f1[0], f0[1], f1[1], 'both running' if running else 'STOPPED'))
+    return running
+
+
 ok_all = True
 warm, el = wait_same(45)
 print('start: both copies in one level after %.1fs (%s / %s)' % (el, tag(level(H)), tag(level(G))))
@@ -124,6 +146,10 @@ for i in range(iters):
     settle(1.5)
     drive()
     attack()
+    if not threads_running(1.5):
+        ok_all = False
+        print('     soak stops here: a game thread is not running any more (the watchdog report is in the log)')
+        break
     if (i + 1) % 5 == 0:
         use_door(HP, 0, 'host')
         time.sleep(0.6)
@@ -146,6 +172,8 @@ for name, pid in (('host', host_pid), ('guest', guest_pid)):
         alive = False
 
 print('final levels: host %s guest %s' % (tag(level(H)), tag(level(G))))
+if not threads_running(2.0):
+    ok_all = False
 print('door counters: host [%s] guest [%s]' % (count_line(HP, 'door sent'), count_line(GP, 'door sent')))
 if alive and ok_all:
     print('soak OK (%d location changes, both copies alive)' % iters)

@@ -24,6 +24,7 @@ Phases:
 Usage: python -I check_doors.py <host pid> <guest pid> [--by host|guest] [--reset <save file>]
 """
 import os
+import re
 import struct
 import sys
 import time
@@ -149,6 +150,20 @@ def phase(by):
     if not reply.startswith('ok'):
         print('%s FAIL: the game did not run the use' % by.upper())
         return False
+    # TASK 35: the mod now uses the nearest door whose STATE the game's own use can run in (enabled, not
+    # busy, +0x120 clear); the nearest door this script shows can be one stuck in that other state. Take
+    # the destination from the door the reply names, or the transition would be compared with another door.
+    m = re.search(r'ent ([0-9a-f]+)', reply)
+    if m:
+        used_ent = int(m.group(1), 16)
+        if used_ent != d['ent']:
+            used = [x for x in doors(user_copy) if x['ent'] == used_ent]
+            if used:
+                ud = used[0]
+                print('   the mod used door ent %x (id %s, dest %s), not the nearest one shown above (id %s, dest %s)'
+                      % (used_ent, tag(ud['id']), tag(ud['dest']) if ud['dest'] else '-', tag(d['id']), dest))
+                d = ud
+                dest = tag(d['dest']) if d['dest'] else '-'
     h = player_human(user_copy, pl)
     want_tag = tag(u32(user_copy, h + 0x14)) if h else '-'
     t0 = time.time()

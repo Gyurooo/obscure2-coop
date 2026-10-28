@@ -158,9 +158,16 @@ for g in host guest; do
 	fatal=$(echo ${fatal:-0} | tr -d '[:space:]')
 	unhandled=$(grep -ac "on the unhandled" "$d/obscoop.log" 2>/dev/null)
 	unhandled=$(echo ${unhandled:-0} | tr -d '[:space:]')
-	echo "  $g: alive $alive, FATAL EXCEPTION lines ${fatal:-0} (unhandled ${unhandled:-0})"
+	stalls=$(grep -ac "GAME THREAD STALLED" "$d/obscoop.log" 2>/dev/null)
+	stalls=$(echo ${stalls:-0} | tr -d '[:space:]')
+	echo "  $g: alive $alive, FATAL EXCEPTION lines ${fatal:-0} (unhandled ${unhandled:-0}), game-thread stall reports ${stalls:-0}"
 	if [ "$alive" = 0 ]; then echo "-- $g died during the soak"; RC=1; fi
 	if [ "${unhandled:-0}" != 0 ]; then echo "-- $g logged an unhandled crash:"; grep -a -A8 "FATAL EXCEPTION" "$d/obscoop.log" | head -20; RC=1; fi
+	if [ "${stalls:-0}" != 0 ]; then
+		echo "-- $g stopped running frames (TASK 35 watchdog); the reports:"
+		grep -a -A18 "GAME THREAD STALLED" "$d/obscoop.log" | head -40
+		RC=1
+	fi
 done
 
 echo "== crash handler proof: the guest is asked to fault (pipe crash)"
