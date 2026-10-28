@@ -464,7 +464,9 @@ static volatile DWORD g_netpad_tick;
 static int g_local_pad;
 static int g_remote_pad_idx = 1;   // host: the game user the guest's controller feeds (net.c keeps g_remote_pad in step)
 static volatile LONG g_peer_ok;
+static volatile LONG g_ever_connected;   // guest: linked at least once; a lost link must not let our pad drive player 1
 static void net_status(char *reply, size_t replysz);
+static void net_pause_set(DWORD ms);   // net.c: test-only link pause (`netpause <ms>`)
 static void sync_status(char *reply, size_t replysz);
 
 
@@ -649,6 +651,8 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 				drop_remote_look((xstate *)state);
 			} else if (g_peer_ok) {
 				memset(state, 0, sizeof(xstate));   // connected, the host's pad is idle or the stream is late
+			} else if (g_ever_connected && in_level) {
+				memset(state, 0, sizeof(xstate));   // the link dropped in a level: our pad must not drive the host's character
 			} else {
 				memset(state, 0, sizeof(xstate));   // not connected yet: this PC's own pad drives the menus
 				pad_read((DWORD)g_local_pad, state);
@@ -1196,6 +1200,15 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		LeaveCriticalSection(&g_vpad_cs);
 	} else if (!strncmp(line, "sync", 4)) {
 		sync_status(reply, replysz);
+	} else if (!strncmp(line, "netpause", 8)) {
+		long ms = -1;
+		sscanf(line + 8, "%ld", &ms);
+		if (ms < 0 || ms > 600000) {
+			_snprintf(reply, replysz, "error netpause <ms 0..600000> (test-only: drop the link in both directions)");
+		} else {
+			net_pause_set((DWORD)ms);
+			_snprintf(reply, replysz, "ok net paused for %ld ms (0 = cleared)", ms);
+		}
 	} else if (!strncmp(line, "net", 3)) {
 		net_status(reply, replysz);
 	} else if (!strncmp(line, "tp ", 3) || !strncmp(line, "tpsafe ", 7) || !strncmp(line, "tpraw ", 6)) {

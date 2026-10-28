@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 11   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 12   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -26,9 +26,12 @@
                         // 10: npc_state carries the enemy's life (+0x320) and AI/death state (+0x2dc); the host owns them
                         // 11: PKT_ITEMUSE: an item use on the guest's own player 2 is applied by the host (which owns the
                         //     inventory and the character life), so it lands once and is not reverted by the next snapshot
+                        // 12: TASK 25: PKT_HELLO carries the guest's level / in-level / need-saves (a reconnect resumes
+                        //     without a reload); PKT_CHAR: each side streams the character it owns (the guest player 2,
+                        //     the host player 1) so the other copy follows the owner instead of re-simulating it
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
-	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17 };
+	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
 
 #pragma pack(push, 1)
@@ -38,6 +41,13 @@ typedef struct { pkt_hdr h; DWORD t_ms; DWORD host_ms; } pkt_ping;   // pong: ho
 typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; DWORD life; DWORD anim; DWORD wep[4]; DWORD wcur; } ch_state;   // anim = character+0x2dc (death/animation state)   // life = character+0x320   // wep = the tags in the 4 live weapon slots (character+0x704 + i*4 -> weapon+0x10), wcur = character+0x714
 #define MAX_CH 8
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; xstate hpad; float yaw; DWORD yaw_valid; ch_state ch[MAX_CH]; } pkt_state;
+// TASK 25: the guest's hello repeats what it already has, so a reconnect is a resume and not a fresh join:
+// level = the world tag it is in (0 = none), in_level = 1 when its game is in a level, need_saves = 1
+// when this process has not received a save file from the host yet.
+typedef struct { pkt_hdr h; DWORD level; DWORD in_level; DWORD need_saves; } pkt_hello;
+// TASK 25: the character this copy owns (guest: player 2, host: player 1), streamed so the other copy
+// follows the owner instead of re-simulating it from a delayed pad in another camera frame.
+typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; ch_state me; } pkt_char;
 typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; } pkt_req;
 // life = character+0x320 (float bits), state = character+0x2dc (the NPC's AI/animation/death state; the
 // same field the humans stream as `anim`). TASK 21: the host owns enemy life and death, the guest applies
@@ -80,7 +90,14 @@ static void guest_on_npc(const char *buf, int n);
 static void guest_on_region(const char *buf, int n);
 static void peer_on_pickup(const char *buf, int n);
 static void peer_on_itemuse(const char *buf, int n);
+static void host_on_char(const char *buf, int n);
+static unsigned rd32(unsigned addr);      // sync.c
+static unsigned world_obj(void);          // sync.c
+static int guest_need_saves(void);        // sync.c: this process has no save file from the host yet
 static volatile LONG g_join_pending;   // host: a guest just connected, send it the current state from the main thread
+// Host: what the guest's last PKT_HELLO said about its own state. A reconnect inside the same level
+// must not load anything (TASK 25 part B).
+static DWORD g_hello_level, g_hello_in_level, g_hello_need_saves;
 
 #include "steam.c"
 
@@ -99,6 +116,25 @@ static volatile DWORD g_last_rx_tick;
 static DWORD g_tx_seq;
 static volatile float g_guest_rtt;      // host: the round trip the guest measured
 static float g_rtt_max;                 // guest: the largest of the last 16 round trips (the delay has to cover it)
+
+// ---- test-only link pause (TASK 25 part B) -----------------------------------------------------
+// `netpause <ms>` on the pipe stops this copy from sending and receiving for that long, which is how the
+// reconnect test drops the link in the middle of play without touching the transport. 0 clears it.
+static volatile LONG g_net_pause_until;
+static int net_paused(void)
+{
+	DWORD until = (DWORD)g_net_pause_until;
+	return until && (LONG)(GetTickCount() - until) < 0;
+}
+static void net_pause_set(DWORD ms)
+{
+	LONG until = ms ? (LONG)(GetTickCount() + ms) : 0;
+	InterlockedExchange(&g_net_pause_until, until);
+	if (ms)
+		logf("net: link paused for %lu ms (test): no packet is sent or received", (unsigned long)ms);
+	else
+		logf("net: link pause cleared (test)");
+}
 
 // Guest: estimate the host's clock. The sample with the smallest round trip among the last 8 is the best one.
 static void clock_sample(const pkt_ping *pp)
@@ -150,6 +186,9 @@ static void net_send_to(sid_t to, BYTE type, void *pkt, WORD payload)
 	h->seq = ++g_tx_seq;
 	int len = (int)(sizeof(pkt_hdr) + payload);
 	int ok;
+	if (net_paused()) {   // test-only: the link is down, the packet is dropped like a lost datagram
+		return;
+	}
 	if (g_use_steam) {
 		ok = steam_send(to, pkt, len);
 	} else {
@@ -183,6 +222,8 @@ static void host_drop_guest(const char *why)
 	if (!g_peer_ok)
 		return;
 	g_peer_ok = 0;
+	g_hello_level = 0;   // the next hello has to say again what the guest has
+	g_hello_in_level = 0;
 	vpad_set(g_remote_pad, 0, 0, 0, 0, 0, 0, 0, 0);
 	logf("net: guest dropped (%s); virtual pad %d disconnected", why, g_remote_pad);
 }
@@ -218,6 +259,8 @@ static void net_send_req(DWORD kind, unsigned a, unsigned b, unsigned c, const c
 static void net_handle(const char *buf, int n, sid_t from)
 {
 	const pkt_hdr *h = (const pkt_hdr *)buf;
+	if (net_paused())   // test-only link pause: nothing arrives either
+		return;
 	if (n < (int)sizeof *h || h->magic != NET_MAGIC || h->version != NET_VERSION ||
 		(int)(sizeof *h + h->len) != n) {
 		InterlockedIncrement(&g_net_bad);
@@ -240,7 +283,25 @@ static void net_handle(const char *buf, int n, sid_t from)
 		switch (h->type) {
 		case PKT_HELLO: {
 			pkt_hdr w;
-			host_save_begin();   // (re)send every save file to this guest
+			// TASK 25: the hello says what the guest already has. A guest that was in a level before the
+			// link dropped does not need a second save transfer; a fresh guest (nothing received yet) does.
+			const pkt_hello *hi = (const pkt_hello *)buf;
+			if (n == sizeof *hi) {
+				g_hello_level = hi->level;
+				g_hello_in_level = hi->in_level;
+				g_hello_need_saves = hi->need_saves;
+			} else {
+				g_hello_level = 0;   // an older/empty hello: behave like a fresh guest
+				g_hello_in_level = 0;
+				g_hello_need_saves = 1;
+			}
+			if (g_hello_need_saves)
+				host_save_begin();   // (re)send every save file to this guest
+			else
+				logf("net: guest joined again and already has the saves: no transfer");
+			g_join_pending = 1;   // also while still "connected": a guest that restarted inside the 3 s
+			                      // timeout sends its hello to the same address, and it still needs the
+			                      // welcome path (resume, or the load that brings it back into the game)
 			net_send(PKT_WELCOME, &w, 0);
 			break;
 		}
@@ -279,6 +340,9 @@ static void net_handle(const char *buf, int n, sid_t from)
 		case PKT_ITEMUSE:
 			peer_on_itemuse(buf, n);
 			break;
+		case PKT_CHAR:
+			host_on_char(buf, n);   // the character the guest owns (player 2), streamed to its copy here
+			break;
 		}
 	} else if (g_role == 2) {
 		if (!g_peer_ok) {
@@ -286,6 +350,7 @@ static void net_handle(const char *buf, int n, sid_t from)
 				return;
 			g_peer = from;
 			g_peer_ok = 1;
+			g_ever_connected = 1;
 			g_last_hostpad_seq = 0;
 			guest_save_session();   // a new session: the host starts its save transfer again
 			logf("net: host welcomed us (%s)", g_use_steam ? "steam" : "udp");
@@ -344,6 +409,8 @@ static void net_tick(void)
 {
 	static DWORD last_hello, last_ping, last_pad, tick;
 	DWORD now = GetTickCount();
+	if (net_paused())   // test-only link pause: no timers advance, so the first tick after it acts at once
+		return;
 	if (g_role == 1) {
 		if (g_peer_ok && now - g_last_rx_tick > (g_use_steam ? 10000u : 3000u))
 			host_drop_guest(g_use_steam ? "timeout 10 s" : "timeout 3 s");
@@ -383,7 +450,14 @@ static void net_tick(void)
 		return;
 	}
 	if (!g_peer_ok && now - last_hello >= 1000) {
-		pkt_hdr hello;
+		pkt_hello hello;
+		memset(&hello, 0, sizeof hello);
+		{   // TASK 25: what this copy already has, so a reconnect after a dropped link is a resume
+			unsigned w = world_obj();
+			hello.in_level = (DWORD)game_in_level();
+			hello.level = (hello.in_level && w) ? rd32(w + 4) : 0;
+			hello.need_saves = (DWORD)guest_need_saves();
+		}
 		if (g_use_steam) {
 			sid_t hosts[16];
 			int n = steam_find_hosts(hosts, 16);
@@ -392,12 +466,12 @@ static void net_tick(void)
 			if (scan_only < 0)
 				scan_only = getenv("OBSCOOP_SCAN_ONLY") != NULL;   // test: count candidates, contact nobody
 			for (int i = 0; i < n && !scan_only; i++)
-				net_send_to(hosts[i], PKT_HELLO, &hello, 0);
+				net_send_to(hosts[i], PKT_HELLO, &hello, (WORD)(sizeof hello - sizeof(pkt_hdr)));
 			static int logged;
 			if (!logged++)
 				logf("net: looking for the host among %d candidate(s)", n);
 		} else {
-			net_send(PKT_HELLO, &hello, 0);
+			net_send(PKT_HELLO, &hello, (WORD)(sizeof hello - sizeof(pkt_hdr)));
 		}
 		last_hello = now;
 	}
@@ -580,4 +654,8 @@ static void net_status(char *reply, size_t replysz)
 	if (g_use_steam && l < replysz)
 		_snprintf(reply + l, replysz - l, " steam_ok %ld session_requests %ld accepted %ld refused %ld tx_fail %ld candidates %d", g_steam_ok,
 			g_steam_session_requests, g_steam_accepted, g_steam_refused, g_steam_tx_fail, g_last_candidates);
+	l = strlen(reply);
+	if (l < replysz)
+		_snprintf(reply + l, replysz - l, " paused %d guest_level %08lx", net_paused(),
+			(unsigned long)(g_role == 1 ? g_hello_level : 0));
 }

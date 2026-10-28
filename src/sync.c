@@ -413,12 +413,26 @@ static void host_on_save_ack(const char *buf, int n)
 
 // Guest: a new session (the host welcomed us), so the host starts its transfer again. Forget what the
 // previous one completed; the files are still on disk, but the host's copies may have changed.
+// TASK 25: when this process already received a file from the host, a reconnect is not a new session:
+// the host is told it needs no transfer (the hello's need_saves) and nothing is forgotten here, so a
+// load that waits for a transferred file still finds it.
 static void guest_save_session(void)
 {
+	if (g_save_rcvd_n > 0) {
+		logf("net: reconnect; the save files from the host are still current (%d file%s)", g_save_rcvd_n,
+			g_save_rcvd_n == 1 ? "" : "s");
+		return;
+	}
 	EnterCriticalSection(&g_rcvd_cs);
 	g_save_rcvd_n = 0;
 	LeaveCriticalSection(&g_rcvd_cs);
 	InterlockedExchange(&g_saves_done, 0);
+}
+
+// Host side of the same rule (called from net.c's hello): does the guest still need the save files?
+static int guest_need_saves(void)
+{
+	return g_save_rcvd_n == 0;
 }
 
 static int guest_save_complete(const char *name)
@@ -843,6 +857,83 @@ static CRITICAL_SECTION g_rx_cs;
 static pkt_state g_rx_state;
 static volatile LONG g_rx_state_new;
 
+// ---- host: the character the guest owns (player 2) -------------------------------------------------
+// TASK 25: the guest is the authority for the character its own pad drives. It streams that character's
+// position, facing and animation (PKT_CHAR) at the pad rate; this copy follows it, so the two copies
+// cannot walk different paths because their cameras (each follows its own player) differ. The follow is
+// a per-packet blend, not a snap, unless the character is far away (a door the guest took alone).
+static pkt_char g_rx_char, g_rx_char_prev;
+static volatile LONG g_rx_char_new;
+static volatile LONG g_char_rcv, g_char_applied, g_char_blends, g_char_snaps, g_char_skipped, g_char_sent, g_char_extrap;
+
+static void host_on_char(const char *buf, int n)
+{
+	if (n != (int)sizeof(pkt_char))
+		return;
+	EnterCriticalSection(&g_rx_cs);
+	g_rx_char_prev = g_rx_char;
+	memcpy(&g_rx_char, buf, sizeof g_rx_char);
+	g_rx_char_new = 1;
+	LeaveCriticalSection(&g_rx_cs);
+	InterlockedIncrement(&g_char_rcv);
+}
+
+static void host_apply_remote_char(void)
+{
+	if (g_role != 1 || !g_rx_char_new)
+		return;
+	pkt_char p, prev;
+	EnterCriticalSection(&g_rx_cs);
+	p = g_rx_char;
+	prev = g_rx_char_prev;
+	g_rx_char_new = 0;
+	LeaveCriticalSection(&g_rx_cs);
+	unsigned w = world_obj();
+	if (!w || rd32(w + 4) != p.level) {
+		InterlockedIncrement(&g_char_skipped);
+		return;
+	}
+	// The stream says where the guest's character was at p.t_ms (host timeline); the packet took half a
+	// round trip to get here, so extrapolate along the last two samples by that age. Without it the host's
+	// copy would constantly trail the guest's by speed x delay (8 units at 110 units/s over a 60 ms relay).
+	float tx = p.me.pos[0], ty = p.me.pos[1], tz = p.me.pos[2];
+	DWORD now = timeline_now();
+	LONG age = (LONG)(now - p.t_ms);
+	LONG span = (LONG)(p.t_ms - prev.t_ms);
+	if (prev.me.tag == p.me.tag && span > 0 && age > 0 && age <= 120) {
+		float vx = (p.me.pos[0] - prev.me.pos[0]) / (float)span;
+		float vy = (p.me.pos[1] - prev.me.pos[1]) / (float)span;
+		if (vx * vx + vy * vy < 900.0f) {   // sanity: under 30 000 units/s
+			tx += vx * (float)age;
+			ty += vy * (float)age;
+			InterlockedIncrement(&g_char_extrap);
+		}
+	}
+	unsigned hs[MAX_CH];
+	int n = world_humans(hs, MAX_CH);
+	for (int k = 0; k < n; k++) {
+		if (rd32(hs[k] + H_TAG) != p.me.tag)
+			continue;
+		float *pos = (float *)(uintptr_t)(hs[k] + H_POS), *dir = (float *)(uintptr_t)(hs[k] + H_DIR);
+		if (IsBadWritePtr(pos, 12) || IsBadWritePtr(dir, 12))
+			break;
+		float ex = tx - pos[0], ey = ty - pos[1], ez = tz - pos[2];
+		float err = sqrtf(ex * ex + ey * ey);
+		if (err > 60.0f) {   // far off (a door, a respawn, a lost stream): take it whole
+			pos[0] += ex; pos[1] += ey; pos[2] += ez;
+			memcpy(dir, p.me.dir, 12);
+			InterlockedIncrement(&g_char_snaps);
+		} else if (err > 0.05f) {
+			float kk = 0.7f;   // smooth: most of what is left per frame (two copies share one PC: ~17 fps)
+			pos[0] += ex * kk; pos[1] += ey * kk; pos[2] += ez * kk;
+			InterlockedIncrement(&g_char_blends);
+		}
+		*(DWORD *)(uintptr_t)(hs[k] + 0x2dc) = p.me.anim;   // the guest owns its character's animation
+		InterlockedIncrement(&g_char_applied);
+		break;
+	}
+}
+
 static void guest_on_state(const char *buf, int n)
 {
 	if (n != (int)sizeof(pkt_state))
@@ -1263,7 +1354,21 @@ static void guest_apply_state(void)
 			float *pos = (float *)(uintptr_t)(hs[k] + H_POS), *dir = (float *)(uintptr_t)(hs[k] + H_DIR);
 			if (IsBadWritePtr(pos, 12) || IsBadWritePtr(dir, 12))
 				break;
-			*(DWORD *)(uintptr_t)(hs[k] + 0x320) = st.ch[i].life;   // health from the host
+			*(DWORD *)(uintptr_t)(hs[k] + 0x320) = st.ch[i].life;   // health stays host-owned (damage is applied there)
+			if (hs[k] == mine) {
+				// TASK 25: this copy owns player 2. Its position, facing and animation are the truth the host
+				// follows (PKT_CHAR); the host's snapshot of it is newer only by the link delay on the pad, so
+				// blending towards it would pull the player's own character backwards. Only a catastrophic
+				// divergence (a door or a respawn the two copies did not share) is repaired here.
+				float ex = st.ch[i].pos[0] - pos[0], ey = st.ch[i].pos[1] - pos[1], ez = st.ch[i].pos[2] - pos[2];
+				if (sqrtf(ex * ex + ey * ey) > 80.0f) {
+					pos[0] += ex; pos[1] += ey; pos[2] += ez;
+					memcpy(dir, st.ch[i].dir, 12);
+					InterlockedIncrement(&g_snaps);
+				}
+				InterlockedIncrement(&g_applied);
+				break;
+			}
 			*(DWORD *)(uintptr_t)(hs[k] + 0x2dc) = st.ch[i].anim;   // death/animation state from the host
 			// the error is measured against where this copy's character was at the snapshot's time
 			float ref[3] = { pos[0], pos[1], pos[2] };
@@ -1272,39 +1377,28 @@ static void guest_apply_state(void)
 				InterlockedIncrement(&g_timed_corr);
 			float ex = st.ch[i].pos[0] - ref[0], ey = st.ch[i].pos[1] - ref[1], ez = st.ch[i].pos[2] - ref[2];
 			float err = sqrtf(ex * ex + ey * ey);
-			// This PC's own character (player 2) answers its own pad, so it runs ahead of the host's copy while it
-			// moves: leave it alone then, pull it in gently once the stick is idle.
-			int local = hs[k] == mine;
-			int idle = 1;
-			if (local) {
-				xstate lp;
-				local_pad(g_local_pad, &lp);
-				idle = abs(lp.lx) < 4000 && abs(lp.ly) < 4000;
-			}
 			{
 				static int dbg = -1, dn;
 				if (dbg < 0) { char v[8]; dbg = GetEnvironmentVariableA("OBSCOOP_DEBUG_SYNC", v, sizeof v) ? 1 : 0; }
-				if (dbg && !local && err > 8.0f && (dn++ % 8) == 0 && dn < 4000)
+				if (dbg && err > 8.0f && (dn++ % 8) == 0 && dn < 4000)
 					logf("corr tag %08x timed %d err %.1f e=(%.1f,%.1f) own_now=(%.1f,%.1f) ref=(%.1f,%.1f) host=(%.1f,%.1f) dT %d", st.ch[i].tag, timed, err, ex, ey,
 						pos[0], pos[1], ref[0], ref[1], st.ch[i].pos[0], st.ch[i].pos[1], (int)(timeline_now() - st.t_ms));
 			}
-			if (!local) {
+			{
 				g_stat_sum += err; g_stat_n++;
 				if (err > g_stat_max) g_stat_max = err;
 			}
-			float big = timed ? 30.0f : (local ? 80.0f : 30.0f);
-			if (err > big) {   // far off (a door, a cutscene, a respawn): move by the whole error
+			float big = 30.0f;   // far off (a door, a cutscene, a respawn): move by the whole error
+			if (err > big) {
 				pos[0] += ex; pos[1] += ey; pos[2] += ez;
 				if (timed)
 					hist_shift(st.ch[i].tag, st.t_ms, ex, ey, ez);
 				memcpy(dir, st.ch[i].dir, 12);
 				InterlockedIncrement(&g_snaps);
-			} else if (!local ? err > (timed ? 0.6f : 1.0f) : (timed ? err > 0.6f : (idle ? err > 1.5f : err > 15.0f))) {
+			} else if (err > (timed ? 0.6f : 1.0f)) {
 				// A timed error is a real position error at the snapshot's time, so take half of it per
-				// snapshot (a quarter left the guest's own character ~v*dt/0.25 units behind the host's
-				// copy while walking: TASK 13 measured mean 10.7 units on loopback). Untimed local
-				// movement still gets a gentle 10 % so a late clock does not drag the player's character.
-				float kk = (!timed && local && !idle) ? 0.1f : 0.5f;
+				// snapshot (a quarter left the remote character ~v*dt/0.25 units behind: TASK 13).
+				float kk = 0.5f;
 				pos[0] += ex * kk; pos[1] += ey * kk; pos[2] += ez * kk;
 				if (timed)
 					hist_shift(st.ch[i].tag, st.t_ms, ex * kk, ey * kk, ez * kk);
@@ -1322,6 +1416,36 @@ static void guest_apply_state(void)
 		g_weap_want_n = wn;
 		g_weap_pending = 1;
 	}
+}
+
+// ---- guest: stream the character this copy owns (player 2) ----------------------------------------
+// TASK 25: player 2 is this copy's own character - its game answers its pad first-hand, so this copy is
+// the authority for where the character is, which way it faces and what it animates. The host follows
+// these instead of re-simulating it from the pad that arrives over the link in another camera frame.
+static void guest_send_char(void)
+{
+	if (g_role != 2 || !g_peer_ok)
+		return;
+	static DWORD last;
+	DWORD now = GetTickCount();
+	if (now - last < 8)
+		return;
+	last = now;
+	unsigned w = world_obj();
+	unsigned me = player_human(1);
+	if (!w || !me || IsBadReadPtr((const void *)(uintptr_t)me, 0x330))
+		return;
+	pkt_char p;
+	memset(&p, 0, sizeof p);
+	p.t_ms = timeline_now();
+	p.level = rd32(w + 4);
+	p.me.tag = rd32(me + H_TAG);
+	memcpy(p.me.pos, (const void *)(uintptr_t)(me + H_POS), 12);
+	memcpy(p.me.dir, (const void *)(uintptr_t)(me + H_DIR), 12);
+	p.me.anim = rd32(me + 0x2dc);
+	p.me.life = rd32(me + 0x320);
+	net_send(PKT_CHAR, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	InterlockedIncrement(&g_char_sent);
 }
 
 
@@ -1782,6 +1906,14 @@ static void host_welcome_guest(void)
 		(char)(g_last_level >> 8), (char)g_last_level);
 	test_hold_party();
 	host_send_progress(1);   // the party table has to reach the guest before the level request
+	// TASK 25: the guest was already in our level when the link dropped - a reconnect, not a join. There is
+	// nothing to load or change: the progress block above and the state stream bring it back in step, and a
+	// level/load request here would rebuild the world (and lose the characters' positions) for nothing.
+	if (g_hello_in_level && g_hello_level && g_hello_level == g_last_level) {
+		char lv[5];
+		logf("join: the guest is already in level %s: resuming without a level or save request", tag4(g_hello_level, lv));
+		return;
+	}
 	if (lname[0]) {
 		// The host is already inside a save it loaded (possibly before this guest existed): the guest must
 		// load that file itself, exactly as it would if the load happened now (CASE 1). No REQ_LEVEL: the
@@ -2587,12 +2719,14 @@ static void frame_tick(void)
 		host_send_state();
 		host_send_npcs();
 		host_send_progress(0);
+		host_apply_remote_char();   // the guest's own character: this copy follows what the guest streams
 		peer_apply_pickups();
 	} else {
 		attach_player2();
 		guest_apply_requests();
 		guest_apply_regions();
 		guest_apply_state();
+		guest_send_char();          // this copy's own character (player 2), for the host to follow
 		guest_apply_npcs();
 		peer_apply_pickups();
 		guest_follow_own_player();
@@ -2615,4 +2749,8 @@ static void sync_status(char *reply, size_t replysz)
 		_snprintf(reply + l, replysz - l, " | saves_done %ld | real load stage %ld at %lu | pickup sent %ld rcv %ld applied %ld already %ld missing %ld",
 			(long)g_saves_done, (long)g_real_load_stage, (unsigned long)g_real_load_at,
 			g_pickup_sent, g_pickup_rcv, g_pickup_applied, g_pickup_skipped, g_pickup_missing);
+	l = strlen(reply);
+	if (l < replysz)
+		_snprintf(reply + l, replysz - l, " | char sent %ld rcv %ld applied %ld blends %ld snaps %ld skipped %ld extrap %ld",
+			g_char_sent, g_char_rcv, g_char_applied, g_char_blends, g_char_snaps, g_char_skipped, g_char_extrap);
 }
