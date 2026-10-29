@@ -62,6 +62,18 @@ def in_level(m):
     return menu_state(m) == 1 and (level(m) or 0) != 0
 
 
+def teammate_human(m):
+    """TASK 38: the character the game's teammate controller (world+0x174c) is linked to. The mod's
+    TASK 35 door fix unlinks player 2's character from it in normal play; TASK 38's guard puts it back
+    whenever the copy is not in normal play (a menu, a load, a scripted event), because the game's own
+    scripted-event skip reads it and a NULL there crashed the guest."""
+    w = world(m)
+    if not w:
+        return None
+    mt = u32(m, w + 0x174c)
+    return u32(m, mt + 4) if mt else None
+
+
 def wait_for(pred, secs=5.0, what=''):
     t0 = time.time()
     while time.time() - t0 < secs:
@@ -101,6 +113,8 @@ if not (in_level(H) and in_level(G)):
 lvl = tag(level(H))
 print('== starting in level %s' % lvl)
 show('before')
+print('   teammate controller: host %s | guest %s (TASK 38: 0 in normal play, restored while a menu is up)'
+      % (teammate_human(H), teammate_human(G)))
 
 results = []
 
@@ -110,6 +124,9 @@ t = wait_for(lambda: both(lambda m: menu_state(m) == 5), 5.0)
 show('after host START')
 print('   both copies show the pause menu after %s s' % ('%.2f' % t if t is not None else 'NO'))
 results.append(check(t is not None, 'pause menu shown on both'))
+tg = teammate_human(G)
+print('   guest teammate controller -> character %s' % tg)
+results.append(check(tg not in (None, 0), 'guest teammate restored while a menu is up (TASK 38 guard)'))
 print('   host  menu: %s' % pipe_menu(HP))
 print('   guest menu: %s' % pipe_menu(GP))
 
@@ -186,6 +203,9 @@ results.append(check(both(lambda m: menu_state(m) == 1), 'back to normal play on
 print('\n== 7. after the menus: the two copies are in the same state')
 show('final')
 results.append(check(both(lambda m: menu_state(m) == 1) and tag(level(H)) == tag(level(G)), 'both normal, same level'))
+t = wait_for(lambda: teammate_human(G) == 0, 2.0)
+print('   guest teammate controller -> character %s' % teammate_human(G))
+results.append(check(t is not None, 'guest teammate unlinked again in normal play (the door fix)'))
 
 print('\nmenus %s (%d checks)' % ('OK' if all(results) else 'FAIL', len(results)))
 sys.exit(0 if all(results) else 1)

@@ -16,6 +16,10 @@
 
 #define HANG_STALL_MS 3000
 #define HANG_REPEAT_MS 5000
+// TASK 38: a level load stops the frame loop for seconds and is not a stall. While the game is loading
+// (no world yet / not in a level / a load or ChangeLevel request pending) the frame counter standing
+// still is expected; it is only reported if it has not moved for this long, which no normal load reaches.
+#define HANG_LOAD_MAX_MS 30000
 #define HANG_STACK_SCAN 0x400
 #define HANG_EBP_FRAMES 16
 
@@ -131,11 +135,40 @@ static void hang_report(DWORD stuck_ms, LONG frames)
 	FlushFileBuffers(g_log);
 }
 
+// TASK 38: is the game loading (or rebuilding its world) right now? Read from the watchdog thread, so
+// every access is guarded: game+0x310 mode (1 in a level), game+0x320 request state (2 load, 3 load by
+// name, 4 change level), game+0x378 world (0 = none / being rebuilt), world+0x11c state (7 = a scripted
+// event's load/transition), world+0x12c next state.
+static int hang_game_loading(void)
+{
+	if (IsBadReadPtr((const void *)0x6c3068, 4))
+		return 0;
+	unsigned g = *(volatile unsigned *)0x6c3068;
+	if (!g || IsBadReadPtr((const void *)(uintptr_t)(g + 0x310), 4) || IsBadReadPtr((const void *)(uintptr_t)(g + 0x378), 4))
+		return 0;
+	unsigned mode = *(volatile unsigned *)(uintptr_t)(g + 0x310);
+	unsigned req = IsBadReadPtr((const void *)(uintptr_t)(g + 0x320), 4) ? 0 : *(volatile unsigned *)(uintptr_t)(g + 0x320);
+	unsigned w = *(volatile unsigned *)(uintptr_t)(g + 0x378);
+	if (!w)
+		return 1;    // no world: the menu, or the world is being torn down / built
+	if (mode != 1)
+		return 1;    // the menu / a loading screen
+	if (req)
+		return 1;    // a load or a ChangeLevel is in progress
+	if (!IsBadReadPtr((const void *)(uintptr_t)(w + 0x12c), 4)) {
+		unsigned st = *(volatile unsigned *)(uintptr_t)(w + 0x11c);
+		unsigned next = *(volatile unsigned *)(uintptr_t)(w + 0x12c);
+		if (st != 1 || next != 0)
+			return 1;   // a menu (2/5), a scripted event (7) or a transition the world still runs
+	}
+	return 0;
+}
+
 static DWORD WINAPI hang_thread(LPVOID arg)
 {
 	(void)arg;
 	LONG last = -1;
-	DWORD still_since = 0, last_report = 0;
+	DWORD still_since = 0, last_report = 0, load_since = 0;
 	for (;;) {
 		Sleep(250);
 		if (!g_log || g_log == INVALID_HANDLE_VALUE)
@@ -157,6 +190,20 @@ static DWORD WINAPI hang_thread(LPVOID arg)
 		}
 		if (!f || !g_hang_tid)
 			continue;   // the first frame has not happened yet (the game is still starting)
+		// TASK 38: while the game is loading a level (or rebuilding the world after one) no frame is
+		// rendered for seconds and that is not a stall. Keep the stall clock at "now" for the duration of
+		// the load; a frame counter that stands still through a load this long IS reported, so a load that
+		// wedged the thread is still visible.
+		if (hang_game_loading()) {
+			if (!load_since)
+				load_since = now;
+			if (now - load_since < HANG_LOAD_MAX_MS) {
+				still_since = now;
+				continue;
+			}
+		} else {
+			load_since = 0;
+		}
 		if (now - still_since < HANG_STALL_MS)
 			continue;
 		if (last_report && now - last_report < HANG_REPEAT_MS)

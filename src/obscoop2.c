@@ -582,8 +582,20 @@ static void drop_remote_look(xstate *s)
 // Player 2's START is the game's "leave the game" key. Online the host turns a START from the guest
 // into a START pulse on player 1 (both copies pause, since pause is shared); drop it from the remote
 // pad so the leave dialog never opens.
+//
+// TASK 38: while a shared menu is up, START is the menu's own key (it closes the pause menu), and the
+// copy whose own pad pressed it has to act on it too: the host's network pulse only reaches the host, so
+// the guest's pause menu used to stay open until the convergence pulsed it (a race that failed in the
+// TASK 37 reviewer run). Every rising edge of player 2's START is counted here; menu_tick turns it into a
+// START pulse on player 1's pad on this copy as well.
+static volatile LONG g_p2_start_edges;
+static int g_p2_start_down;
 static void drop_remote_start(xstate *s)
 {
+	int down = (s->buttons & 0x0010) != 0;
+	if (down && !g_p2_start_down)
+		InterlockedIncrement(&g_p2_start_edges);
+	g_p2_start_down = down;
 	s->buttons &= ~0x0010;
 }
 

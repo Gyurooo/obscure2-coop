@@ -146,8 +146,18 @@ def phase(by):
     user_copy, peer_copy = (H, G) if by == 'host' else (G, H)
     user_proc, peer_proc = (HP, GP) if by == 'host' else (GP, HP)
     lvl0 = tag(level(H))
-    d = nearest(user_copy, pl)
-    print('== phase %s -> level %s: %s' % (by, lvl0, describe(user_copy, d)))
+    # TASK 38: right after a load the world's entity manager can still be filling (the guest's J002
+    # phase in soak run 2 saw an empty door list 1.3 s after the reset load). Wait for the scan, do not
+    # fail the phase on it.
+    d = None
+    t0 = time.time()
+    while time.time() - t0 < 12.0:
+        d = nearest(user_copy, pl)
+        if d:
+            break
+        time.sleep(0.3)
+    print('== phase %s -> level %s: %s (door scan after %.1f s)' % (by, lvl0, describe(user_copy, d),
+                                                                   time.time() - t0))
     if not d:
         print('%s FAIL: no door in this level' % by.upper())
         return False

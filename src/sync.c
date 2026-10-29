@@ -118,6 +118,21 @@ static DWORD host_trans_next(void)
 // swallows and then spins on forever (the guest "froze with a static image").
 // A real two-player world has no teammate; unlink the controllers' character from it. One character, so
 // this is a single pointer write, and attach_player2 repeats it because the game re-links it after a load.
+//
+// TASK 38: the game itself reads that pointer when it LEAVES a scripted event. In the world update's
+// state-7 branch (the noe scene / scripted event, world+0x12c == 7; decompile 110439-110480) a skip key
+// runs
+//     manager->vtable[0x1c]( *(world+0x174c + 4), world+0x1748 + 0x764 )
+// which is FUN_004f16a0: it writes human+8 = &controller2 and then virtual-calls controller2. With the
+// teammate human unlinked (0) that is a write to address 8: the guest's FATAL EXCEPTION at
+// Obscure2.exe+0xf16a9 in the TASK 37 soak, right after a load and the level's scripted event (the scene's
+// skip pressed by the mod or by the player). So the unlink is only kept while this copy is in NORMAL PLAY;
+// in a load, a menu, a scripted event or a transition the pointer is put back before the game's update
+// runs, and the game's own attach uses a real character. See teammate_game_guard.
+static unsigned g_teammate_h;      // the character the unlink took off the teammate controller
+static unsigned g_teammate_world;  // ... in this world object (a rebuilt world is the game's own business)
+static volatile LONG g_teammate_restores;
+
 static int teammate_unlink(unsigned ch)
 {
 	unsigned w = world_obj();
@@ -130,6 +145,8 @@ static int teammate_unlink(unsigned ch)
 	if (rd32(p) != ch)
 		return 0;
 	*(DWORD *)(uintptr_t)p = 0;
+	g_teammate_h = ch;
+	g_teammate_world = w;
 	{
 		static DWORD logged_tag;
 		char c[5];
@@ -141,6 +158,73 @@ static int teammate_unlink(unsigned ch)
 		}
 	}
 	return 1;
+}
+
+// TASK 38: put the teammate character back while this copy is NOT in normal play, so the game's own
+// code (the scripted-event skip, the enter-normal-play attach, a menu) always finds a real character
+// there, and take it off again as soon as the copy is back in normal play (where the door fix needs it
+// gone). Called from hk_game_update around the game's own update, which is where the world update runs.
+//
+// "Normal play" is deliberately narrow: state 1 with no scripted event/pending world state. A pending
+// REQUEST (game+0x320, e.g. the ChangeLevel a door use just started) is NOT part of it - the door use is
+// still running in the same world, and restoring the teammate there would let the game's sweep stop the
+// door it is using (the TASK 35 bug). Only the states where the world is not playable (menu, load,
+// scripted event) put the character back.
+static int world_normal_play(unsigned g)
+{
+	unsigned w = g ? rd32(g + 0x378) : 0;
+	if (!g || !w || IsBadReadPtr((const void *)(uintptr_t)(w + 0x12c), 4))
+		return 0;
+	return rd32(g + 0x310) == 1 && rd32(w + 0x11c) == 1 && rd32(w + 0x12c) == 0;
+}
+
+static void teammate_game_guard(unsigned g, int before_update)
+{
+	if (!g_teammate_h)
+		return;
+	unsigned w = g ? rd32(g + 0x378) : 0;
+	if (!w || w != g_teammate_world) {
+		// The world was rebuilt: its teammate pointer is the game's own (and possibly a new character).
+		g_teammate_h = 0;
+		return;
+	}
+	unsigned mt = rd32(w + 0x174c), p = mt + 4;
+	if (!mt || IsBadReadPtr((const void *)(uintptr_t)p, 4) || IsBadWritePtr((void *)(uintptr_t)p, 4)) {
+		g_teammate_h = 0;
+		return;
+	}
+	unsigned cur = rd32(p);
+	if (before_update) {
+		if (!world_normal_play(g) && cur == 0) {
+			*(DWORD *)(uintptr_t)p = g_teammate_h;
+			InterlockedIncrement(&g_teammate_restores);
+		}
+	} else if (world_normal_play(g) && cur == g_teammate_h) {
+		*(DWORD *)(uintptr_t)p = 0;   // normal play again: the game's teammate sweep must not see it
+	}
+}
+
+// TASK 38: remember the partner as the teammate controller's character even when the pointer is already
+// 0 (the game may have cleared it, or the world came up without one), so the guard knows whom to put back
+// while this copy is not in normal play. Restores it at once when the copy is not in normal play.
+static void teammate_want(unsigned ch)
+{
+	unsigned w = world_obj();
+	unsigned mt = w ? rd32(w + 0x174c) : 0;
+	if (!mt || !ch)
+		return;
+	unsigned p = mt + 4;
+	if (IsBadReadPtr((const void *)(uintptr_t)p, 4) || IsBadWritePtr((void *)(uintptr_t)p, 4))
+		return;
+	unsigned cur = rd32(p);
+	if (cur == 0 || cur == ch) {
+		g_teammate_h = ch;
+		g_teammate_world = w;
+	}
+	if (cur == 0) {
+		*(DWORD *)(uintptr_t)p = ch;
+		InterlockedIncrement(&g_teammate_restores);
+	}
 }
 
 static void attach_player2(void)
@@ -169,7 +253,14 @@ static void attach_player2(void)
 	if (!h2) h2 = rd32(arr + 4);
 	if (!h2 || IsBadWritePtr((void *)(uintptr_t)c2h, 4) || IsBadReadPtr((const void *)(uintptr_t)(h2 + 8), 4))
 		return;
-	teammate_unlink(h2);   // TASK 35: a 2P world has no teammate; see the comment above teammate_unlink
+	// TASK 38: only while this copy is in normal play. In a menu / a load / a scripted event the guard
+	// (teammate_game_guard) has put the character back for the game's own code - do not take it away here
+	// in the middle of such a frame; the next normal-play frame re-nulls it.
+	unsigned g = game_obj();
+	if (g && world_normal_play(g))
+		teammate_unlink(h2);   // TASK 35: a 2P world has no teammate; see the comment above teammate_unlink
+	else
+		teammate_want(h2);     // not playable here: the game needs a character there (TASK 38)
 	unsigned cur = rd32(c2h);
 	if (!cur || cur == h1)
 		*(DWORD *)(uintptr_t)c2h = h2;   // input controller 2 controls the partner
@@ -5444,6 +5535,10 @@ static DWORD g_menu_div_since;          // when the current mismatch was first s
 static LONG g_menu_div_pst = -1;        // ... and the peer state it was seen with
 static LONG g_menu_div_seq = -1;
 static volatile LONG g_menu_corrections, g_menu_gated;   // pulses issued for a confirmed divergence / corrections skipped as not yet stable
+// TASK 38: player 2's START edges (drop_remote_start in obscoop2.c). A START on player 2's pad cannot
+// close a shared menu by itself - the game reads player 1's pad for the pause menu, and the network pulse
+// only fires on the host - so menu_tick turns the edge into a START pulse on player 1's pad on THIS copy.
+static DWORD g_menu_p2_edges;
 // Menu changes are ordered by a sequence number, exactly like the scene sync's leave_seq (TASK 31): every
 // LOCAL change bumps g_menu_my_seq, and a copy only corrects a divergence for a state NEWER than the one it
 // has already applied. Without the order the two copies chase each other (measured: 2 -> 1 -> 2 ... every
@@ -5550,6 +5645,16 @@ static void menu_tick(void)
 	if (!g_peer_ok)
 		return;
 	DWORD now = GetTickCount();
+	// TASK 38: player 2's START while a shared menu is up: make it a START press on player 1's pad on this
+	// copy, the same edge the host's network pulse makes there. It is an EDGE, and only while the menu
+	// was ALREADY up at the previous tick (prev and st both a menu): the press that opened the menu can
+	// never close it again, whichever copy opened it or however the open pulse reached this copy.
+	DWORD edges = (DWORD)g_p2_start_edges;
+	if (edges != g_menu_p2_edges) {
+		g_menu_p2_edges = edges;
+		if (menu_world_menu(prev) && menu_world_menu(st))
+			menu_pulse(0, 0x0010, 0, 'S');
+	}
 	// TASK 37: while EITHER copy is in a menu, both keep publishing (a menu session). That is what makes
 	// the freshness rule below possible: the copy that is back in normal play still says so every 250 ms.
 	int active = menu_world_menu(st) || ui0 >= 3 || ui1 >= 3 || menu_world_menu((int)g_peer_menu_state);
@@ -5896,6 +6001,9 @@ static void sync_status(char *reply, size_t replysz)
 			(unsigned long)g_trans_applied, (unsigned long)g_trans_queued, g_trans_stale, g_heals,
 			g_host_lvl ? tag4((unsigned)g_host_lvl, hl) : "-", g_host_busy);
 	}
+	l = strlen(reply);
+	if (l < replysz)
+		_snprintf(reply + l, replysz - l, " | teammate restores %ld", g_teammate_restores);
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | frames %ld", g_frames);
