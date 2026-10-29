@@ -288,6 +288,10 @@ static int __fastcall hk_party_table(void *game, void *edx, int flag, unsigned l
 typedef void(__fastcall *input_update_t)(void *, void *, int);
 static input_update_t g_input_update;
 static void guest_weapons_frame(void);   // sync.c: the guest's held weapons, applied in the game's own update
+static volatile LONG g_puppet_gated, g_puppet_frames, g_puppet_move_gated;   // TASK 42 gating counters
+static int puppet_is(unsigned ch);       // sync.c (TASK 42): is this character the peer's puppet?
+static int puppet_prepare(unsigned ch);  // sync.c (TASK 42): the owner's pose/state before the game's update
+static void puppet_finish(unsigned ch);  // sync.c (TASK 42): the owner's pose after it
 
 static void __fastcall hk_input_update(void *self, void *edx, int dt)
 {
@@ -302,8 +306,74 @@ static void __fastcall hk_input_update(void *self, void *edx, int dt)
 		*(unsigned *)(uintptr_t)(ch + 0x884) = 0;
 	}
 	guest_weapons_frame();
+	// TASK 42: the peer's character is a puppet - its controller must not run at all in normal play, or
+	// the local game would drive it from a pad (the old model) or from the teammate AI and fight the
+	// streamed pose and state. In a menu / a load / a scripted event the game's own code needs the
+	// controller (the shared menus, the scene skip), so it runs there as before.
+	if (puppet_is(ch)) {
+		InterlockedIncrement(&g_puppet_gated);
+		return;
+	}
 	if (g_input_update)
 		g_input_update(self, edx, dt);
+}
+
+// TASK 42: the human's movement/state machine FUN_004e76c0 (called from the human update through
+// vtable+0xd8) is what REACTS to character+0x2dc. Setting a state the puppet never entered makes the
+// game read what the owner's controller filled in: the host's copy crashed in it with
+//     0x4e810c  cmp 0xc8, 0x2dc(human)        ; state 200 = attack
+//     0x4e811e  mov 0x820(human), ecx
+//     0x4e8124  mov 0x824(human,ecx,4), edx   ; the attack target list the aim/attack search fills
+//     0x4e812b  cmp ebx, 0x64(edx)            ; edx = 0 -> access violation
+// (crash report of run run_s42_3.log, host). The puppet must not run that machine: its state, its pose
+// and its speed come from the owner, the animation clips are played by the game's own setter, and the
+// movement function only has to be out of the way. Prologue 55 8b ec 81 ec 30 07 00 00 (9 bytes).
+typedef void(__fastcall *char_move_t)(void *, void *, int);
+static char_move_t g_char_move;
+
+static void __fastcall hk_char_move(void *ch, void *edx, int dt)
+{
+	if (!g_passive && puppet_is((unsigned)(uintptr_t)ch)) {
+		InterlockedIncrement(&g_puppet_move_gated);
+		return;
+	}
+	if (g_char_move)
+		g_char_move(ch, edx, dt);
+}
+
+// TASK 42: CCharacterHuman_s10 (0x4de4f0, vtable slot 10) is every human's per-frame update. The puppet
+// is put into the owner's pose and state just before it (so the game's own movement state machine runs
+// in the right state and picks the right gait from the streamed speed) and put back into the owner's
+// pose just after it (so this copy's physics can never drag it away).
+typedef void(__fastcall *char_update_t)(void *, void *, float);
+static char_update_t g_char_update;
+
+static void __fastcall hk_char_update(void *ch, void *edx, float dt)
+{
+	int puppet = 0;
+	if (!g_passive) {
+		static unsigned seen[8];
+		static int nseen;
+		unsigned c = (unsigned)(uintptr_t)ch;
+		int known = 0;
+		for (int i = 0; i < nseen && i < 8; i++)
+			if (seen[i] == c) known = 1;
+		if (!known && nseen < 8 && c) {
+			seen[nseen++] = c;
+			{
+				char t[5];
+				unsigned tag = IsBadReadPtr((const void *)(uintptr_t)(c + 0x14), 4) ? 0 : *(unsigned *)(uintptr_t)(c + 0x14);
+				logf("hook: human update runs for %s at %x", tag4(tag, t), c);
+			}
+		}
+		puppet = puppet_prepare(c);
+	}
+	if (g_char_update)
+		g_char_update(ch, edx, dt);
+	if (puppet) {
+		puppet_finish((unsigned)(uintptr_t)ch);
+		InterlockedIncrement(&g_puppet_frames);
+	}
 }
 
 // The game object's per-frame update (FUN_004a5f20, prologue 55 8b ec 56 8b f1) runs in every mode,
@@ -379,6 +449,16 @@ static void install_request_hooks(void)
 	static const BYTE p_update[6] = { 0x55, 0x8b, 0xec, 0x56, 0x8b, 0xf1 };
 	g_game_update = (game_update_t)hook_entry((BYTE *)0x4a5f20, p_update, 6, (void *)hk_game_update,
 		"game update (0x4a5f20)");
+	// 9 bytes on purpose: push ebp; mov ebp,esp; sub esp,0x730 is THREE instructions of 1+2+6 bytes
+	// (0x4e76c0..0x4e76c8). Eight bytes would copy the immediate of the `sub` only partly and the
+	// trampoline would then subtract garbage from esp - the host died on the first character update of
+	// every load with that (runs run_s42_4/5/6).
+	static const BYTE p_move[9] = { 0x55, 0x8b, 0xec, 0x81, 0xec, 0x30, 0x07, 0x00, 0x00 };
+	g_char_move = (char_move_t)hook_entry((BYTE *)0x4e76c0, p_move, 9, (void *)hk_char_move,
+		"human movement/state machine (0x4e76c0)");
+	static const BYTE p_char[6] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x40 };
+	g_char_update = (char_update_t)hook_entry((BYTE *)0x4de4f0, p_char, 6, (void *)hk_char_update,
+		"human character update (0x4de4f0)");
 	static const BYTE p_collect[9] = { 0x56, 0x8b, 0xf1, 0x8b, 0x8e, 0x3c, 0x07, 0x00, 0x00 };
 	g_char_collect = (char_collect_t)hook_entry((BYTE *)0x4ddad0, p_collect, 9, (void *)hk_char_collect,
 		"character collect (0x4ddad0)");

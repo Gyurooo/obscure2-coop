@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 20   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 21   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -50,6 +50,12 @@
                         //     (the guest applies only the newest, an older one is dropped/cancelled);
                         //     pkt_state carries the host's authoritative level/entry and whether it is in a
                         //     transition, so the guest can re-converge on the host's level (self-heal).
+                        // 21: TASK 42, the puppet model: pkt_char now goes in BOTH directions (each copy
+                        //     streams the character its own pad drives) and carries the velocity and the
+                        //     owner's speed (character+0x278), so the receiver plays the peer's real
+                        //     walk/run/action animation through the game's own state setter instead of
+                        //     re-simulating it from a streamed pad. The character positions in pkt_state
+                        //     no longer correct anyone.
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,
@@ -68,9 +74,13 @@ typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; xstate hpad; float
 // level = the world tag it is in (0 = none), in_level = 1 when its game is in a level, need_saves = 1
 // when this process has not received a save file from the host yet.
 typedef struct { pkt_hdr h; DWORD level; DWORD in_level; DWORD need_saves; } pkt_hello;
-// TASK 25: the character this copy owns (guest: player 2, host: player 1), streamed so the other copy
-// follows the owner instead of re-simulating it from a delayed pad in another camera frame.
-typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; ch_state me; } pkt_char;
+// TASK 25/42: the character this copy owns (host: player 1, guest: player 2), streamed so the other
+// copy plays it as a PUPPET (position, facing, the owner's speed +0x278, the game state +0x2dc) instead
+// of re-simulating it from a delayed pad in another camera frame. vel = the character's velocity vector
+// (character+0x294..0x29c); speed = character+0x278 (the value the game's own movement state machine
+// uses to choose idle/walk/run); anim = character+0x2dc (the state id the whole game switches on, see
+// FINDINGS_42 §1).
+typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; ch_state me; float vel[3]; DWORD speed; } pkt_char;
 typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; DWORD seq; } pkt_req;
 // life = character+0x320 (float bits), state = character+0x2dc (the NPC's AI/animation/death state; the
 // same field the humans stream as `anim`). TASK 21: the host owns enemy life and death, the guest applies
@@ -159,7 +169,8 @@ static void guest_on_npc(const char *buf, int n);
 static void guest_on_region(const char *buf, int n);
 static void peer_on_pickup(const char *buf, int n);
 static void peer_on_itemuse(const char *buf, int n);
-static void host_on_char(const char *buf, int n);
+static void peer_on_char(const char *buf, int n);   // TASK 42: the peer's character (a puppet here)
+static void char_send_local(void);                 // TASK 42: this copy's own character, every 16 ms (sync.c)
 static void peer_on_prop(const char *buf, int n);
 static void guest_on_props(const char *buf, int n);
 static void peer_on_apt(const char *buf, int n);
@@ -451,7 +462,7 @@ static void net_handle(const char *buf, int n, sid_t from)
 			peer_on_itemuse(buf, n);
 			break;
 		case PKT_CHAR:
-			host_on_char(buf, n);   // the character the guest owns (player 2), streamed to its copy here
+			peer_on_char(buf, n);   // TASK 42: the character the guest's pad drives (player 2) - a puppet here
 			break;
 		case PKT_PROP:
 			peer_on_prop(buf, n);   // a prop carry/break from the guest (applied on the game thread)
@@ -499,6 +510,8 @@ static void net_handle(const char *buf, int n, sid_t from)
 				if (in->yaw_valid) { g_peer_yaw = in->yaw; g_peer_yaw_valid = 1; }
 				g_netpad_tick = GetTickCount();
 			}
+		} else if (h->type == PKT_CHAR) {
+			peer_on_char(buf, n);    // TASK 42: the character the host's pad drives (player 1) - a puppet here
 		} else if (h->type == PKT_SAVE) {
 		guest_on_save(buf, n);
 	} else if (h->type == PKT_SAVES_DONE) {
@@ -551,6 +564,11 @@ static void net_tick(void)
 	DWORD now = GetTickCount();
 	if (net_paused())   // test-only link pause: no timers advance, so the first tick after it acts at once
 		return;
+	// TASK 42: the character stream is sent from HERE, not from the frame tick: the game renders ~17 fps
+	// on a loaded PC, and a 58 ms stream cannot feed a 100 ms interpolation buffer (the receiver was
+	// extrapolating on most frames). The transport thread ticks every <= 2 ms, so the character goes out
+	// every 16 ms = 60 Hz whatever the frame rate does.
+	char_send_local();
 	if (g_role == 1) {
 		if (g_peer_ok && now - g_last_rx_tick > (g_use_steam ? 10000u : 3000u))
 			host_drop_guest(g_use_steam ? "timeout 10 s" : "timeout 3 s");

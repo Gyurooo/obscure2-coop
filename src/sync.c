@@ -2510,128 +2510,342 @@ static CRITICAL_SECTION g_rx_cs;
 static pkt_state g_rx_state;
 static volatile LONG g_rx_state_new;
 
-// ---- host: the character the guest owns (player 2) -------------------------------------------------
-// TASK 25: the guest is the authority for the character its own pad drives. It streams that character's
-// position, facing and animation (PKT_CHAR) at the pad rate; this copy follows it, so the two copies
-// cannot walk different paths because their cameras (each follows its own player) differ. The follow is
-// a per-packet blend, not a snap, unless the character is far away (a door the guest took alone).
-static pkt_char g_rx_char, g_rx_char_prev;
-static volatile LONG g_rx_char_new;
-static volatile LONG g_char_rcv, g_char_applied, g_char_blends, g_char_snaps, g_char_skipped, g_char_sent, g_char_extrap;
+// ---- TASK 42: the peer's character is a PUPPET -----------------------------------------------------
+// The old model re-simulated BOTH characters on both copies from streamed pads (with an input delay) and
+// corrected the remote one with position snapshots. On a real Steam link that was unplayable: the remote
+// character slid without a walk animation (a pad that arrives late is not the input the owner's copy
+// ran) and the two games disagreed about where it was - which is what froze/crashed the game's own code
+// (FINDINGS_41 section 1, the owner's playtest).
+//
+// The puppet model: each copy simulates only its own character. The peer's character is played back from
+// a stream: position, facing, velocity, the owner's speed (character+0x278, the value the game's own
+// movement state machine uses to pick idle/walk/run) and the game state (character+0x2dc, the id the
+// whole game switches on - FINDINGS_42 section 1). The state is applied through the GAME'S OWN SETTER,
+// the human's vtable slot 18 (0x4e3ed0 - it plays the animation clip that belongs to the state and
+// stores the id in +0x2dc), so walking, running, the aim stance, an attack, a climb and a death play
+// their real animation. A raw write of +0x2dc (the old code) changes the value but plays no clip.
+//
+// Playback is an interpolation buffer ~100 ms behind the newest sample; the delay adapts to the measured
+// arrival jitter (the Steam link delivers in bursts, FINDINGS_41 section 3). The buffer is filled on the
+// network thread and read on the game thread; both run under g_pb_cs.
+#define PBUF 32             // samples kept (a 16 ms stream: half a second of history)
+#define PUP_DELAY_MIN 55.0f
+#define PUP_DELAY_MAX 220.0f
+#define PUP_EXTRAP_MAX 120  // ms of dead reckoning past the newest sample
+typedef struct { DWORD t; float pos[3], dir[3], vel[3]; DWORD speed, anim; } psample;
 
-// TASK 34: the remote character's animation state (character+0x2dc) is taken from the stream only when the
-// streamed value has disagreed with the local simulation for ANIM_FORCE_MS. Both copies simulate both
-// characters from the streamed pads, so a short difference is an action the local game is already
-// playing (aim stance, swing, item use); writing the owner's value on every packet reset that animation
-// to a state one link delay old, which is why the owner saw no attack animation on the other PC. A
-// persistent difference is a state the local simulation cannot produce (death, a respawn, a scripted
-// animation) and is taken over.
-#define ANIM_FORCE_MS 250
-#define ANIM_TRACK 10
-typedef struct { DWORD tag, since, want; } anim_hold;
-static anim_hold g_anim_hold[ANIM_TRACK];
-static volatile LONG g_anim_forced;
+static CRITICAL_SECTION g_pb_cs;
+static psample g_pb[PBUF];        // sorted by t, oldest first
+static int g_pb_n;
+static DWORD g_pb_tag;            // the character tag the stream belongs to
+static DWORD g_pb_level;          // ... and the level it says it is in
+static float g_pb_delay = 90.0f;  // playback delay (ms), adaptive
+static float g_pb_age = -1.0f;    // running mean of the arrival age
+static float g_pb_dev = 10.0f;    // running mean of |age - mean|
+static DWORD g_pb_anim_done;      // the state id last handed to the game's setter (game thread)
+static DWORD g_pb_anim_tag;       // ... for this character
+static volatile LONG g_char_rcv, g_char_sent, g_char_applied, g_char_skipped, g_char_snaps, g_char_blends;
+static volatile LONG g_pb_under, g_pb_extrap, g_pb_anim_sets, g_pb_anim_diff, g_pb_nosample, g_pb_anim_ok;
+static volatile LONG g_pb_err_n;
+static volatile float g_pb_err_sum, g_pb_err_max;
+static volatile LONG g_pb_writes;
 
-static void anim_apply_remote(unsigned h, DWORD tag, DWORD anim)
-{
-	if (!h || IsBadWritePtr((void *)(uintptr_t)(h + 0x2dc), 4))
-		return;
-	DWORD now = GetTickCount();
-	anim_hold *e = 0;
-	for (int i = 0; i < ANIM_TRACK; i++) {
-		if (g_anim_hold[i].tag == tag) { e = &g_anim_hold[i]; break; }
-		if (!g_anim_hold[i].tag && !e) e = &g_anim_hold[i];
-	}
-	if (!e)
-		return;
-	DWORD cur = rd32(h + 0x2dc);
-	if (!e->tag) {
-		e->tag = tag;
-		e->since = now;
-		e->want = anim;
-	}
-	if (anim == cur) {
-		e->since = now;   // the two agree: nothing to take over
-		e->want = anim;
-		return;
-	}
-	if (e->want != anim) {   // a different value from the last packet: restart the timer
-		e->want = anim;
-		e->since = now;
-	}
-	if (now - e->since >= ANIM_FORCE_MS) {
-		*(DWORD *)(uintptr_t)(h + 0x2dc) = anim;
-		InterlockedIncrement(&g_anim_forced);
-	}
-}
+// A character's state setter: the game's own animation/state function (CCharacterHuman vtable slot 18,
+// 0x4e3ed0 -> __thiscall(void *character, unsigned state)).
+typedef void(__fastcall *char_state_t)(void *, void *, unsigned);
 
-static void host_on_char(const char *buf, int n)
+static void peer_on_char(const char *buf, int n)
 {
 	if (n != (int)sizeof(pkt_char))
 		return;
-	EnterCriticalSection(&g_rx_cs);
-	g_rx_char_prev = g_rx_char;
-	memcpy(&g_rx_char, buf, sizeof g_rx_char);
-	g_rx_char_new = 1;
-	LeaveCriticalSection(&g_rx_cs);
+	const pkt_char *p = (const pkt_char *)buf;
+	EnterCriticalSection(&g_pb_cs);
+	if (g_pb_tag != p->me.tag) {   // another character (a respawn, a rebuilt party): the old history is not its own
+		char t[5], l[5];
+		g_pb_tag = p->me.tag;
+		g_pb_n = 0;
+		g_pb_age = -1.0f;
+		logf("puppet: the peer streams %s in level %s", tag4(p->me.tag, t), tag4(p->level, l));
+	}
+	g_pb_level = p->level;
+	int i = g_pb_n;
+	if (i >= PBUF) {   // full: drop the oldest
+		memmove(&g_pb[0], &g_pb[1], sizeof(psample) * (PBUF - 1));
+		i = PBUF - 1;
+	}
+	psample *s = &g_pb[i];
+	memset(s, 0, sizeof *s);
+	s->t = p->t_ms;
+	memcpy(s->pos, p->me.pos, 12);
+	memcpy(s->dir, p->me.dir, 12);
+	memcpy(s->vel, p->vel, 12);
+	s->speed = p->speed;
+	s->anim = p->me.anim;
+	g_pb_n = i + 1;
+	while (i > 0 && (LONG)(g_pb[i - 1].t - g_pb[i].t) > 0) {   // out of order (jitter)
+		psample tmp = g_pb[i - 1];
+		g_pb[i - 1] = g_pb[i];
+		g_pb[i] = tmp;
+		i--;
+	}
+	{   // the playback delay: mean arrival age + twice its deviation + a margin, bounded, slowly adapted
+		LONG age = (LONG)(timeline_now() - p->t_ms);
+		if (age < -500) age = -500;
+		if (age > 500) age = 500;
+		if (g_pb_age < -400.0f)
+			g_pb_age = (float)age;
+		else
+			g_pb_age += ((float)age - g_pb_age) * 0.1f;
+		float d = (float)age - g_pb_age;
+		if (d < 0) d = -d;
+		g_pb_dev += (d - g_pb_dev) * 0.1f;
+		float want = g_pb_age + 2.0f * g_pb_dev + 30.0f;
+		if (want < PUP_DELAY_MIN) want = PUP_DELAY_MIN;
+		if (want > PUP_DELAY_MAX) want = PUP_DELAY_MAX;
+		g_pb_delay += (want - g_pb_delay) * 0.05f;
+	}
+	LeaveCriticalSection(&g_pb_cs);
 	InterlockedIncrement(&g_char_rcv);
 }
 
-static void host_apply_remote_char(void)
+// The pose to show now: the buffer interpolated at (now - delay). 0 = no sample yet.
+static int puppet_pose(psample *out)
 {
-	if (g_role != 1 || !g_rx_char_new)
-		return;
-	pkt_char p, prev;
-	EnterCriticalSection(&g_rx_cs);
-	p = g_rx_char;
-	prev = g_rx_char_prev;
-	g_rx_char_new = 0;
-	LeaveCriticalSection(&g_rx_cs);
-	unsigned w = world_obj();
-	if (!w || rd32(w + 4) != p.level) {
-		InterlockedIncrement(&g_char_skipped);
-		return;
+	if (!g_pb_tag)
+		return 0;
+	DWORD tp;
+	EnterCriticalSection(&g_pb_cs);
+	int n = g_pb_n;
+	if (n < 1) {
+		LeaveCriticalSection(&g_pb_cs);
+		return 0;
 	}
-	// The stream says where the guest's character was at p.t_ms (host timeline); the packet took half a
-	// round trip to get here, so extrapolate along the last two samples by that age. Without it the host's
-	// copy would constantly trail the guest's by speed x delay (8 units at 110 units/s over a 60 ms relay).
-	float tx = p.me.pos[0], ty = p.me.pos[1], tz = p.me.pos[2];
-	DWORD now = timeline_now();
-	LONG age = (LONG)(now - p.t_ms);
-	LONG span = (LONG)(p.t_ms - prev.t_ms);
-	if (prev.me.tag == p.me.tag && span > 0 && age > 0 && age <= 120) {
-		float vx = (p.me.pos[0] - prev.me.pos[0]) / (float)span;
-		float vy = (p.me.pos[1] - prev.me.pos[1]) / (float)span;
-		if (vx * vx + vy * vy < 900.0f) {   // sanity: under 30 000 units/s
-			tx += vx * (float)age;
-			ty += vy * (float)age;
-			InterlockedIncrement(&g_char_extrap);
+	tp = timeline_now() - (DWORD)g_pb_delay;
+	*out = g_pb[n - 1];
+	if ((LONG)(tp - g_pb[n - 1].t) >= 0) {   // past the newest sample: dead reckon along the last step
+		psample *a = &g_pb[n - 1], *b = n > 1 ? &g_pb[n - 2] : 0;
+		LONG age = (LONG)(tp - a->t);
+		if (age > PUP_EXTRAP_MAX) age = PUP_EXTRAP_MAX;
+		if (b && age > 0 && (LONG)(a->t - b->t) > 0) {
+			float k = (float)age / (float)(int)(a->t - b->t);
+			if (k > 1.5f) k = 1.5f;
+			for (int c = 0; c < 3; c++)
+				out->pos[c] = a->pos[c] + (a->pos[c] - b->pos[c]) * k;
+			InterlockedIncrement(&g_pb_extrap);
+		}
+	} else if ((LONG)(tp - g_pb[0].t) < 0) {   // older than the history: the oldest sample
+		*out = g_pb[0];
+		InterlockedIncrement(&g_pb_under);
+	} else {
+		for (int i = n - 1; i > 0; i--) {
+			if ((LONG)(tp - g_pb[i - 1].t) >= 0) {
+				psample *a = &g_pb[i], *b = &g_pb[i - 1];
+				LONG span = (LONG)(a->t - b->t);
+				float k = span > 0 ? (float)(LONG)(tp - b->t) / (float)span : 1.0f;
+				float dx = b->dir[0] + (a->dir[0] - b->dir[0]) * k;
+				float dy = b->dir[1] + (a->dir[1] - b->dir[1]) * k;
+				float dz = b->dir[2] + (a->dir[2] - b->dir[2]) * k;
+				float l = sqrtf(dx * dx + dy * dy + dz * dz);
+				*out = *a;
+				out->anim = b->anim;   // the state the owner was in at the playback instant
+				out->speed = b->speed;
+				for (int c = 0; c < 3; c++) {
+					out->pos[c] = b->pos[c] + (a->pos[c] - b->pos[c]) * k;
+					out->vel[c] = b->vel[c] + (a->vel[c] - b->vel[c]) * k;
+				}
+				if (l > 1e-4f) {
+					out->dir[0] = dx / l;
+					out->dir[1] = dy / l;
+					out->dir[2] = dz / l;
+				}
+				break;
+			}
 		}
 	}
-	unsigned hs[MAX_CH];
-	int n = world_humans(hs, MAX_CH);
-	for (int k = 0; k < n; k++) {
-		if (rd32(hs[k] + H_TAG) != p.me.tag)
-			continue;
-		float *pos = (float *)(uintptr_t)(hs[k] + H_POS), *dir = (float *)(uintptr_t)(hs[k] + H_DIR);
-		if (IsBadWritePtr(pos, 12) || IsBadWritePtr(dir, 12))
-			break;
-		float ex = tx - pos[0], ey = ty - pos[1], ez = tz - pos[2];
-		float err = sqrtf(ex * ex + ey * ey);
-		if (err > 60.0f) {   // far off (a door, a respawn, a lost stream): take it whole
-			pos[0] += ex; pos[1] += ey; pos[2] += ez;
-			memcpy(dir, p.me.dir, 12);
-			InterlockedIncrement(&g_char_snaps);
-		} else if (err > 0.05f) {
-			float kk = 0.7f;   // smooth: most of what is left per frame (two copies share one PC: ~17 fps)
-			pos[0] += ex * kk; pos[1] += ey * kk; pos[2] += ez * kk;
-			InterlockedIncrement(&g_char_blends);
-		}
-		anim_apply_remote(hs[k], p.me.tag, p.me.anim);   // TASK 34: only a persistent divergence is taken over
-		InterlockedIncrement(&g_char_applied);
-		break;
-	}
+	LeaveCriticalSection(&g_pb_cs);
+	return 1;
 }
+
+// The character the peer drives here (0 = none). The role decides which local slot it is: the host's own
+// pad drives player 1, so the guest's character is player 2; on the guest it is the other way round.
+static unsigned puppet_target(void)
+{
+	if (!g_role || !g_peer_ok || !g_pb_tag)
+		return 0;
+	// This runs from the per-character and per-controller hooks, i.e. on frames where a world is being
+	// built or torn down: every pointer is checked before it is dereferenced.
+	unsigned g = game_obj();
+	if (!g || !mem_ok((const void *)(uintptr_t)g, 0x380))
+		return 0;
+	if (rd32(g + 0x310) != 1)
+		return 0;
+	unsigned w = rd32(g + 0x378);
+	if (!w || !mem_ok((const void *)(uintptr_t)w, 0x1800))
+		return 0;
+	if (rd32(w + 0x11c) != 1)
+		return 0;   // a menu, a load, a scripted event: the game's own code owns both characters
+	if (g_pb_level && rd32(w + 4) != g_pb_level)
+		return 0;   // the stream is from another level (the level change is still in flight)
+	unsigned ctl = rd32(w + 0x1748);
+	if (!ctl || !mem_ok((const void *)(uintptr_t)ctl, 0x764 * 2))
+		return 0;
+	unsigned ctlrec = ctl + 0x764 * (g_role == 1 ? 1 : 0);
+	unsigned ch = rd32(ctlrec + 4);
+	if (!ch || !mem_ok((const void *)(uintptr_t)ch, 0x330))
+		return 0;
+	if (IsBadWritePtr((void *)(uintptr_t)(ch + H_POS), 12))
+		return 0;
+	if (rd32(ch + H_TAG) != g_pb_tag)
+		return 0;   // the local world's character is not the one streamed (a rebuild in progress)
+	// The character must be WIRED to that controller record (human+8 is the controller the body answers,
+	// see check_movement's wiring dump). A world that is being rebuilt has characters allocated but not
+	// yet attached; driving one of those (the state setter walks the animation list at +0x210 and the
+	// objects at +0x2bc) is how a level change would crash this copy.
+	if (rd32(ch + 8) != ctlrec)
+		return 0;
+	if (!rd32(ch + 0x210) || !rd32(ch + 0x30c))
+		return 0;   // no animation system yet
+	return ch;
+}
+
+// Position, facing, velocity and the owner's speed: the four fields the game's own movement code reads.
+static void puppet_write(unsigned ch, const psample *s)
+{
+	float *pos = (float *)(uintptr_t)(ch + H_POS), *dir = (float *)(uintptr_t)(ch + H_DIR);
+	float *vel = (float *)(uintptr_t)(ch + 0x294);
+	if (IsBadWritePtr(pos, 12) || IsBadWritePtr(dir, 12) || IsBadWritePtr(vel, 12))
+		return;
+	for (int c = 0; c < 3; c++) {
+		pos[c] = s->pos[c];
+		dir[c] = s->dir[c];
+		vel[c] = s->vel[c];
+	}
+	if (!IsBadWritePtr((void *)(uintptr_t)(ch + 0x278), 4))
+		*(DWORD *)(uintptr_t)(ch + 0x278) = s->speed;   // the speed the walk/run decision uses
+	// The swing state (200 = 0xc8) makes the game's OWN code read its attack target,
+	// human+0x824[human+0x820], and dereference it:
+	//   0x4dd243  mov 0x820(esi),edx / mov 0x824(esi,edx,4),eax / 0x4dd250 cmp 0,0x64(eax)
+	//   0x4e811e  mov 0x820(esi),ecx / mov 0x824(esi,ecx,4),edx / 0x4e812b cmp ebx,0x64(edx)
+	// Only the attacker's own controller fills that list (the aim/attack search FUN_004e0750); on a
+	// puppet it is null and the copy crashed twice in it (FINDINGS_42 section 5). Point the slot at the
+	// character itself - a valid object - so the read is harmless on the copy that only plays the clip.
+	if (rd32(ch + 0x2dc) == 200) {
+		DWORD idx = rd32(ch + 0x820);
+		if (idx > 7) {
+			idx = 0;
+			*(DWORD *)(uintptr_t)(ch + 0x820) = 0;
+		}
+		unsigned slot = ch + 0x824 + idx * 4;
+		if (!IsBadWritePtr((void *)(uintptr_t)slot, 4) && !rd32(slot))
+			*(DWORD *)(uintptr_t)slot = ch;
+	}
+	InterlockedIncrement(&g_pb_writes);
+}
+
+// The state: through the game's own setter, and only when it changes (the setter restarts the clip).
+static void puppet_anim(unsigned ch, const psample *s)
+{
+	DWORD tag = rd32(ch + H_TAG);
+	if (g_pb_anim_tag != tag) {
+		g_pb_anim_tag = tag;
+		g_pb_anim_done = rd32(ch + 0x2dc);
+	}
+	if (s->anim == g_pb_anim_done)
+		return;
+	unsigned vt = rd32(ch), fn = vt ? rd32(vt + 0x48) : 0;
+	if (!fn || !code_in_exe(fn)) {
+		*(DWORD *)(uintptr_t)(ch + 0x2dc) = s->anim;   // fallback: the value at least
+		g_pb_anim_done = s->anim;
+		return;
+	}
+	((char_state_t)fn)((void *)(uintptr_t)ch, NULL, s->anim);
+	g_pb_anim_done = s->anim;
+	InterlockedIncrement(&g_pb_anim_sets);
+}
+
+// Called before the game's own character update for every human: is this the puppet, and if so put it in
+// the pose/state the owner has. Returns 1 when the update must be completed by puppet_finish.
+static int puppet_prepare(unsigned ch)
+{
+	if (ch != puppet_target())
+		return 0;
+	psample s;
+	if (!puppet_pose(&s)) {
+		InterlockedIncrement(&g_pb_nosample);
+		return 0;
+	}
+	puppet_anim(ch, &s);
+	puppet_write(ch, &s);
+	return 1;
+}
+
+// Called after the game's own character update: the update may have moved the puppet or changed its
+// state. The owner's values win; the state field is put back WITHOUT the setter (the clip that is
+// playing is the right one - the setter would restart it every frame).
+static void puppet_finish(unsigned ch)
+{
+	psample s;
+	if (!puppet_pose(&s))
+		return;
+	float *pos = (float *)(uintptr_t)(ch + H_POS);
+	float dx = s.pos[0] - pos[0], dy = s.pos[1] - pos[1], dz = s.pos[2] - pos[2];
+	float err = sqrtf(dx * dx + dy * dy + dz * dz);
+	g_pb_err_sum += err;
+	if (err > g_pb_err_max) g_pb_err_max = err;
+	InterlockedIncrement(&g_pb_err_n);
+	if (err > 0.05f)
+		InterlockedIncrement(&g_char_snaps);
+	puppet_write(ch, &s);
+	if (!IsBadWritePtr((void *)(uintptr_t)(ch + 0x2dc), 4)) {
+		if (rd32(ch + 0x2dc) == s.anim) {
+			InterlockedIncrement(&g_pb_anim_ok);
+		} else {
+			*(DWORD *)(uintptr_t)(ch + 0x2dc) = s.anim;   // the game's own update moved it: the owner wins
+			InterlockedIncrement(&g_pb_anim_diff);
+		}
+	}
+	InterlockedIncrement(&g_char_applied);
+}
+
+// Is this character the puppet (used by the input hook to leave its controller alone)?
+static int puppet_is(unsigned ch)
+{
+	return ch && ch == puppet_target();
+}
+
+// ---- each copy streams the character its own pad drives -------------------------------------------
+// TASK 42: 16 ms = 60 Hz, called from the transport thread (net.c net_tick), so the rate does not depend
+// on the frame rate; the receiver interpolates it.
+static void char_send_local(void)
+{
+	if (!g_role || !g_peer_ok)
+		return;
+	if (scene_local_cinematic())
+		return;   // TASK 30: in a scripted event the script owns this character; do not stream it as pad-driven
+	static DWORD last;
+	DWORD now = GetTickCount();
+	if (now - last < 16)
+		return;
+	last = now;
+	unsigned w = world_obj();
+	unsigned me = player_human(g_role == 1 ? 0 : 1);
+	if (!w || !me || IsBadReadPtr((const void *)(uintptr_t)me, 0x330))
+		return;
+	pkt_char p;
+	memset(&p, 0, sizeof p);
+	p.t_ms = timeline_now();
+	p.level = rd32(w + 4);
+	p.me.tag = rd32(me + H_TAG);
+	memcpy(p.me.pos, (const void *)(uintptr_t)(me + H_POS), 12);
+	memcpy(p.me.dir, (const void *)(uintptr_t)(me + H_DIR), 12);
+	memcpy(p.vel, (const void *)(uintptr_t)(me + 0x294), 12);
+	p.speed = rd32(me + 0x278);
+	p.me.anim = rd32(me + 0x2dc);
+	p.me.life = rd32(me + 0x320);
+	net_send(PKT_CHAR, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	InterlockedIncrement(&g_char_sent);
+}
+
 
 // ---- guest: the host's authoritative level (TASK 37) --------------------------------------------
 // The split case this task fixes: the host announced a transition its game did not perform (the door
@@ -2683,82 +2897,6 @@ static void guest_on_state(const char *buf, int n)
 // A snapshot says where the host's character was at host time T. The guest's character is now further along its path,
 // so comparing the two directly would pull it backwards by speed x delay. Compare against the guest's own position at
 // T instead (history, interpolated) and move the current position by that error.
-#define HH 192
-typedef struct { DWORD t; float pos[3]; } hpos;
-static DWORD g_hist_tag[MAX_CH];
-static hpos g_hist[MAX_CH][HH];
-static int g_hist_head[MAX_CH], g_hist_n[MAX_CH];
-
-static int hist_slot(DWORD tag)
-{
-	for (int i = 0; i < MAX_CH; i++)
-		if (g_hist_tag[i] == tag)
-			return i;
-	for (int i = 0; i < MAX_CH; i++)
-		if (!g_hist_tag[i]) {
-			g_hist_tag[i] = tag;
-			return i;
-		}
-	return -1;
-}
-
-static void guest_record_history(void)
-{
-	if (!g_clock_valid)
-		return;
-	unsigned hs[MAX_CH];
-	int n = world_humans(hs, MAX_CH);
-	DWORD t = timeline_now();
-	for (int k = 0; k < n; k++) {
-		int sl = hist_slot(rd32(hs[k] + H_TAG));
-		if (sl < 0)
-			continue;
-		int last = (g_hist_head[sl] + HH - 1) % HH;
-		if (g_hist_n[sl] && (int)(t - g_hist[sl][last].t) < 6)
-			continue;
-		hpos *e = &g_hist[sl][g_hist_head[sl]];
-		e->t = t;
-		memcpy(e->pos, (const void *)(uintptr_t)(hs[k] + H_POS), 12);
-		g_hist_head[sl] = (g_hist_head[sl] + 1) % HH;
-		if (g_hist_n[sl] < HH)
-			g_hist_n[sl]++;
-	}
-}
-
-// A correction moves the character's path from time t onward: shift the history entries after t the same way, or the next
-// snapshot would see the same error again and correct it again.
-static void hist_shift(DWORD tag, DWORD t, float cx, float cy, float cz)
-{
-	int sl = hist_slot(tag);
-	if (sl < 0)
-		return;
-	for (int k = 0; k < g_hist_n[sl]; k++) {
-		hpos *e = &g_hist[sl][(g_hist_head[sl] + HH - 1 - k) % HH];
-		if ((int)(e->t - t) <= 0)
-			break;
-		e->pos[0] += cx; e->pos[1] += cy; e->pos[2] += cz;
-	}
-}
-
-// The guest's own position of this character at host time t (interpolated); 0 if the history does not cover t.
-static int hist_at(DWORD tag, DWORD t, float *out)
-{
-	int sl = hist_slot(tag);
-	if (sl < 0 || g_hist_n[sl] < 2)
-		return 0;
-	for (int k = 0; k < g_hist_n[sl] - 1; k++) {
-		int i = (g_hist_head[sl] + HH - 1 - k) % HH, j = (i + HH - 1) % HH;   // i newer than j
-		if ((int)(g_hist[sl][j].t - t) <= 0 && (int)(t - g_hist[sl][i].t) <= 0) {
-			float span = (float)(int)(g_hist[sl][i].t - g_hist[sl][j].t);
-			float a = span > 0 ? (float)(int)(t - g_hist[sl][j].t) / span : 1.0f;
-			for (int c = 0; c < 3; c++)
-				out[c] = g_hist[sl][j].pos[c] + (g_hist[sl][i].pos[c] - g_hist[sl][j].pos[c]) * a;
-			return 1;
-		}
-	}
-	return 0;
-}
-
 // ---- guest: the weapons in the characters' hands --------------------------------------------------
 // The live weapon state is on the character itself: +0x704 + i*4 is the object in slot i (the object
 // carries its 4-character tag at +0x10, 0 = empty slot) and +0x714 is the slot in the hand. None of it is
@@ -3110,7 +3248,6 @@ static void guest_apply_state(void)
 	}
 	unsigned hs[MAX_CH];
 	int n = world_humans(hs, MAX_CH);
-	unsigned mine = player_human(1);
 	// TASK 30: the battery/energy the host's copy has (a story EnergySet, or the usual drain) is host-owned.
 	if (st.energy_valid) {
 		unsigned inv = rd32(w + 0x1790);
@@ -3168,67 +3305,10 @@ static void guest_apply_state(void)
 				}
 			}
 			*(DWORD *)(uintptr_t)(hs[k] + 0x320) = st.ch[i].life;   // health stays host-owned (damage is applied there)
-			if (hs[k] == mine) {
-				// TASK 25: this copy owns player 2. Its position, facing and animation are the truth the host
-				// follows (PKT_CHAR); the host's snapshot of it is merely older, so blending towards it would
-				// pull the player's own character backwards.
-				// TASK 35: the old > 80 unit repair did exactly that when this copy's own game moved the
-				// character in one step (a door, `tp`, a scripted move): the host's snapshot still held the
-				// position from before the move, and the "repair" put the character back - a guest door use
-				// could never stand at its door (measured: 600 units away after the placement). The host
-				// follows a jump of this size itself (host_apply_remote_char snaps above 60 units), so the
-				// local position stays; only a persistent disagreement is reported.
-				float ex = st.ch[i].pos[0] - pos[0], ey = st.ch[i].pos[1] - pos[1], ez = st.ch[i].pos[2] - pos[2];
-				float dd = sqrtf(ex * ex + ey * ey);
-				if (dd > 80.0f) {
-					static DWORD logged;
-					if (!logged || GetTickCount() - logged > 2000) {
-						logged = GetTickCount();
-						char c[5];
-						logf("guest: %s is %.0f units from the host's snapshot: this copy owns it, the host follows",
-						     tag4(st.ch[i].tag, c), dd);
-					}
-					(void)ez;
-					InterlockedIncrement(&g_snaps);
-				}
-				InterlockedIncrement(&g_applied);
-				break;
-			}
-			anim_apply_remote(hs[k], st.ch[i].tag, st.ch[i].anim);   // TASK 34: only a persistent divergence
-			// the error is measured against where this copy's character was at the snapshot's time
-			float ref[3] = { pos[0], pos[1], pos[2] };
-			int timed = g_clock_valid && hist_at(st.ch[i].tag, st.t_ms, ref);
-			if (timed)
-				InterlockedIncrement(&g_timed_corr);
-			float ex = st.ch[i].pos[0] - ref[0], ey = st.ch[i].pos[1] - ref[1], ez = st.ch[i].pos[2] - ref[2];
-			float err = sqrtf(ex * ex + ey * ey);
-			{
-				static int dbg = -1, dn;
-				if (dbg < 0) { char v[8]; dbg = GetEnvironmentVariableA("OBSCOOP_DEBUG_SYNC", v, sizeof v) ? 1 : 0; }
-				if (dbg && err > 8.0f && (dn++ % 8) == 0 && dn < 4000)
-					logf("corr tag %08x timed %d err %.1f e=(%.1f,%.1f) own_now=(%.1f,%.1f) ref=(%.1f,%.1f) host=(%.1f,%.1f) dT %d", st.ch[i].tag, timed, err, ex, ey,
-						pos[0], pos[1], ref[0], ref[1], st.ch[i].pos[0], st.ch[i].pos[1], (int)(timeline_now() - st.t_ms));
-			}
-			{
-				g_stat_sum += err; g_stat_n++;
-				if (err > g_stat_max) g_stat_max = err;
-			}
-			float big = 30.0f;   // far off (a door, a cutscene, a respawn): move by the whole error
-			if (err > big) {
-				pos[0] += ex; pos[1] += ey; pos[2] += ez;
-				if (timed)
-					hist_shift(st.ch[i].tag, st.t_ms, ex, ey, ez);
-				memcpy(dir, st.ch[i].dir, 12);
-				InterlockedIncrement(&g_snaps);
-			} else if (err > (timed ? 0.6f : 1.0f)) {
-				// A timed error is a real position error at the snapshot's time, so take half of it per
-				// snapshot (a quarter left the remote character ~v*dt/0.25 units behind: TASK 13).
-				float kk = 0.5f;
-				pos[0] += ex * kk; pos[1] += ey * kk; pos[2] += ez * kk;
-				if (timed)
-					hist_shift(st.ch[i].tag, st.t_ms, ex * kk, ey * kk, ez * kk);
-				InterlockedIncrement(&g_blends);
-			}
+			// TASK 42: no position, facing or animation correction here any more. Each copy owns its own
+			// character and the peer's character is a puppet driven by PKT_CHAR (see the puppet block
+			// above); a snapshot is one link delay old, and pulling a character towards it is exactly the
+			// correction that made the remote character slide and the two games disagree.
 			InterlockedIncrement(&g_applied);
 			break;
 		}
@@ -3242,39 +3322,6 @@ static void guest_apply_state(void)
 		g_weap_pending = 1;
 	}
 }
-
-// ---- guest: stream the character this copy owns (player 2) ----------------------------------------
-// TASK 25: player 2 is this copy's own character - its game answers its pad first-hand, so this copy is
-// the authority for where the character is, which way it faces and what it animates. The host follows
-// these instead of re-simulating it from the pad that arrives over the link in another camera frame.
-static void guest_send_char(void)
-{
-	if (g_role != 2 || !g_peer_ok)
-		return;
-	if (scene_local_cinematic())
-		return;   // TASK 30: in a scripted event the script owns this character; do not stream it as pad-driven
-	static DWORD last;
-	DWORD now = GetTickCount();
-	if (now - last < 8)
-		return;
-	last = now;
-	unsigned w = world_obj();
-	unsigned me = player_human(1);
-	if (!w || !me || IsBadReadPtr((const void *)(uintptr_t)me, 0x330))
-		return;
-	pkt_char p;
-	memset(&p, 0, sizeof p);
-	p.t_ms = timeline_now();
-	p.level = rd32(w + 4);
-	p.me.tag = rd32(me + H_TAG);
-	memcpy(p.me.pos, (const void *)(uintptr_t)(me + H_POS), 12);
-	memcpy(p.me.dir, (const void *)(uintptr_t)(me + H_DIR), 12);
-	p.me.anim = rd32(me + 0x2dc);
-	p.me.life = rd32(me + 0x320);
-	net_send(PKT_CHAR, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
-	InterlockedIncrement(&g_char_sent);
-}
-
 
 // ---- NPCs and enemies (the NPC manager at world + 0x1760: same container layout as the humans, same position
 // and facing offsets) ---------------------------------------------------------------------------------
@@ -6136,6 +6183,7 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_apt_cs);     // TASK 28 pipe `aptdone`
 	InitializeCriticalSection(&g_scene_cs);   // TASK 30 (rx thread / game thread / pipe thread)
 	InitializeCriticalSection(&g_door_cs);    // TASK 34 (rx thread / game thread)
+	InitializeCriticalSection(&g_pb_cs);      // TASK 42 (rx thread / game thread): the puppet buffer
 }
 
 // Guest, game thread (TASK 37): the host is the only authority for the level. When this copy has been in
@@ -6254,14 +6302,29 @@ static void frame_tick(void)
 		DWORD now = GetTickCount();
 		if (now - last_stat >= 10000) {
 			last_stat = now;
-			if (g_role == 2)
-				logf("sync stats: host characters off by mean %.1f max %.1f units over %ld snapshots (%ld snaps, %ld blends); rtt %ld ms, "
-					"clock %s, input delay %s %ld ms, camera yaw own %.0f peer %.0f (valid %ld/%ld)",
-					g_stat_n ? g_stat_sum / g_stat_n : 0.0f, g_stat_max, g_stat_n, g_snaps, g_blends, g_net_rtt_ms, g_clock_valid ? "synced" : "unknown",
-					g_delay_on ? "on" : "off", g_delay_ms, g_cam_yaw * 57.2958f, g_peer_yaw * 57.2958f, g_cam_yaw_valid, g_peer_yaw_valid);
-			else
-				logf("sync stats: sent %ld snapshots, %ld requests; guest rtt %.0f ms; camera yaw own %.0f peer %.0f (valid %ld/%ld)", g_snd_states, g_req_sent,
-					g_guest_rtt, g_cam_yaw * 57.2958f, g_peer_yaw * 57.2958f, g_cam_yaw_valid, g_peer_yaw_valid);
+			// TASK 42: the puppet numbers. "drift" is how far the game's own update moved the puppet away
+			// from the owner's pose before this copy put it back (0 = the two simulations agree); "anim"
+			// is how often the puppet showed exactly the state the owner streamed.
+			{
+				char ot[5], pt[5];
+				unsigned own = player_human(g_role == 1 ? 0 : 1), pup = player_human(g_role == 1 ? 1 : 0);
+				long an = (long)g_pb_anim_ok + (long)g_pb_anim_diff;
+				logf("puppet stats: own %s at %.1f,%.1f,%.1f | peer %s %s at %.1f,%.1f,%.1f (stream %s, delay %.0f ms) | "
+				     "drift mean %.2f max %.2f over %ld updates, anim %ld/%ld (%.0f%%), %ld state sets, %ld underruns, %ld extrapolated | rtt %ld ms",
+				     tag4(own ? rd32(own + H_TAG) : 0, ot),
+				     own ? *(const float *)(uintptr_t)(own + H_POS) : 0.0f,
+				     own ? *(const float *)(uintptr_t)(own + H_POS + 4) : 0.0f,
+				     own ? *(const float *)(uintptr_t)(own + H_POS + 8) : 0.0f,
+				     tag4(pup ? rd32(pup + H_TAG) : 0, pt), pup ? "local" : "none",
+				     pup ? *(const float *)(uintptr_t)(pup + H_POS) : 0.0f,
+				     pup ? *(const float *)(uintptr_t)(pup + H_POS + 4) : 0.0f,
+				     pup ? *(const float *)(uintptr_t)(pup + H_POS + 8) : 0.0f,
+				     g_pb_tag ? "live" : "none", g_pb_delay,
+				     g_pb_err_n ? g_pb_err_sum / g_pb_err_n : 0.0f, g_pb_err_max, g_pb_err_n,
+				     (long)g_pb_anim_ok, an, an ? 100.0 * (double)g_pb_anim_ok / (double)an : 0.0,
+				     g_pb_anim_sets, g_pb_under, g_pb_extrap, g_net_rtt_ms);
+			}
+			g_pb_err_sum = 0; g_pb_err_max = 0; g_pb_err_n = 0;
 			g_stat_sum = 0; g_stat_max = 0; g_stat_n = 0;
 		}
 	}
@@ -6282,10 +6345,6 @@ static void frame_tick(void)
 		host_send_npcs();
 		hang_phase("in host_send_progress");
 		host_send_progress(0);
-		if (!scene_local_cinematic()) {
-			hang_phase("in host_apply_remote_char");
-			host_apply_remote_char();   // TASK 30: in a scripted event the script owns both characters
-		}
 		hang_phase("in scene_tick (host)");
 		scene_tick();                   // TASK 30: mirror the world's scripted-event state / apply a skip
 		hang_phase("in door_tick (host)");
@@ -6307,8 +6366,6 @@ static void frame_tick(void)
 		guest_level_heal();         // TASK 37: follow the host's level if the copies ended apart
 		hang_phase("in guest_apply_state (PKT_STATE)");
 		guest_apply_state();
-		hang_phase("in guest_send_char");
-		guest_send_char();          // this copy's own character (player 2), for the host to follow
 		hang_phase("in guest_apply_npcs");
 		guest_apply_npcs();
 		hang_phase("in peer_apply_pickups (guest)");
@@ -6323,8 +6380,6 @@ static void frame_tick(void)
 		door_tick();                // TASK 34: door uses / transition objects on both copies
 		hang_phase("in guest_follow_own_player");
 		guest_follow_own_player();
-		hang_phase("in guest_record_history");
-		guest_record_history();
 		hang_phase("in guest_debug_p1");
 		guest_debug_p1();
 	}
@@ -6347,8 +6402,10 @@ static void sync_status(char *reply, size_t replysz)
 			g_pickup_sent, g_pickup_rcv, g_pickup_applied, g_pickup_skipped, g_pickup_missing);
 	l = strlen(reply);
 	if (l < replysz)
-		_snprintf(reply + l, replysz - l, " | char sent %ld rcv %ld applied %ld blends %ld snaps %ld skipped %ld extrap %ld",
-			g_char_sent, g_char_rcv, g_char_applied, g_char_blends, g_char_snaps, g_char_skipped, g_char_extrap);
+		_snprintf(reply + l, replysz - l, " | char sent %ld rcv %ld applied %ld blends %ld snaps %ld skipped %ld extrap %ld"
+			" | puppet delay %.0f ms under %ld anim_sets %ld anim_diff %ld anim_ok %ld writes %ld",
+			g_char_sent, g_char_rcv, g_char_applied, g_char_blends, g_char_snaps, g_char_skipped, g_pb_extrap,
+			g_pb_delay, g_pb_under, g_pb_anim_sets, g_pb_anim_diff, g_pb_anim_ok, g_pb_writes);
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | prop sent %ld rcv %ld applied %ld broke %ld drop %ld missing %ld",
@@ -6360,7 +6417,7 @@ static void sync_status(char *reply, size_t replysz)
 			g_apt_sent, g_apt_rcv, g_apt_applied, g_apt_actions);
 	l = strlen(reply);
 	if (l < replysz)
-		_snprintf(reply + l, replysz - l, " | anim forced %ld", g_anim_forced);
+		_snprintf(reply + l, replysz - l, " | puppet gated %ld frames %ld", g_puppet_gated, g_puppet_frames);
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | door sent %ld rcv %ld applied %ld missed %ld | ask sent %ld pend %ld",

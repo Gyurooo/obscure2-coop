@@ -146,14 +146,16 @@ def phase(name, by):
         samples reaches the other one sample later (measured: 49/55 exact, every mismatch a transition
         edge). A plain per-sample equality turned that skew into a FAIL at 89 % - the criterion is that
         the state SEQUENCE is the same on both copies, not that the edge lands on the same sample."""
-        for j in (i, i - 1, i + 1):
+        # TASK 42: the puppet plays its owner's state through its own setter ~100 ms later, and the steam
+        # link adds jitter/spikes/blackouts on top, so an edge may land up to ~200 ms (4 samples) later.
+        for j in (i, i - 1, i + 1, i - 2, i + 2, i - 3, i + 3, i - 4, i + 4):
             if 0 <= j < len(hist_g) and hist_g[j] is not None and hist_g[j] == h:
                 return True
         return False
 
     agree = sum(1 for i, h, g in pairs if near(i, h))
     agree_frac = (agree / float(len(pairs))) if pairs else 0.0
-    print('   copies agree on %d/%d samples (%.0f%%, one sample of skew allowed)'
+    print('   copies agree on %d/%d samples (%.0f%%, up to four samples (200 ms) of delay allowed)'
           % (agree, len(pairs), 100.0 * agree_frac))
     ok_h = bool(stance_h) and bool(stance_g) and agree_frac >= 0.90 and extra_h == extra_g
     ok_g = ok_h

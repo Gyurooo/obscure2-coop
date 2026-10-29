@@ -871,6 +871,8 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		if (delayed_input_on()) {
 			DWORD t_apply = timeline_now() - (DWORD)g_delay_ms;
 			memset(state, 0, sizeof(xstate));
+			if (user == 0 && !menu_input_active())   // TASK 42: the host's character is a puppet here
+				return pad_finish(user, state);
 			ring_get(user == 0 ? &g_ring_p1 : &g_ring_p2, t_apply, (xstate *)state);
 			if (user == 0) {
 				remap_if_known((xstate *)state);   // the host's stick is in the host's camera frame
@@ -884,7 +886,10 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			if (g_peer_ok && !in_level) {   // menus and loading screens: this PC's own pad, so the friend can start their game
 				memset(state, 0, sizeof(xstate));
 				pad_read((DWORD)g_local_pad, state);
-			} else if (g_peer_ok && GetTickCount() - g_netpad_tick < 500) {
+			} else if (g_peer_ok && menu_input_active() && GetTickCount() - g_netpad_tick < 500) {
+				// TASK 42: in normal play the host's character is a PUPPET on this copy - its pad must not
+				// reach the game at all. The streamed pad is served only where a shared MENU needs it
+				// (TASK 36/38: both pads drive the pause menu and the inventory on both copies).
 				memcpy(state, &g_netpad, sizeof(xstate));
 				remap_if_known((xstate *)state);
 				drop_remote_look((xstate *)state);
@@ -924,6 +929,10 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 	if (g_role == 1 && delayed_input_on() && (user == 0 || (int)user == g_remote_pad_idx)) {
 		DWORD t_apply = timeline_now() - (DWORD)g_delay_ms;
 		int down = p1_down();
+		if (user != 0 && !menu_input_active()) {   // TASK 42: the guest's character is a puppet here
+			memset(state, 0, sizeof(xstate));
+			return pad_finish(user, state);
+		}
 		if (user == 0 && down) {
 			memset(state, 0, sizeof(xstate));
 			return pad_finish(user, state);
@@ -953,7 +962,11 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			LeaveCriticalSection(&g_vpad_cs);
 			return pad_finish(user, state);
 		}
-		memcpy(state, &g_vpad[user], sizeof(xstate));
+		if (g_role == 1 && g_peer_ok && (int)user == g_remote_pad_idx && game_in_level() && !menu_input_active()) {
+			memset(state, 0, sizeof(xstate));   // TASK 42: the guest's character is a puppet here, no pad
+		} else {
+			memcpy(state, &g_vpad[user], sizeof(xstate));
+		}
 		if (g_role == 1 && user != 0 && down && g_vpad_on[0])
 			merge_pad((xstate *)state, &g_vpad[0]);
 		LeaveCriticalSection(&g_vpad_cs);
