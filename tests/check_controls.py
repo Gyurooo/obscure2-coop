@@ -46,6 +46,29 @@ def in_level(m):
     return u32(m, g + 0x310) == 1 and u32(m, g + 0x320) == 0 and w and (u32(m, w + 4) or 0) != 0
 
 
+def normal(m):
+    """In a level AND in normal play. The game only runs its pad/movement scan in world state 1 with no
+    requested scene (FINDINGS_36 §2/§6); right after a load the level' own script often opens a scripted
+    event (state 7 / world+0x12c != 0) for a few seconds, during which a held stick moves nobody. TASK 37:
+    wait for normal play instead of failing a pad that is wired correctly."""
+    g = u32(m, m.va(GAME))
+    if not g:
+        return False
+    w = u32(m, g + 0x378)
+    if not w or u32(m, g + 0x310) != 1 or u32(m, g + 0x320) != 0 or (u32(m, w + 4) or 0) == 0:
+        return False
+    return u32(m, w + 0x11c) == 1 and u32(m, w + 0x12c) == 0
+
+
+def wait_normal(t=25.0):
+    t0 = time.time()
+    while time.time() - t0 < t:
+        if normal(H) and normal(G) and tag(level(H)) == tag(level(G)):
+            return time.time() - t0
+        time.sleep(0.3)
+    return None
+
+
 def wiring(m):
     w = world(m)
     ctl = u32(m, w + 0x1748) if w else 0
@@ -142,15 +165,26 @@ for by, pl in (('host', 0), ('guest', 1)):
     # Each copy's own controller is virtual pad 0 (LOCAL_PAD), whatever player it drives: on the host it
     # is served as XInput user 0 (player 1), on the guest as user 1 (player 2).
     print('== %s own pad (vpad 0) forward %.1f s (drives player %d = %s)' % (by, STICK_MS / 1000.0, pl + 1, wh[pl][0]))
-    b0, b1 = positions(H), positions(G)
-    move(pipe, 0, STICK_MS / 1000.0)
-    a0, a1 = positions(H), positions(G)
-    dh = [dist(b0[i], a0[i]) for i in (0, 1)]
-    dg = [dist(b1[i], a1[i]) for i in (0, 1)]
-    print('   host copy moved: player 1 %.1f, player 2 %.1f units | guest copy: player 1 %.1f, player 2 %.1f units'
-          % (dh[0], dh[1], dg[0], dg[1]))
-    good = dh[pl] >= MOVE_MIN and dg[pl] >= MOVE_MIN and dh[other] < STILL_MAX and dg[other] < STILL_MAX
-    print('   %s: %s (own character moved on both copies, the other did not)' % (by, 'PASS' if good else 'FAIL'))
+    good = False
+    for attempt in (1, 2):
+        t = None if attempt == 1 else wait_normal(25)
+        if attempt == 2:
+            print('   the world was not in normal play (or nothing moved): waited %s s, driving again' % (
+                ('%.1f' % t) if t is not None else 'NO'))
+        b0, b1 = positions(H), positions(G)
+        move(pipe, 0, STICK_MS / 1000.0)
+        a0, a1 = positions(H), positions(G)
+        dh = [dist(b0[i], a0[i]) for i in (0, 1)]
+        dg = [dist(b1[i], a1[i]) for i in (0, 1)]
+        print('   host copy moved: player 1 %.1f, player 2 %.1f units | guest copy: player 1 %.1f, player 2 %.1f units'
+              % (dh[0], dh[1], dg[0], dg[1]))
+        good = dh[pl] >= MOVE_MIN and dg[pl] >= MOVE_MIN and dh[other] < STILL_MAX and dg[other] < STILL_MAX
+        print('   %s: %s (own character moved on both copies, the other did not)' % (by, 'PASS' if good else 'FAIL'))
+        if good:
+            break
+        if attempt == 1 and wait_normal(25) is not None:
+            continue
+        break
     ok.append(good)
     time.sleep(0.6)
 if all(ok):

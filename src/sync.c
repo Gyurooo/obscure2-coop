@@ -87,6 +87,15 @@ static volatile LONG g_item_applied;
 // otherwise invisible to a test that only reads memory.
 static volatile LONG g_frames;
 
+// TASK 37: transitions are ordered. Every transition the host announces gets the next sequence number;
+// a repeat of the same transition carries the same number, so the guest can tell a repeat (same seq) from
+// an older transition (lower seq, dropped) and from a newer one (higher seq, replaces what is queued).
+static DWORD g_trans_seq;   // the newest transition sequence this host has announced (pkt_state.host_seq)
+static DWORD host_trans_next(void)
+{
+	return ++g_trans_seq;
+}
+
 // A save load starts the game with only player 1 attached: the second input controller's character
 // pointer is 0, so the partner is AI and the guest's pad controls nothing. Re-attach the second human
 // to the second input controller after a load (both copies do this).
@@ -2042,6 +2051,16 @@ static void host_send_state(void)
 	memset(&p, 0, sizeof p);
 	p.t_ms = now_ms();
 	p.level = rd32(world_obj() + 4);
+	// TASK 37: the host's authoritative state for the guest's self-heal: the level the party is in (the
+	// last transition the host performed or announced), its entry, and whether this copy is in the middle
+	// of a transition right now (game+0x320 != 0 or the world is being rebuilt).
+	p.host_level = p.level ? p.level : g_last_level;   // the level the host is actually in, else its last announced one
+	p.host_entry = g_last_entry;
+	p.host_seq = g_trans_seq;
+	{
+		unsigned go = game_obj();
+		p.host_busy = (g_last_level && (rd32(go + 0x320) != 0 || !go)) ? 1u : 0u;
+	}
 	p.n = (DWORD)n;
 	memset(&p.hpad, 0, sizeof p.hpad);
 	pad_read(0, &p.hpad);   // the host's own controller is the guest's player 1
@@ -2218,6 +2237,22 @@ static void host_apply_remote_char(void)
 	}
 }
 
+// ---- guest: the host's authoritative level (TASK 37) --------------------------------------------
+// The split case this task fixes: the host announced a transition its game did not perform (the door
+// line 0.7 s before a pipe load: the load's world was never built on the host), or two transitions
+// raced and the two games applied them in a different order - so the copies ended in different levels
+// and nothing compared them again. The host streams the level the party is in (pkt_state.host_level /
+// host_entry / host_busy / host_seq); if this copy is in another level for LVL_HEAL_MS while BOTH
+// copies are idle, it performs the host's level change through the same ChangeLevel call the
+// late-join path uses (guest_level_heal, near frame_tick).
+static volatile LONG g_host_lvl, g_host_entry, g_host_busy, g_host_seq;
+static volatile DWORD g_host_lvl_at;
+static DWORD g_lvl_mismatch_since;
+static int g_heal_tries;                     // heals without the copies agreeing (a bounded retry)
+static volatile LONG g_heals;                // levels re-converged because the host was in another one
+#define LVL_HEAL_MS 3000                     // the mismatch must persist this long with both copies idle
+#define LVL_HEAL_FRESH_MS 1000               // the host's statement must be this recent
+
 static void guest_on_state(const char *buf, int n)
 {
 	if (n != (int)sizeof(pkt_state))
@@ -2236,6 +2271,14 @@ static void guest_on_state(const char *buf, int n)
 	memcpy(&g_rx_state, buf, sizeof g_rx_state);
 	g_rx_state_new = 1;
 	LeaveCriticalSection(&g_rx_cs);
+	// TASK 37: the host's authoritative level, for the guest's self-heal (guest_level_heal, game thread).
+	if (st->host_level) {
+		g_host_lvl = (LONG)st->host_level;
+		g_host_entry = (LONG)st->host_entry;
+		g_host_busy = (LONG)st->host_busy;
+		g_host_seq = (LONG)st->host_seq;
+		g_host_lvl_at = GetTickCount();
+	}
 	InterlockedIncrement(&g_rcv_states);
 }
 
@@ -2418,6 +2461,13 @@ static int guest_owns_level(unsigned level)
 
 static void guest_load_failed(const char *name);   // sync.c: the game refused the file, take a repeat again
 
+// TASK 37: a transition is never started on top of one that is still in flight. A load is a transition
+// too (it rebuilds the world), so it waits until the game has no request pending and the level it holds
+// has been stable for LOAD_SETTLE_MS. Without this the game can apply a load and a change-level of its own
+// in either order - the copies then end in different levels (the soak's door 0.7 s before a pipe load).
+#define LOAD_SETTLE_MS 700
+static DWORD g_game_busy_at, g_level_seen_at, g_level_seen_tag;
+
 // Runs on the game's own thread, every frame, in every mode (main menu included).
 static void game_load_tick(unsigned game)
 {
@@ -2457,6 +2507,40 @@ static void game_load_tick(unsigned game)
 			g_role == 2 ? "guest" : "host", name, src, now - at);
 		InterlockedExchange(&g_rload_want, 0);
 		return;
+	}
+	{   // TASK 37: wait for this copy's own game to be idle and settled (see LOAD_SETTLE_MS above) -
+		// but only INSIDE a level. At the main menu game+0x320 holds the menu request state (9), which is
+		// normal there; gating on it would hold a joining guest's load at the menu.
+		if (rd32(game + 0x310) == 1) {
+			DWORD req = rd32(game + 0x320);
+			unsigned gw = rd32(game + 0x378), gl = gw ? rd32(gw + 4) : 0;
+			if (req)
+				g_game_busy_at = now;
+			if (gl && gl != g_level_seen_tag) {
+				g_level_seen_tag = gl;
+				g_level_seen_at = now;
+			}
+			int busy = req || (g_game_busy_at && now - g_game_busy_at < LOAD_SETTLE_MS) ||
+			           (g_level_seen_at && now - g_level_seen_at < LOAD_SETTLE_MS);
+			if (busy) {
+				static DWORD logged;
+				if ((LONG)(now - at) < LOAD_WAIT_MS) {
+					if (!logged || now - logged > 2000) {
+						logged = now;
+						logf("%s: real load of \"%s\" (%s) waits for this copy's transition to finish (state %u, %u ms since the level %08x)",
+							g_role == 2 ? "guest" : "host", name, src, req,
+							(unsigned)(g_level_seen_at ? now - g_level_seen_at : 0), (unsigned)g_level_seen_tag);
+					}
+					return;   // keep the request pending
+				}
+				logf("%s: real load of \"%s\" (%s) given up after %u ms: this copy never became idle",
+					g_role == 2 ? "guest" : "host", name, src, now - at);
+				InterlockedExchange(&g_rload_want, 0);
+				if (g_role == 2 && !strcmp(src, "host"))
+					guest_load_failed(name);   // TASK 37: let the host's repeat be applied again
+				return;
+			}
+		}
 	}
 	InterlockedExchange(&g_rload_want, 0);
 	int opened = game_save_open(game, name);
@@ -3160,23 +3244,26 @@ static void guest_apply_regions(void)
 static DWORD g_req_rep_until, g_req_rep_at, g_req_rep_level, g_req_rep_entry, g_req_rep_flag;
 static DWORD g_req_rep_kind;              // REQ_LEVEL or REQ_LOAD_NAME (a load is as important as a level change)
 static char g_req_rep_name[32];
+static DWORD g_req_rep_seq;               // TASK 37: the transition sequence this repeat belongs to
 
-static void host_level_request_repeat(unsigned level, unsigned entry, unsigned flag)
+static void host_level_request_repeat(unsigned level, unsigned entry, unsigned flag, DWORD seq)
 {
 	DWORD now = GetTickCount();
 	g_req_rep_level = level;
 	g_req_rep_entry = entry;
 	g_req_rep_flag = flag;
 	g_req_rep_kind = REQ_LEVEL;
+	g_req_rep_seq = seq;
 	g_req_rep_until = now + REQ_REPEAT_FOR;
 	g_req_rep_at = now;
 }
 
-static void host_load_request_repeat(const char *name)
+static void host_load_request_repeat(const char *name, DWORD seq)
 {
 	DWORD now = GetTickCount();
 	_snprintf(g_req_rep_name, sizeof g_req_rep_name, "%s", name ? name : "");
 	g_req_rep_kind = REQ_LOAD_NAME;
+	g_req_rep_seq = seq;
 	g_req_rep_until = now + REQ_REPEAT_FOR;
 	g_req_rep_at = now;
 }
@@ -3194,12 +3281,12 @@ static void host_repeat_tick(void)
 		return;
 	g_req_rep_at = now;
 	if (g_req_rep_kind == REQ_LOAD_NAME) {
-		net_send_req(REQ_LOAD_NAME, 0, 0, 0, g_req_rep_name);
+		net_send_req(REQ_LOAD_NAME, 0, 0, 0, g_req_rep_name, g_req_rep_seq);
 		InterlockedIncrement(&g_req_sent);
 		return;
 	}
 	host_send_progress(1);   // the party table must reach the guest before the level change it belongs to
-	net_send_req(REQ_LEVEL, g_req_rep_level, g_req_rep_entry, g_req_rep_flag, NULL);
+	net_send_req(REQ_LEVEL, g_req_rep_level, g_req_rep_entry, g_req_rep_flag, NULL, g_req_rep_seq);
 	InterlockedIncrement(&g_req_sent);
 }
 
@@ -3235,9 +3322,10 @@ static void host_watch_level(void)
 	if (g_peer_ok) {
 		test_hold_party();
 		host_send_progress(1);   // the party table must reach the guest before the level change it belongs to
-		net_send_req(REQ_LEVEL, lvl, entry, 1, NULL);
+		DWORD seq = host_trans_next();
+		net_send_req(REQ_LEVEL, lvl, entry, 1, NULL, seq);
 		InterlockedIncrement(&g_req_sent);
-		host_level_request_repeat(lvl, entry, 1);
+		host_level_request_repeat(lvl, entry, 1, seq);
 		InterlockedIncrement(&g_watch_sent);
 	}
 }
@@ -3266,17 +3354,19 @@ static void host_welcome_guest(void)
 		// load that file itself, exactly as it would if the load happened now (CASE 1). No REQ_LEVEL: the
 		// file builds that world, and a level request would only sit in the guest's queue behind the load.
 		logf("join: the host is in a load of \"%s\"; asking the guest to load that file itself", lname);
-		net_send_req(REQ_LOAD_NAME, 0, 0, 0, lname);
+		DWORD seq = host_trans_next();
+		net_send_req(REQ_LOAD_NAME, 0, 0, 0, lname, seq);
 		InterlockedIncrement(&g_req_sent);
-		host_load_request_repeat(lname);
+		host_load_request_repeat(lname, seq);
 		return;
 	}
 	// The friend starts their own "New game, Two players" first (that choice decides who controls player 2); the
 	// level request waits on the guest until its world exists.
 	if (g_last_level) {
-		net_send_req(REQ_LEVEL, g_last_level, g_last_entry, g_last_flag, NULL);
+		DWORD seq = host_trans_next();
+		net_send_req(REQ_LEVEL, g_last_level, g_last_entry, g_last_flag, NULL, seq);
 		InterlockedIncrement(&g_req_sent);
-		host_level_request_repeat(g_last_level, g_last_entry, g_last_flag);
+		host_level_request_repeat(g_last_level, g_last_entry, g_last_flag, seq);
 	}
 }
 
@@ -3293,6 +3383,17 @@ static DWORD g_lvl_req_done_a, g_lvl_req_done_b, g_lvl_req_done_at;   // the las
 static unsigned g_lvl_defer_level;  // the level request currently waiting for the host party (0 = none)
 static DWORD g_ln_done_at;          // the last load request this copy took
 static char g_ln_done_name[sizeof(((pkt_req *)0)->name)];
+// TASK 37: transitions are ordered by the host's sequence number. g_trans_applied is the newest one this
+// copy has performed, g_trans_queued the newest one waiting; an older request is never applied (it would
+// undo a newer transition), and a newer request cancels the older ones still queued.
+static DWORD g_trans_applied, g_trans_queued;
+static DWORD g_ln_seq;                // the sequence of the load request this copy took (for a retry)
+static volatile LONG g_trans_stale;   // requests dropped because a newer transition exists
+
+static int req_is_transition(DWORD kind)
+{
+	return kind == REQ_LEVEL || kind == REQ_LOAD_NAME || kind == REQ_LOAD_PROGRESS;
+}
 
 // The game refused to open the file this load named (a half-written file, or a name it does not accept).
 // Forget the "already taken" mark, so the host's repeat of the same request is executed again instead of
@@ -3302,6 +3403,15 @@ static void guest_load_failed(const char *name)
 	EnterCriticalSection(&g_req_cs);
 	if (!strncmp(g_ln_done_name, name, sizeof g_ln_done_name))
 		g_ln_done_at = 0;
+	// TASK 37: the sequence ordering must not swallow the retry. This load was marked as the newest applied
+	// transition when it was taken; step the marks back to just below it, so the host's repeat of the same
+	// request (same seq) is accepted and tried again instead of being dropped as a duplicate.
+	if (g_ln_seq) {
+		if (g_trans_applied == g_ln_seq)
+			g_trans_applied = g_ln_seq - 1;
+		if (g_trans_queued == g_ln_seq)
+			g_trans_queued = g_ln_seq - 1;
+	}
 	LeaveCriticalSection(&g_req_cs);
 }
 
@@ -3312,10 +3422,40 @@ static void guest_on_req(const char *buf, int n)
 	const pkt_req *r = (const pkt_req *)buf;
 	DWORD now = GetTickCount();
 	EnterCriticalSection(&g_req_cs);
+	if (r->seq && req_is_transition(r->kind)) {
+		// TASK 37: only the newest transition counts. A repeat of the one already applied or queued is a
+		// duplicate; one OLDER than either would undo a newer transition and is dropped; a NEWER one cancels
+		// whatever older transitions are still queued, so nothing is ever applied half.
+		if (g_trans_applied && r->seq + 16 < g_trans_applied) {
+			// The host's counter is far below ours: it was restarted (the host's game relaunched and
+			// reconnected to this guest). Start counting again instead of dropping everything.
+			logf("guest: the host's transition counter restarted (%lu < %lu): counting from its values again",
+			     (unsigned long)r->seq, (unsigned long)g_trans_applied);
+			g_trans_applied = g_trans_queued = 0;
+		}
+		if (r->seq <= g_trans_applied || r->seq <= g_trans_queued) {
+			LeaveCriticalSection(&g_req_cs);
+			InterlockedIncrement(&g_trans_stale);
+			return;
+		}
+		for (int i = g_req_head; i != g_req_tail; i = (i + 1) & 7) {
+			if (req_is_transition(g_req_q[i].kind) && g_req_q[i].seq < r->seq) {
+				char lv[5], nm[sizeof g_req_q[i].name];
+				DWORD k = g_req_q[i].kind, lvl = g_req_q[i].a, old = g_req_q[i].seq;
+				memcpy(nm, g_req_q[i].name, sizeof nm);
+				nm[sizeof nm - 1] = 0;
+				g_req_q[i].kind = 0;   // cancelled: a newer transition replaces it (skipped in apply)
+				logf("guest: transition %lu (%s %s) cancelled: transition %lu is newer", (unsigned long)old,
+				     k == REQ_LEVEL ? "level" : k == REQ_LOAD_NAME ? "load" : "progress",
+				     k == REQ_LEVEL ? tag4(lvl, lv) : nm, (unsigned long)r->seq);
+			}
+		}
+		g_trans_queued = r->seq;
+	}
 	if (r->kind == REQ_LEVEL) {
 		// The host repeats a level request because PKT_REQ is not reliable: skip the copies (one already
 		// waiting in the queue, or one applied a moment ago) so the guest changes level once.
-		if (g_lvl_req_done_at && r->a == g_lvl_req_done_a && r->b == g_lvl_req_done_b &&
+		if (g_lvl_req_done_at && !r->seq && r->a == g_lvl_req_done_a && r->b == g_lvl_req_done_b &&
 		    now - g_lvl_req_done_at < REQ_LEVEL_DONE_MS) {
 			LeaveCriticalSection(&g_req_cs);
 			return;
@@ -3327,7 +3467,7 @@ static void guest_on_req(const char *buf, int n)
 			}
 	}
 	if (r->kind == REQ_LOAD_NAME) {   // repeated like a level request: one real load per name
-		if (g_ln_done_at && !strncmp(r->name, g_ln_done_name, sizeof g_ln_done_name) &&
+		if (g_ln_done_at && !r->seq && !strncmp(r->name, g_ln_done_name, sizeof g_ln_done_name) &&
 		    now - g_ln_done_at < REQ_LOAD_DONE_MS) {
 			LeaveCriticalSection(&g_req_cs);
 			return;
@@ -3365,6 +3505,11 @@ static void guest_apply_requests(void)
 		}
 		r = g_req_q[g_req_head];
 		seen = g_req_seen[g_req_head];
+		if (r.kind == 0) {   // TASK 37: cancelled by a newer transition
+			g_req_head = (g_req_head + 1) & 7;
+			LeaveCriticalSection(&g_req_cs);
+			continue;
+		}
 		if (r.kind == REQ_LEVEL) {   // a joining guest may still be loading: keep the request until its world exists
 			unsigned g0 = game_obj();
 			if (!g0 || rd32(g0 + 0x310) != 1 || rd32(g0 + 0x320) != 0 || !world_obj()) {
@@ -3415,6 +3560,10 @@ static void guest_apply_requests(void)
 			}
 		}
 		g_req_head = (g_req_head + 1) & 7;
+		if (r.seq && req_is_transition(r.kind) && r.seq > g_trans_applied)
+			g_trans_applied = r.seq;   // TASK 37: an older transition can never be applied after this one
+		if (r.kind == REQ_LOAD_NAME)
+			g_ln_seq = r.seq;          // TASK 37: the seq this load owns, so a failure can re-open it
 		if (r.kind == REQ_LEVEL) {   // remember it: the host's repeats of this one are dropped
 			g_lvl_req_done_a = r.a;
 			g_lvl_req_done_b = r.b;
@@ -4252,6 +4401,7 @@ static void level_ask_tick(void)
 // Host, UDP thread: the guest's ask, applied on the game thread.
 static volatile LONG g_levelask_pending;
 static DWORD g_levelask_level, g_levelask_entry, g_levelask_flag;
+static DWORD g_levelask_at;   // TASK 37: when the ask started waiting for this copy's own transition
 
 static void host_on_levelask(const char *buf, int n)
 {
@@ -4261,6 +4411,7 @@ static void host_on_levelask(const char *buf, int n)
 	g_levelask_level = a->level;
 	g_levelask_entry = a->entry;
 	g_levelask_flag = a->flag;
+	g_levelask_at = 0;
 	g_levelask_pending = 1;
 }
 
@@ -4268,8 +4419,23 @@ static void host_levelask_tick(void)
 {
 	if (g_role != 1 || !g_levelask_pending || !g_peer_ok)
 		return;
-	g_levelask_pending = 0;
-	host_apply_guest_level(g_levelask_level, g_levelask_entry, g_levelask_flag);
+	DWORD now = GetTickCount();
+	if (!g_levelask_at)
+		g_levelask_at = now;
+	if (host_apply_guest_level(g_levelask_level, g_levelask_entry, g_levelask_flag)) {
+		g_levelask_pending = 0;
+		g_levelask_at = 0;
+		return;
+	}
+	// TASK 37: this copy has a transition of its own in flight. The ask stays pending until that one is
+	// over (a transition is never applied half on top of another), but not forever.
+	if (now - g_levelask_at > ASK_GIVE_UP_MS) {
+		char lv[5];
+		g_levelask_pending = 0;
+		g_levelask_at = 0;
+		logf("host: the guest's ask for %s is dropped: this copy stayed busy for %d ms",
+		     tag4(g_levelask_level, lv), ASK_GIVE_UP_MS);
+	}
 }
 
 // TEST ONLY (pipe `usedoor <0|1>`): run the game's own door use on the nearest door to that player, the
@@ -5255,6 +5421,9 @@ static int item_use_forward(int player, unsigned tag, char *reply, size_t replys
 // the "guest START -> player-1 START pulse" has always worked. One pulse per correction, 400 ms apart.
 #define MENU_PERIOD_MS 250
 #define MENU_PEER_STALE_MS 1500
+#define MENU_FRESH_MS 600       // TASK 37: a peer packet older than this is not acted on
+#define MENU_SETTLE_MS 600      // TASK 37: no correction for this long after a LOCAL state change/pulse
+#define MENU_STABLE_MS 500      // TASK 37: the divergence must persist this long in fresh packets
 #define MENU_PULSE_MS 160
 #define MENU_PULSE_GAP_MS 420
 
@@ -5265,6 +5434,16 @@ static DWORD g_menu_sent_at, g_menu_sent_ui0 = (DWORD)-1, g_menu_sent_ui1 = (DWO
 static LONG g_menu_sent_state = -1;
 static DWORD g_menu_pulse_at;
 static volatile LONG g_menu_pulses, g_menu_sent, g_menu_rcv;
+// TASK 37: a convergence pulse is only pressed on a STABLE, CONFIRMED divergence. The reviewer's run lost
+// the inventory close to the opposite: both copies left the inventory within 9 ms, each then read the
+// peer's previous packet (still "in the inventory") and pressed BACK (the open button) on its own pad,
+// which re-opened it on both. So: never act within MENU_SETTLE_MS of this copy's own change, never act on a
+// peer packet older than MENU_FRESH_MS, and only after the mismatch has survived MENU_STABLE_MS.
+static DWORD g_menu_local_changed_at;   // this copy's own last menu change (or pulse)
+static DWORD g_menu_div_since;          // when the current mismatch was first seen
+static LONG g_menu_div_pst = -1;        // ... and the peer state it was seen with
+static LONG g_menu_div_seq = -1;
+static volatile LONG g_menu_corrections, g_menu_gated;   // pulses issued for a confirmed divergence / corrections skipped as not yet stable
 // Menu changes are ordered by a sequence number, exactly like the scene sync's leave_seq (TASK 31): every
 // LOCAL change bumps g_menu_my_seq, and a copy only corrects a divergence for a state NEWER than the one it
 // has already applied. Without the order the two copies chase each other (measured: 2 -> 1 -> 2 ... every
@@ -5324,10 +5503,11 @@ static void menu_status(char *reply, size_t replysz)
 	int st, ui0, ui1;
 	menu_read(&st, &ui0, &ui1);
 	_snprintf(reply, replysz,
-	          "menu local st %d ui %d/%d seq %lu | peer st %ld ui %ld/%ld seq %ld age %lu ms | sent %ld rcv %ld pulses %ld",
+	          "menu local st %d ui %d/%d seq %lu | peer st %ld ui %ld/%ld seq %ld age %lu ms | sent %ld rcv %ld pulses %ld "
+	          "correct %ld gated %ld",
 	          st, ui0, ui1, (unsigned long)g_menu_my_seq, g_peer_menu_state, g_peer_menu_ui0, g_peer_menu_ui1,
 	          g_peer_menu_seq, (unsigned long)(g_peer_menu_at ? GetTickCount() - g_peer_menu_at : 0),
-	          g_menu_sent, g_menu_rcv, g_menu_pulses);
+	          g_menu_sent, g_menu_rcv, g_menu_pulses, g_menu_corrections, g_menu_gated);
 }
 
 // Network thread: the peer's menu state (a convergence signal, not the data the menu is drawn from).
@@ -5350,6 +5530,7 @@ static void menu_pulse(int user, unsigned buttons, int rt, char what)
 {
 	menu_pulse_start(user, buttons, rt, MENU_PULSE_MS);
 	g_menu_pulse_at = GetTickCount();
+	g_menu_local_changed_at = g_menu_pulse_at;   // TASK 37: do not correct again before the settle window is over
 	InterlockedIncrement(&g_menu_pulses);
 	logf("%s: sharing the menu: pulsing %c on player %d's pad (peer menu %ld, this copy %ld)", 
 	     g_role == 2 ? "guest" : "host", what, user + 1, g_peer_menu_state, g_menu_state);
@@ -5369,10 +5550,14 @@ static void menu_tick(void)
 	if (!g_peer_ok)
 		return;
 	DWORD now = GetTickCount();
-	int active = menu_world_menu(st) || ui0 >= 3 || ui1 >= 3;
+	// TASK 37: while EITHER copy is in a menu, both keep publishing (a menu session). That is what makes
+	// the freshness rule below possible: the copy that is back in normal play still says so every 250 ms.
+	int active = menu_world_menu(st) || ui0 >= 3 || ui1 >= 3 || menu_world_menu((int)g_peer_menu_state);
 	int changed = st != g_menu_sent_state || (DWORD)ui0 != g_menu_sent_ui0 || (DWORD)ui1 != g_menu_sent_ui1;
-	if (st != prev)   // a LOCAL change: it becomes the newest state of the pair (see g_menu_my_seq)
+	if (st != prev) {   // a LOCAL change: it becomes the newest state of the pair (see g_menu_my_seq)
 		g_menu_my_seq = (g_menu_my_seq > g_menu_seen_seq ? g_menu_my_seq : g_menu_seen_seq) + 1;
+		g_menu_local_changed_at = now;
+	}
 	if (changed || (active && now - g_menu_sent_at >= MENU_PERIOD_MS)) {
 		unsigned w = world_obj();
 		pkt_menu p;
@@ -5397,6 +5582,31 @@ static void menu_tick(void)
 		return;
 	int pst = (int)g_peer_menu_state;
 	int pseq = (int)g_peer_menu_seq;
+	// Is there a divergence at all, and which way? 1 = the peer is in a shared menu this copy is not in;
+	// 2 = this copy is in one the peer has left.
+	int diverge = menu_world_menu(pst) && st == 1 ? 1 : (pst == 1 && menu_world_menu(st) ? 2 : 0);
+	if (!diverge) {
+		g_menu_div_since = 0;
+		g_menu_div_pst = -1;
+		g_menu_div_seq = -1;
+		return;
+	}
+	// TASK 37: a correction is only pressed on a confirmed divergence (see the constants above).
+	if (now - g_menu_local_changed_at < MENU_SETTLE_MS)
+		return;   // this copy's own menu state just changed: the peer's packet about it may still be on the way
+	if (!g_peer_menu_at || now - g_peer_menu_at > MENU_FRESH_MS)
+		return;   // the peer's word is not fresh: it may already have moved on (this is the reviewer's flake)
+	if (g_menu_div_pst != pst || g_menu_div_seq != pseq) {
+		g_menu_div_pst = pst;
+		g_menu_div_seq = pseq;
+		g_menu_div_since = now;
+		InterlockedIncrement(&g_menu_gated);
+		return;   // a new divergence (or a new reason): start its stability clock and wait
+	}
+	if (!g_menu_div_since)
+		g_menu_div_since = now;
+	if (now - g_menu_div_since < MENU_STABLE_MS)
+		return;   // not confirmed yet
 	if (pseq > (int)g_menu_seen_seq) {
 		g_menu_seen_seq = (DWORD)pseq;   // the peer's newest change: this copy follows it
 	} else {
@@ -5411,20 +5621,21 @@ static void menu_tick(void)
 	DWORD lvl = w ? rd32(w + 4) : 0;
 	if ((DWORD)g_peer_menu_level != lvl)
 		return;   // the peer's menu state is from another level
-	if (menu_world_menu(pst) && st == 1) {
+	if (diverge == 1) {
 		// the peer opened a menu this copy did not see: press the same button here
+		InterlockedIncrement(&g_menu_corrections);
 		if (pst == 5)
 			menu_pulse(0, 0x0010, 0, 'S');    // START: the pause menu (probe: opens on both)
 		else
 			menu_pulse(0, 0x0020, 0, 'B');    // BACK: the inventory menu (probe: st 2 on both)
 		return;
 	}
-	if (pst == 1 && menu_world_menu(st)) {
-		// the peer left the menu and this copy is still in it: press the same button to leave
+	{   // the peer left the menu and this copy is still in it: press the same button to leave
+		InterlockedIncrement(&g_menu_corrections);
 		if (st == 5)
 			menu_pulse(0, 0x0010, 0, 'S');    // START leaves the pause menu (FUN_004b2770)
 		else
-			menu_pulse(0, 0x2000, 0, 'A');    // B leaves the inventory (measured: host B -> st 1 on both)
+			menu_pulse(0, 0x2000, 0, 'A');    // A leaves the inventory (B is 0x2000 on the pad; measured: st 1 on both)
 		return;
 	}
 	// The wheel (3) / item menu (4) are not repaired here: they are one player's own pad hold, already
@@ -5451,6 +5662,77 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_apt_cs);     // TASK 28 pipe `aptdone`
 	InitializeCriticalSection(&g_scene_cs);   // TASK 30 (rx thread / game thread / pipe thread)
 	InitializeCriticalSection(&g_door_cs);    // TASK 34 (rx thread / game thread)
+}
+
+// Guest, game thread (TASK 37): the host is the only authority for the level. When this copy has been in
+// a different level for LVL_HEAL_MS while both copies are idle, follow the host's level with the game's own
+// ChangeLevel (the late-join path: the party table for that level is applied by hk_party_table when it is
+// here, and the state stream corrects the characters). This is the guarantee that two transitions which
+// raced can never leave the copies apart for good.
+static void guest_level_heal(void)
+{
+	if (g_role != 2 || !g_peer_ok) {
+		g_lvl_mismatch_since = 0;
+		return;
+	}
+	DWORD now = GetTickCount();
+	LONG hl = g_host_lvl;
+	if (!hl || !g_host_lvl_at || now - g_host_lvl_at > LVL_HEAL_FRESH_MS || g_host_busy) {
+		g_lvl_mismatch_since = 0;   // no fresh word from the host, or it is mid-transition itself
+		return;
+	}
+	int queued;
+	EnterCriticalSection(&g_req_cs);
+	queued = g_req_head != g_req_tail;
+	LeaveCriticalSection(&g_req_cs);
+	unsigned g = game_obj(), w = world_obj();
+	if (queued || !g || !w || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0) {
+		g_lvl_mismatch_since = 0;   // a request is in flight or this copy is not in a live level
+		return;
+	}
+	unsigned mine = rd32(w + 4);
+	if (!mine || mine == (unsigned)hl) {
+		if (g_lvl_mismatch_since) {
+			char a[5], b[5];
+			logf("guest: level %s matches the host again (%s): no self-heal needed", tag4(mine, a), tag4((unsigned)hl, b));
+		}
+		g_lvl_mismatch_since = 0;
+		g_heal_tries = 0;
+		return;
+	}
+	if (door_animation_running() || scene_local_cinematic())
+		return;   // never rebuild the world under a door animation or a scripted event
+	if (!g_lvl_mismatch_since) {
+		char a[5], b[5];
+		g_lvl_mismatch_since = now;
+		logf("guest: level %s != host %s: waiting %d ms with both copies idle before following the host",
+		     tag4(mine, a), tag4((unsigned)hl, b), LVL_HEAL_MS);
+		return;
+	}
+	if (now - g_lvl_mismatch_since < LVL_HEAL_MS)
+		return;
+	if (g_heal_tries >= 3) {
+		if (g_heal_tries == 3) {
+			g_heal_tries = 4;
+			logf("guest: the self-heal did not take the world to the host's level 3 times: not trying again until the copies agree");
+		}
+		return;
+	}
+	char a[5], b[5];
+	logf("guest: SELF-HEAL: this copy is in %s, the host is in %s for %u ms with both copies idle: following the host",
+	     tag4(mine, a), tag4((unsigned)hl, b), (unsigned)(now - g_lvl_mismatch_since));
+	g_lvl_mismatch_since = 0;
+	g_heal_tries++;
+	// The host's newest transition is older than this heal by definition: never apply a repeat of it here.
+	if (g_host_seq > 0 && (DWORD)g_host_seq > g_trans_applied)
+		g_trans_applied = (DWORD)g_host_seq;
+	g_accept_at = now + 4500;   // the rebuilt world may ask "player 2 is joining" again
+	g_accept_until = g_accept_at + 150;
+	g_apply_host_req = 1;
+	if (g_change_level)
+		g_change_level((void *)(uintptr_t)g, NULL, (unsigned)hl, (unsigned)g_host_entry, 1);
+	g_apply_host_req = 0;
+	InterlockedIncrement(&g_heals);
 }
 
 static void frame_tick(void)
@@ -5545,6 +5827,8 @@ static void frame_tick(void)
 		guest_apply_requests();
 		hang_phase("in guest_apply_regions");
 		guest_apply_regions();
+		hang_phase("in guest_level_heal");
+		guest_level_heal();         // TASK 37: follow the host's level if the copies ended apart
 		hang_phase("in guest_apply_state (PKT_STATE)");
 		guest_apply_state();
 		hang_phase("in guest_send_char");
@@ -5605,6 +5889,13 @@ static void sync_status(char *reply, size_t replysz)
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | door sent %ld rcv %ld applied %ld missed %ld | ask sent %ld pend %ld",
 			g_door_sent, g_door_rcv, g_door_applied, g_door_missed, g_ask_sent, (long)g_ask_pending);
+	l = strlen(reply);
+	if (l < replysz) {
+		char hl[5];
+		_snprintf(reply + l, replysz - l, " | trans applied %lu queued %lu stale %ld heal %ld host level %s busy %ld",
+			(unsigned long)g_trans_applied, (unsigned long)g_trans_queued, g_trans_stale, g_heals,
+			g_host_lvl ? tag4((unsigned)g_host_lvl, hl) : "-", g_host_busy);
+	}
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | frames %ld", g_frames);

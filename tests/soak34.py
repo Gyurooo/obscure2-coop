@@ -102,6 +102,37 @@ def frames(pipe):
         return -1
 
 
+# TASK 37: the race phases read the game logs the runner's env names (OBSCOOP_HOST_DIR / OBSCOOP_GUEST_DIR).
+def log_path(role):
+    d = os.environ.get('OBSCOOP_%s_DIR' % role.upper())
+    return os.path.join(d, 'obscoop.log') if d else ''
+
+
+def log_size(role):
+    try:
+        return os.path.getsize(log_path(role))
+    except (OSError, TypeError):
+        return 0
+
+
+def wait_log(role, marker, since, timeout):
+    """True as soon as the log holds `marker` after byte offset `since`."""
+    p = log_path(role)
+    if not p or not os.path.exists(p):
+        return False
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            with open(p, 'rb') as f:
+                f.seek(since)
+                if marker.encode() in f.read():
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.1)
+    return False
+
+
 def threads_running(waited=2.0):
     """Both game threads must still run frames: sample, wait, sample again."""
     f0 = (frames(HP), frames(GP))
@@ -160,6 +191,67 @@ for i in range(iters):
             'one level' if same2 else 'not one level', el2, tag(level(H)), tag(level(G))))
         if not same2:
             ok_all = False
+
+# ---- TASK 37: deliberate race phases -------------------------------------------------------------
+# The soak failure this task fixes was a door's ChangeLevel and a save load 0.7 s apart: the host
+# announced both, its own game applied them in one order and the guest's in another, and the copies
+# stayed split. These two phases reproduce that on purpose and require ONE level afterwards (the
+# transition sequence + the guest's self-heal must end them together).
+print('\n== race A: door use on the host, then a save load the moment the door asks for its level')
+t_door = time.time()
+if not use_door(HP, 0, 'host'):
+    print('   race A: no door for the host in level %s: skipped' % tag(level(H)))
+else:
+    sz = log_size('host')
+    got = wait_log('host', 'request ChangeLevel', sz, 25)
+    print('   the door reached its ChangeLevel: %s' % ('yes' if got else 'NO'))
+    if not got:
+        ok_all = False
+    sv = SAVES[iters % len(SAVES)]
+    print('   issuing loadsave %s right now (%.1f s after the door use)' % (sv, time.time() - t_door))
+    HP.cmd('loadsave %s' % sv)
+    same, el = wait_same(35)
+    print('   race A result: level %s/%s after %.1fs -> %s' % (
+        tag(level(H)), tag(level(G)), el, 'one level' if same else 'NOT one level'))
+    if not same:
+        ok_all = False
+    if not threads_running(1.5):
+        ok_all = False
+
+print('\n== race B: the same door used on the host and on the guest at the same moment')
+use_door(HP, 0, 'host')
+use_door(GP, 1, 'guest')
+time.sleep(0.6)
+same, el = wait_same(35)
+print('   race B result: level %s/%s after %.1fs -> %s' % (
+    tag(level(H)), tag(level(G)), el, 'one level' if same else 'NOT one level'))
+if not same:
+    ok_all = False
+if not threads_running(1.5):
+    ok_all = False
+
+# The race phases leave a door animation / a level ask in flight; the checks that follow (run_soak runs
+# check_doors right after this script) need a settled pair: one level and no change for 3 s.
+print('\n== settling after the race phases (one level, no change for 3 s)')
+t0 = time.time()
+quiet_since, last = None, None
+while time.time() - t0 < 40:
+    ok = in_level(H) and in_level(G) and tag(level(H)) == tag(level(G))
+    lv = tag(level(H))
+    if ok and lv == last:
+        if quiet_since is None:
+            quiet_since = time.time()
+        if time.time() - quiet_since >= 3.0:
+            break
+    else:
+        quiet_since = None
+    last = lv
+    time.sleep(0.5)
+print('   settled: level %s/%s, quiet for %.1f s (%s)' % (
+    tag(level(H)), tag(level(G)), time.time() - (quiet_since if quiet_since else time.time()),
+    'yes' if quiet_since else 'NO'))
+if not quiet_since:
+    ok_all = False
 
 alive = True
 for name, pid in (('host', host_pid), ('guest', guest_pid)):

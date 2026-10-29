@@ -63,10 +63,20 @@ def in_level(m):
     return md == 1 and st == 0 and (level(m) or 0) != 0
 
 
+def normal(m):
+    """TASK 37: in a level AND in normal play. A scripted event (world+0x12c != 0, state 7) right after a
+    load stops the interaction scan, so `usedoor` answers "not in a level" while the world is rebuilding -
+    waiting for normal play instead of failing the phase."""
+    w = world(m)
+    if not (in_level(m) and w):
+        return False
+    return u32(m, w + 0x11c) == 1 and u32(m, w + 0x12c) == 0
+
+
 def wait_in_level(t=30.0):
     t0 = time.time()
     while time.time() - t0 < t:
-        if in_level(H) and in_level(G):
+        if in_level(H) and in_level(G) and normal(H) and normal(G):
             return True
         time.sleep(0.3)
     return False
@@ -145,8 +155,28 @@ def phase(by):
     d_peer = same_door(peer_copy, d)
     print('   the same door on the %s: %s' % ('guest' if by == 'host' else 'host', describe(peer_copy, d_peer)))
     before_peer = user_tag(peer_copy, d_peer)
-    reply = user_proc.cmd('usedoor %d' % pl)
-    print('   usedoor %d -> %s' % (pl, reply))
+    # TASK 37: `usedoor` answers "not in a level" while this copy's world is being rebuilt (a load or a
+    # level change in flight right after the reset). That is a timing condition, not a door failure: wait
+    # for both copies to be in one level again and retry (the world may be rebuilt, so re-pick the door).
+    reply = ''
+    for attempt in (1, 2, 3):
+        reply = user_proc.cmd('usedoor %d' % pl)
+        print('   usedoor %d -> %s' % (pl, reply))
+        if not reply.startswith('error usedoor: not in a level'):
+            break
+        if attempt == 3:
+            break
+        t1 = time.time()
+        while time.time() - t1 < 20:
+            if in_level(H) and in_level(G) and tag(level(H)) == tag(level(G)):
+                break
+            time.sleep(0.4)
+        print('   the %s world was being rebuilt: waited %.1f s for one level, retrying' % (by, time.time() - t1))
+        d = nearest(user_copy, pl)
+        if not d:
+            break
+        d_peer = same_door(peer_copy, d)
+        before_peer = user_tag(peer_copy, d_peer)
     if not reply.startswith('ok'):
         print('%s FAIL: the game did not run the use' % by.upper())
         return False

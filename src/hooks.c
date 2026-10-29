@@ -89,8 +89,9 @@ static req3_t g_change_level;
 static req1_t g_load_progress, g_load_name;
 static req0_t g_to_menu;
 static party_t g_party_table;
-static void host_level_request_repeat(unsigned level, unsigned entry, unsigned flag);   // sync.c
-static void host_load_request_repeat(const char *name);   // sync.c
+static void host_level_request_repeat(unsigned level, unsigned entry, unsigned flag, DWORD seq);   // sync.c
+static void host_load_request_repeat(const char *name, DWORD seq);   // sync.c
+static DWORD host_trans_next(void);                   // sync.c (TASK 37: the next transition sequence)
 static void guest_note_own_level(unsigned level, unsigned entry, unsigned flag);   // sync.c (TASK 34)
 static void test_hold_party(void);                    // sync.c
 static void host_send_progress(int force);            // sync.c
@@ -106,24 +107,38 @@ static DWORD g_ask_done_level, g_ask_done_at;
 
 // Host, game thread: perform the level change the guest's own game asked for (its door script calls
 // ChangeLevel every frame and the guest drops it), then tell the guest exactly like a local request does.
-static void host_apply_guest_level(unsigned level, unsigned entry, unsigned flag)
+// TASK 37: a transition is never applied on top of one that is still in flight. If this copy's game still
+// has a request pending (game+0x320 != 0: a door's own ChangeLevel, a load), the ask stays pending and is
+// retried on a later frame; the caller gives up after a few seconds.
+static int host_apply_guest_level(unsigned level, unsigned entry, unsigned flag)
 {
 	char t[5];
 	if (g_role != 1 || !g_peer_ok)
-		return;
+		return 0;
 	unsigned g = *(volatile unsigned *)0x6c3068;
-	if (!g || *(unsigned *)((BYTE *)g + 0x310) != 1) {
+	if (!g)
+		return 1;
+	if (*(unsigned *)((BYTE *)g + 0x320) != 0) {
+		static DWORD logged;
+		if (!logged || GetTickCount() - logged > 2000) {
+			logged = GetTickCount();
+			logf("host: the guest's ask for %s waits: this copy has a transition in flight (state %u)",
+			     tag4(level, t), *(unsigned *)((BYTE *)g + 0x320));
+		}
+		return 0;   // deferred: the caller keeps it pending
+	}
+	if (*(unsigned *)((BYTE *)g + 0x310) != 1) {
 		logf("host: the guest asked for ChangeLevel %s, but this copy is not in a level", tag4(level, t));
-		return;
+		return 1;
 	}
 	if (level == g_last_level) {
 		logf("host: the guest asked for ChangeLevel %s: already here", tag4(level, t));
-		return;
+		return 1;
 	}
 	DWORD now = GetTickCount();
 	if (g_ask_done_level == level && (LONG)(now - g_ask_done_at) < 2000) {
 		logf("host: the guest's ask for %s is the change just made here: ignored", tag4(level, t));
-		return;
+		return 1;
 	}
 	logf("host: the guest asked for ChangeLevel %s (0x%08x) entry %u flag %u: doing it here", tag4(level, t), level,
 		entry, flag);
@@ -135,11 +150,15 @@ static void host_apply_guest_level(unsigned level, unsigned entry, unsigned flag
 	g_last_level = level;
 	g_last_entry = entry;
 	g_last_flag = flag;
-	net_send_req(REQ_LEVEL, level, entry, flag, NULL);
+	{
+		DWORD seq = host_trans_next();
+		net_send_req(REQ_LEVEL, level, entry, flag, NULL, seq);
+		host_level_request_repeat(level, entry, flag, seq);
+	}
 	InterlockedIncrement(&g_req_sent);
-	host_level_request_repeat(level, entry, flag);
 	g_accept_at = GetTickCount() + 4500;   // the rebuilt world asks "player 2 is joining" again
 	g_accept_until = g_accept_at + 150;
+	return 1;
 }
 
 static void __fastcall hk_change_level(void *game, void *edx, unsigned level, unsigned entry, unsigned flag)
@@ -166,6 +185,10 @@ static void __fastcall hk_change_level(void *game, void *edx, unsigned level, un
 	// allowlist (obscoop_levels.txt next to the DLL). A replayed transition is not a new observation.
 	if (g_role != 2 && !g_level_replay && getenv("OBSCOOP_LEVELS_LOG"))
 		level_record_real(level, entry, flag);
+	// TASK 37: the game asked for a transition while one of this copy's own requests is in flight (the
+	// door script retries, or a load is being processed): the game decides, but the guest is only told
+	// the newest transition, with a new sequence number.
+	unsigned busy = *(unsigned *)((BYTE *)game + 0x320);
 	g_change_level(game, edx, level, entry, flag);
 	g_last_level = level; g_last_entry = entry; g_last_flag = flag;
 	if (g_role == 1 && g_peer_ok) {   // after a load the game asks "player 2 is joining"; accept it once
@@ -173,9 +196,13 @@ static void __fastcall hk_change_level(void *game, void *edx, unsigned level, un
 		logf("join dialog: auto-accept pulse in 4.5 s");
 	}
 	if (g_role == 1 && !g_apply_host_req && g_peer_ok) {
-		net_send_req(REQ_LEVEL, level, entry, flag, NULL);
+		DWORD seq = host_trans_next();
+		net_send_req(REQ_LEVEL, level, entry, flag, NULL, seq);
+		host_level_request_repeat(level, entry, flag, seq);   // PKT_REQ is not reliable: repeat it for a moment
 		InterlockedIncrement(&g_req_sent);
-		host_level_request_repeat(level, entry, flag);   // PKT_REQ is not reliable: repeat it for a moment
+		if (busy)
+			logf("host: announced ChangeLevel %s (seq %lu) while state %u was in flight: the newest wins",
+			     tag4(level, t), (unsigned long)seq, busy);
 	}
 }
 
@@ -195,7 +222,7 @@ static void __fastcall hk_load_progress(void *game, void *edx, unsigned arg)
 		logf("join dialog: auto-accept pulse in 4.5 s");
 	}
 	if (g_role == 1 && !g_apply_host_req && g_peer_ok) {
-		net_send_req(REQ_LOAD_PROGRESS, arg, 0, 0, NULL);
+		net_send_req(REQ_LOAD_PROGRESS, arg, 0, 0, NULL, host_trans_next());
 		InterlockedIncrement(&g_req_sent);
 	}
 }
@@ -208,9 +235,10 @@ static void __fastcall hk_load_name(void *game, void *edx, unsigned name)
 		host_save_include((const char *)name);
 	g_load_name(game, edx, name);
 	if (g_role == 1 && !g_apply_host_req && g_peer_ok && name) {
-		net_send_req(REQ_LOAD_NAME, 0, 0, 0, (const char *)name);
+		DWORD seq = host_trans_next();
+		net_send_req(REQ_LOAD_NAME, 0, 0, 0, (const char *)name, seq);
 		InterlockedIncrement(&g_req_sent);
-		host_load_request_repeat((const char *)name);   // PKT_REQ has no ack: repeat it for a moment
+		host_load_request_repeat((const char *)name, seq);   // PKT_REQ has no ack: repeat it for a moment
 	}
 }
 
@@ -222,7 +250,7 @@ static void __fastcall hk_to_menu(void *game, void *edx)
 		host_save_forget();
 	g_to_menu(game, edx);
 	if (g_role == 1 && !g_apply_host_req && g_peer_ok) {
-		net_send_req(REQ_TO_MENU, 0, 0, 0, NULL);
+		net_send_req(REQ_TO_MENU, 0, 0, 0, NULL, 0);   // not a level transition: no sequence number
 		InterlockedIncrement(&g_req_sent);
 	}
 }

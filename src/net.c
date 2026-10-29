@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 19   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 20   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -46,6 +46,10 @@
                         //     2 = inventory; each controller's UI state +0xa4: 3 = weapon wheel, 4 = item
                         //     menu). Both pads drive the open menu on both copies (merged input) and a
                         //     divergence is repaired by pulsing the same button on the right pad.
+                        // 20: TASK 37, ordered transitions: pkt_req carries the host's transition sequence
+                        //     (the guest applies only the newest, an older one is dropped/cancelled);
+                        //     pkt_state carries the host's authoritative level/entry and whether it is in a
+                        //     transition, so the guest can re-converge on the host's level (self-heal).
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,
@@ -59,7 +63,7 @@ typedef struct { pkt_hdr h; DWORD t_ms; DWORD host_ms; } pkt_ping;   // pong: ho
 typedef struct { DWORD tag; float pos[3]; float dir[3]; DWORD s220, s278; DWORD life; DWORD anim; DWORD wep[4]; DWORD wcur; } ch_state;   // anim = character+0x2dc (death/animation state)   // life = character+0x320   // wep = the tags in the 4 live weapon slots (character+0x704 + i*4 -> weapon+0x10), wcur = character+0x714
 #define MAX_CH 8
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; DWORD n; xstate hpad; float yaw; DWORD yaw_valid;
-                 float energy; DWORD energy_valid; ch_state ch[MAX_CH]; } pkt_state;
+                 float energy; DWORD energy_valid; DWORD host_level, host_entry, host_busy, host_seq; ch_state ch[MAX_CH]; } pkt_state;
 // TASK 25: the guest's hello repeats what it already has, so a reconnect is a resume and not a fresh join:
 // level = the world tag it is in (0 = none), in_level = 1 when its game is in a level, need_saves = 1
 // when this process has not received a save file from the host yet.
@@ -67,7 +71,7 @@ typedef struct { pkt_hdr h; DWORD level; DWORD in_level; DWORD need_saves; } pkt
 // TASK 25: the character this copy owns (guest: player 2, host: player 1), streamed so the other copy
 // follows the owner instead of re-simulating it from a delayed pad in another camera frame.
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; ch_state me; } pkt_char;
-typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; } pkt_req;
+typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; DWORD seq; } pkt_req;
 // life = character+0x320 (float bits), state = character+0x2dc (the NPC's AI/animation/death state; the
 // same field the humans stream as `anim`). TASK 21: the host owns enemy life and death, the guest applies
 // the difference through the game's own life method (see guest_apply_npcs).
@@ -336,13 +340,13 @@ static void steam_session_request(sid_t from)
 }
 
 // Sends a request to the guest (host only); the guest executes it in step with the host.
-static void net_send_req(DWORD kind, unsigned a, unsigned b, unsigned c, const char *name)
+static void net_send_req(DWORD kind, unsigned a, unsigned b, unsigned c, const char *name, DWORD seq)
 {
 	if (g_role != 1 || !g_peer_ok)
 		return;
 	pkt_req r;
 	memset(&r, 0, sizeof r);
-	r.kind = kind; r.a = a; r.b = b; r.c = c;
+	r.kind = kind; r.a = a; r.b = b; r.c = c; r.seq = seq;
 	if (name)
 		_snprintf(r.name, sizeof r.name - 1, "%s", name);
 	net_send(PKT_REQ, &r, sizeof r - sizeof(pkt_hdr));
