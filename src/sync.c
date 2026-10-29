@@ -165,17 +165,60 @@ static int teammate_unlink(unsigned ch)
 // there, and take it off again as soon as the copy is back in normal play (where the door fix needs it
 // gone). Called from hk_game_update around the game's own update, which is where the world update runs.
 //
-// "Normal play" is deliberately narrow: state 1 with no scripted event/pending world state. A pending
-// REQUEST (game+0x320, e.g. the ChangeLevel a door use just started) is NOT part of it - the door use is
-// still running in the same world, and restoring the teammate there would let the game's sweep stop the
-// door it is using (the TASK 35 bug). Only the states where the world is not playable (menu, load,
-// scripted event) put the character back.
+// "Normal play" is deliberately narrow: in a level (mode 1) and in world state 1. Nothing else counts.
+//
+// TASK 39: a pending world REQUEST (world+0x12c) is NOT part of it. That field is the game's own request
+// queue, OBSERVED in the world update FUN_004b4cb0: 1/2/3/4/9 = a state change, 5 = a menu, 6 = a
+// change-level by tag, 7 = a scripted event, 8 = a screenshot, 0xa = a save, 0xb = ..., 0xc = the
+// ChangeLevel request (FUN_004b2a20 writes level/entry/flag there, 0x13c/0x138/0x130), 0xd, 0x10, 0x11.
+// The world is still the SAME playable world while such a request is queued - the door use that just
+// started its ChangeLevel is the prime example - and the game's "stop the other character" sweep
+// (FUN_0042ad70) can still run in it. TASK 38 counted the request as "not playable" and put the teammate
+// character back for those frames; that re-enabled exactly the TASK 35 door freeze (the sweep picks the
+// teammate, sees the door it is using, stops it). The states that really need a character there are the
+// ones the game's own code reads it in: a menu (2/5), a scripted event (7) and a transition (9/0xc/...).
 static int world_normal_play(unsigned g)
 {
 	unsigned w = g ? rd32(g + 0x378) : 0;
-	if (!g || !w || IsBadReadPtr((const void *)(uintptr_t)(w + 0x12c), 4))
+	if (!g || !w || IsBadReadPtr((const void *)(uintptr_t)(w + 0x11c), 4))
 		return 0;
-	return rd32(g + 0x310) == 1 && rd32(w + 0x11c) == 1 && rd32(w + 0x12c) == 0;
+	return rd32(g + 0x310) == 1 && rd32(w + 0x11c) == 1;
+}
+
+// TASK 39: the character the guard is about to put back must still belong to the CURRENT world. A world
+// object is freed and rebuilt by every level change and the heap can hand the new world the same address
+// (the only test TASK 38 had was `w == g_teammate_world`), so without this a stale character pointer from
+// the previous level could be written into the new world's teammate controller - a dead pointer that the
+// game's sweep and its scripted-event skip would then call through.
+static int world_has_human(unsigned h)
+{
+	unsigned hs[MAX_CH];
+	int n = world_humans(hs, MAX_CH);
+	for (int i = 0; i < n; i++)
+		if (hs[i] == h)
+			return 1;
+	return 0;
+}
+
+// TASK 39 (diagnostic): every write the guard family makes, with the three fields that decide it. Only
+// with OBSCOOP_DEBUG_TEAMMATE=1: the soak logs are 20 KB per run and a line per write would swamp them.
+static int teammate_debug(void)
+{
+	static int dbg = -1;
+	if (dbg < 0) {
+		char v[8];
+		dbg = GetEnvironmentVariableA("OBSCOOP_DEBUG_TEAMMATE", v, sizeof v) ? 1 : 0;
+	}
+	return dbg;
+}
+
+static void teammate_note(const char *what, unsigned g, unsigned cur, unsigned put)
+{
+	if (!teammate_debug())
+		return;
+	unsigned w = g ? rd32(g + 0x378) : 0;
+	logf("%s: teammate %x -> %x (mode %u state %u req %u world %x/%x)", what, cur, put,
+	     g ? rd32(g + 0x310) : 0, w ? rd32(w + 0x11c) : 0, w ? rd32(w + 0x12c) : 0, w, g_teammate_world);
 }
 
 static void teammate_game_guard(unsigned g, int before_update)
@@ -195,11 +238,13 @@ static void teammate_game_guard(unsigned g, int before_update)
 	}
 	unsigned cur = rd32(p);
 	if (before_update) {
-		if (!world_normal_play(g) && cur == 0) {
+		if (!world_normal_play(g) && cur == 0 && world_has_human(g_teammate_h)) {
+			teammate_note("guard: restore before the update", g, cur, g_teammate_h);
 			*(DWORD *)(uintptr_t)p = g_teammate_h;
 			InterlockedIncrement(&g_teammate_restores);
 		}
 	} else if (world_normal_play(g) && cur == g_teammate_h) {
+		teammate_note("guard: unlink after the update", g, cur, 0);
 		*(DWORD *)(uintptr_t)p = 0;   // normal play again: the game's teammate sweep must not see it
 	}
 }
@@ -221,7 +266,8 @@ static void teammate_want(unsigned ch)
 		g_teammate_h = ch;
 		g_teammate_world = w;
 	}
-	if (cur == 0) {
+	if (cur == 0 && world_has_human(ch)) {
+		teammate_note("attach_player2: restore", game_obj(), cur, ch);
 		*(DWORD *)(uintptr_t)p = ch;
 		InterlockedIncrement(&g_teammate_restores);
 	}
@@ -1038,6 +1084,7 @@ static void prop_align_drop(unsigned ent, DWORD dcls, DWORD did, const float *dp
 static prop_slot g_props[PROP_MAX];
 static int g_prop_n;
 static DWORD g_prop_level;                 // the level the table was built in
+static unsigned g_prop_world;              // ... and the world object it was scanned from (TASK 39)
 // The level the previous scan belongs to: the first scan of a level records its already-broken props
 // without announcing them (they are the level's state, not a break this copy performed).
 static DWORD g_prev_level;
@@ -1084,6 +1131,7 @@ static void prop_scan(unsigned w, DWORD level)
 	memcpy(old, g_props, sizeof(prop_slot) * (size_t)g_prop_n);
 	g_prop_n = 0;
 	g_prop_level = level;
+	g_prop_world = w;
 	if (mgr)
 		for (int h = 0; h < 2; h++) {
 			unsigned head = rd32(mgr + (h == 0 ? 8 : 0x18));
@@ -1743,7 +1791,12 @@ static void prop_tick(void)
 		return;
 	DWORD level = rd32(w + 4);
 	DWORD now = GetTickCount();
-	if (level != g_prop_level) {
+	// TASK 39: the table is keyed on the WORLD, not only on the level tag. A save load of the level this
+	// copy is already in (the soak loads game3.sav while it is in J002) rebuilds the world under an
+	// unchanged level tag, and every entity pointer in the table then points into freed memory: the guest
+	// died in prop_tick that way (run_s39_soak3.log: the drop's mesh slot 33 called on a torn-down world,
+	// Obscure2.exe+0x184fc7, read at 0). door_ensure keys on g_door_world for the same reason.
+	if (w != g_prop_world || level != g_prop_level) {
 		prop_scan(w, level);
 		prop_pending_flush();   // TASK 35: no entity pointer survives the rebuild
 	}
@@ -4390,8 +4443,10 @@ static void door_apply(const pkt_door *p)
 	// the door half entered. And the teammate controller must not point at this character: the use runs
 	// FUN_0042ad70, which would stop the door it is using (see teammate_unlink).
 	teammate_unlink(h);
+	hang_phase("in the peer door replay: the game's gate (vtable+0x34)");
 	int ok_use = (int)((int(__fastcall *)(void *, void *, unsigned, void *))f34)((void *)(uintptr_t)e, NULL, 1,
 		(void *)(uintptr_t)h);
+	hang_phase("in the peer door replay: the game's use (vtable+0x70)");
 	if (!ok_use) {
 		InterlockedIncrement(&g_door_missed);
 		char c[5], t[5];
@@ -4552,6 +4607,11 @@ static char g_dooru_msg[200];
 // and a door whose use runs but does not take the user (its +0x120 lock branch) is left for the next door.
 static unsigned g_dooru_doors[DOORU_MAX_DOORS];
 static int g_dooru_ndoors, g_dooru_di, g_dooru_spot;
+static DWORD g_dooru_req_at;   // TASK 39: when the pipe queued this request (a rebuild is waited out)
+// TASK 39: how many times this request had to re-pick because the world was rebuilt under it (bounded, so
+// a world that keeps rebuilding ends in the 15 s pipe answer instead of a loop).
+#define DOORU_MAX_STALE 8
+static int g_dooru_stale;
 
 // The places a use is attempted from, as (depth along the door's own normal, sideways offset). The game's
 // check (FUN_0042a480) wants the character within 80 units of the door's anchor (+0x10c) and its forward
@@ -4594,7 +4654,18 @@ static int door_use_run(unsigned h, door_slot *best, float bd)
 {
 	DWORD base = virt_exe_base(), size = virt_exe_size();
 	unsigned e = best->ent;
-	DWORD vt = (e && !IsBadReadPtr((void *)(uintptr_t)e, 0x150)) ? rd32(e) : 0;
+	// TASK 39: the same identity check door_apply makes. The slot comes from a scan that can be up to a
+	// level change old, and a freed entity's memory is reusable by the heap (TASK 35 §3.2 measured a vtable
+	// slot holding heap data and the game thread executing 0x44754000): the entity must still be that
+	// exact object - class vtable, class tag, id - before its two use entries are called through.
+	if (!e || IsBadReadPtr((void *)(uintptr_t)e, 0x150) || rd32(e) != best->cls || rd32(e + 0x10) != best->tag ||
+	    (best->id && rd32(e + 4) != best->id)) {
+		// TASK 39: the slot was rebuilt under the 400 ms settle (a level change landed between the pick and
+		// the use). That is not a failed use: the caller picks again from the CURRENT table.
+		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: door %x is gone from this world", e);
+		return 3;
+	}
+	DWORD vt = rd32(e);
 	DWORD f34 = (vt && !IsBadReadPtr((void *)(uintptr_t)vt, 0x74)) ? rd32(vt + 0x34) : 0;
 	DWORD f70 = f34 ? rd32(vt + 0x70) : 0;
 	char c[5];
@@ -4613,8 +4684,16 @@ static int door_use_run(unsigned h, door_slot *best, float bd)
 	// 128210-128245). The first argument is the interaction type (1 = the front pass). The check's answer is
 	// the scan's gate: 0 = not usable from here (TASK 35), and the use must not run then.
 	teammate_unlink(h);
+	// TASK 39: name the two game calls in the watchdog's `last mod step`, so a stall report says WHICH of
+	// them the game thread never came back from (the TASK 38 report only said "in door_tick (guest)").
+	if (teammate_debug()) {
+		unsigned mt = world_obj() ? rd32(world_obj() + 0x174c) : 0;
+		teammate_note("door use: the game's gate (vtable+0x34) runs with the teammate", game_obj(), mt ? rd32(mt + 4) : 0, h);
+	}
+	hang_phase("in the game's door gate (vtable+0x34)");
 	int ok_use = (int)((int(__fastcall *)(void *, void *, unsigned, void *))f34)((void *)(uintptr_t)e, NULL, 1,
 		(void *)(uintptr_t)h);
+	hang_phase("in the game's door use (vtable+0x70)");
 	if (!ok_use) {
 		// The gate has four inputs; log all of them, so a refusal is never a guess.
 		float cd[3] = { 0, 0, 0 }, fw[3] = { 0, 0, 0 };
@@ -4706,7 +4785,14 @@ static void door_use_frame(void)
 	if (g_dooru_state != DOORU_QUEUED && g_dooru_state != DOORU_PLACED)
 		return;
 	unsigned w = world_obj();
-	if (!w || !rd32(w + 4)) {
+	// TASK 39: the world is being rebuilt (a level change this copy is following: no world, or no level
+	// tag yet) or a load/ChangeLevel is in flight (game+0x320 = 2/3/4). Every entity picked now would die
+	// under the 400 ms settle, and the whole door table would be stale - so WAIT for the rebuild to finish
+	// instead of answering "not in a level" (the soak's guest phase hit this every time right after the
+	// host's own door changed the level). The pipe's 15 s answer still bounds the wait.
+	if (!w || !rd32(w + 4) || rd32(game_obj() + 0x320) != 0) {
+		if (g_dooru_req_at && GetTickCount() - g_dooru_req_at < DOORU_WAIT_MS - 3000)
+			return;
 		g_dooru_state = DOORU_DONE;
 		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: not in a level");
 		return;
@@ -4751,6 +4837,22 @@ static void door_use_frame(void)
 		if (v == 1) {
 			g_dooru_state = DOORU_DONE;
 			g_dooru_ent = 0;
+			return;
+		}
+		if (v == 3) {   // TASK 39: the world was rebuilt under the settle: pick the doors again
+			if (++g_dooru_stale > DOORU_MAX_STALE) {
+				g_dooru_state = DOORU_DONE;
+				return;
+			}
+			// The world object can come back at the SAME address (the heap reuses the block) under the SAME
+			// level tag, so the table's key (world + level) cannot see that rebuild: scan again, or every
+			// re-pick returns the same dead entity.
+			door_scan(w, rd32(w + 4));
+			g_dooru_ndoors = 0;
+			g_dooru_ent = 0;
+			g_dooru_di = 0;
+			g_dooru_spot = 0;
+			g_dooru_state = DOORU_QUEUED;
 			return;
 		}
 		if (v == 2)
@@ -4848,6 +4950,8 @@ static int door_use_request(int player, char *reply, size_t replysz)
 	g_dooru_di = 0;
 	g_dooru_spot = 0;
 	g_dooru_face[0] = g_dooru_face[1] = g_dooru_face[2] = 0.0f;
+	g_dooru_stale = 0;
+	g_dooru_req_at = GetTickCount();
 	g_dooru_state = DOORU_QUEUED;
 	DWORD t0 = GetTickCount();
 	while (g_dooru_state != DOORU_DONE) {

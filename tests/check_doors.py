@@ -141,23 +141,27 @@ def describe(m, d):
         user_tag(m, d), tag(d['dest']) if d['dest'] else '-')
 
 
+def scan_door(m, pl, secs=12.0):
+    """Wait for the door scan (TASK 38/39: right after a load the world's entity manager can still be
+    filling, so the list can be empty for a moment; the guest's J002 phase in soak run 2 saw an empty
+    door list 1.3 s after the reset load). Returns (door, seconds waited)."""
+    t0 = time.time()
+    d = None
+    while time.time() - t0 < secs:
+        d = nearest(m, pl)
+        if d:
+            break
+        time.sleep(0.3)
+    return d, time.time() - t0
+
+
 def phase(by):
     pl = 0 if by == 'host' else 1
     user_copy, peer_copy = (H, G) if by == 'host' else (G, H)
     user_proc, peer_proc = (HP, GP) if by == 'host' else (GP, HP)
     lvl0 = tag(level(H))
-    # TASK 38: right after a load the world's entity manager can still be filling (the guest's J002
-    # phase in soak run 2 saw an empty door list 1.3 s after the reset load). Wait for the scan, do not
-    # fail the phase on it.
-    d = None
-    t0 = time.time()
-    while time.time() - t0 < 12.0:
-        d = nearest(user_copy, pl)
-        if d:
-            break
-        time.sleep(0.3)
-    print('== phase %s -> level %s: %s (door scan after %.1f s)' % (by, lvl0, describe(user_copy, d),
-                                                                   time.time() - t0))
+    d, waited = scan_door(user_copy, pl)
+    print('== phase %s -> level %s: %s (door scan after %.1f s)' % (by, lvl0, describe(user_copy, d), waited))
     if not d:
         print('%s FAIL: no door in this level' % by.upper())
         return False
@@ -172,18 +176,31 @@ def phase(by):
     for attempt in (1, 2, 3):
         reply = user_proc.cmd('usedoor %d' % pl)
         print('   usedoor %d -> %s' % (pl, reply))
-        if not reply.startswith('error usedoor: not in a level'):
+        # the party is rebuilt a few frames after the level: "has no character" is the same timing case
+        if not (reply.startswith('error usedoor: not in a level') or 'has no character' in reply):
             break
         if attempt == 3:
             break
+        # TASK 39: one level is not enough - a load of the level this copy is already in keeps the level
+        # tag while the world is rebuilt under it (the mod's `usedoor` then re-picks and can run out of
+        # re-picks). Wait for NORMAL play on both copies: mode 1, no load/level request pending, world
+        # state 1 (the same predicate check_doors' own `normal()` uses).
         t1 = time.time()
         while time.time() - t1 < 20:
-            if in_level(H) and in_level(G) and tag(level(H)) == tag(level(G)):
+            if in_level(H) and in_level(G) and normal(H) and normal(G) and tag(level(H)) == tag(level(G)):
                 break
             time.sleep(0.4)
         print('   the %s world was being rebuilt: waited %.1f s for one level, retrying' % (by, time.time() - t1))
-        d = nearest(user_copy, pl)
+        # TASK 39: that wait can carry a level change with it (a door the pair used a moment ago is still
+        # asking for its own level): the phase then runs in a DIFFERENT level from the one it started in,
+        # and the door has to be picked there (measured: the guest's use ran in J001 while the phase had
+        # picked its door in J002, and the phase compared the door's J000 destination with J001/J001).
+        lvl0 = tag(level(H))
+        # the rebuilt world may not have its doors a frame later either - wait for the scan (same 12 s
+        # rule as above) instead of failing the phase on one empty sample.
+        d, _ = scan_door(user_copy, pl)
         if not d:
+            print('   %s FAIL: no door in this level after the rebuild' % by.upper())
             break
         d_peer = same_door(peer_copy, d)
         before_peer = user_tag(peer_copy, d_peer)
