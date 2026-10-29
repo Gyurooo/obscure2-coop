@@ -28,6 +28,20 @@ static int code_in_exe(DWORD f)
 	return g_exe_base && f >= g_exe_base && f < g_exe_base + g_exe_size;
 }
 
+// TASK 40: a class vtable is a static address in the game's image. `code_in_exe` answers "may I jump
+// here", which is not the same question: after a world rebuild a freed object's first dword can be a
+// heap pointer (the guest's prop mesh read 0x169eb798) whose slot 33 happened to hold an exe address,
+// and the call ran an unrelated game function with the dead object as `this` (the crash of
+// claude_verify_39_soak2.log). Before dereferencing a vtable, require the vtable ITSELF in the image.
+static int image_ptr(DWORD p)
+{
+	if (!g_exe_base) {
+		g_exe_base = virt_exe_base();
+		g_exe_size = virt_exe_size();
+	}
+	return g_exe_base && p >= g_exe_base && p < g_exe_base + g_exe_size;
+}
+
 static int mem_ok(const void *p, size_t n)
 {
 	return p && !IsBadReadPtr(p, n);
@@ -76,6 +90,166 @@ static unsigned player_human(int player)
 	unsigned ctl = w ? rd32(w + 0x1748) : 0;
 	return ctl ? rd32(ctl + 4 + 0x764 * player) : 0;
 }
+
+// ---- TASK 40: the world generation every entity table is keyed on ---------------------------------
+// The game rebuilds its world object on every level change AND on every save load, and it fills the
+// new world over several frames. The guest log of claude_verify_39_soak2.log shows it: while the copy
+// loaded game3.sav INTO J002 (an unchanged level tag) the prop table grew 11 -> 19 entities in one
+// 150 ms scan, and the world was "up" only 41 ms later. The world POINTER cannot tell two worlds
+// apart either - the heap hands the same address back for the rebuilt world (the same-address rebuild
+// TASK 39 §3.8 found for doors). So every table is keyed on a GENERATION:
+//   * it changes when this copy leaves normal play (menu, load, level request, no world),
+//   * when the world object or its level tag changes,
+//   * and when the set of live level entities changes at all (a build adds/removes entities).
+// A table is only built when the same entity set has been seen for WORLD_SETTLE_MS, and only used
+// inside the generation it was built in.
+#define WORLD_SETTLE_MS 150
+static DWORD g_world_gen = 1;     // the live generation (never 0: 0 means "no table may be used")
+static unsigned g_world_w;        // the world object last seen
+static DWORD g_world_level;       // ... its level tag
+static DWORD g_world_sig;         // signature of the entity manager's lists
+static DWORD g_world_sig_at;      // when that signature was first seen
+static int g_world_stable;        // 1 = the same signature for WORLD_SETTLE_MS
+static int g_world_changes;       // signature changes seen in this world (the safety valve below)
+
+// A cheap signature of the level's entity set: both lists of the manager (mgr+8 = the level's own
+// entities, mgr+0x18 = the objects the world build adds), hashed by entity pointer + count.
+static DWORD world_entity_sig(unsigned w)
+{
+	unsigned mgr = rd32(w + 0x1768);
+	if (!mgr)
+		return 0;
+	DWORD h = 0;   // order-independent: only the SET of entities matters, not their list order
+	unsigned n = 0;
+	for (int l = 0; l < 2; l++) {
+		unsigned node = rd32(mgr + (l ? 0x18 : 8));
+		unsigned seen[2] = { 0, 0 };
+		int nseen = 0;
+		for (unsigned guard = 0; node && guard < 4000; guard++) {
+			int dup = 0;
+			for (int s = 0; s < nseen; s++)
+				if (seen[s] == node)
+					dup = 1;
+			if (dup)
+				break;
+			if (nseen < 2)
+				seen[nseen++] = node;
+			unsigned e = rd32(node);
+			h ^= e ? e : 0x9e3779b9u;
+			h = (h << 5) | (h >> 27);   // rotate, still order-independent per element
+			n++;
+			unsigned nx = rd32(node + 4);
+			if (nx == node)
+				break;
+			node = nx;
+		}
+	}
+	return (h ^ (n * 2654435761u)) | 1;   // never 0
+}
+
+// 1 = the entity is one of THIS world's live level entities (either list of the manager). TASK 40:
+// the strongest identity a cached pointer can have - a block the game freed is removed from the lists
+// before it is freed, and its old fields can still look valid.
+static int world_has_entity(unsigned ent)
+{
+	unsigned w = world_obj();
+	unsigned mgr = w ? rd32(w + 0x1768) : 0;
+	if (!mgr || !ent)
+		return 0;
+	for (int l = 0; l < 2; l++) {
+		unsigned node = rd32(mgr + (l ? 0x18 : 8));
+		unsigned seen[2] = { 0, 0 };
+		int nseen = 0;
+		for (unsigned guard = 0; node && guard < 4000; guard++) {
+			int dup = 0;
+			for (int s = 0; s < nseen; s++)
+				if (seen[s] == node)
+					dup = 1;
+			if (dup)
+				break;
+			if (nseen < 2)
+				seen[nseen++] = node;
+			if (rd32(node) == ent)
+				return 1;
+			unsigned nx = rd32(node + 4);
+			if (nx == node)
+				break;
+			node = nx;
+		}
+	}
+	return 0;
+}
+
+// mode 1 + world state 1 + no pending request, in a level: the state a table may be built in.
+static int world_playable(unsigned *wo, unsigned *go)
+{
+	unsigned g = game_obj();
+	unsigned w = g ? rd32(g + 0x378) : 0;
+	if (!g || !w || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0 || !rd32(w + 4))
+		return 0;
+	if (wo)
+		*wo = w;
+	if (go)
+		*go = g;
+	return 1;
+}
+
+// 1 = the entity tables may be built and called through (a playable, settled world).
+static int world_ready(void)
+{
+	return g_world_gen && g_world_stable;
+}
+
+// Called once per frame before every table tick (frame_tick).
+static void world_gen_tick(void)
+{
+	unsigned w = 0, g = 0;
+	DWORD now = GetTickCount();
+	if (!world_playable(&w, &g)) {
+		if (g_world_stable || g_world_w) {
+			g_world_gen++;
+			g_world_stable = 0;
+			g_world_w = 0;
+			g_world_level = 0;
+			g_world_sig = 0;
+			g_world_sig_at = 0;
+		}
+		return;
+	}
+	DWORD level = rd32(w + 4);
+	DWORD sig = world_entity_sig(w);
+	if (w != g_world_w || level != g_world_level || sig != g_world_sig) {
+		// a new world, or the set of entities in this one changed (a build in progress): every table
+		// built before this moment belongs to an older generation and may not be called through
+		if (w != g_world_w || level != g_world_level)
+			g_world_changes = 0;
+		else
+			g_world_changes++;
+		g_world_gen++;
+		g_world_w = w;
+		g_world_level = level;
+		g_world_sig = sig;
+		g_world_sig_at = now;
+		g_world_stable = 0;
+		// Safety valve: a level whose entity set keeps changing (a script that spawns or frees a
+		// prop every few frames) must not leave the tables unusable for ever. After a second of
+		// changes in an unchanged world this copy accepts the set it sees now.
+		if (g_world_changes > 60) {
+			g_world_stable = 1;
+			g_world_changes = 0;
+			logf("%s: the entity set of world %x keeps changing: using it as it is",
+				g_role == 2 ? "guest" : "host", w);
+		}
+		return;
+	}
+	if (!g_world_stable && now - g_world_sig_at >= WORLD_SETTLE_MS) {
+		g_world_stable = 1;
+		char lv[5];
+		logf("%s: world %x in level %s is settled: the entity tables are rebuilt from it",
+			g_role == 2 ? "guest" : "host", w, tag4(level, lv));
+	}
+}
+
 
 static float g_stat_sum, g_stat_max;   // guest: how far the host's characters were from this copy at each snapshot
 static LONG g_stat_n;
@@ -989,6 +1163,8 @@ static void peer_apply_pickups(void)
 		}
 		if (!g || !w || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0)
 			return;   // menu or loading: keep the pickup queued
+		if (!world_ready())
+			return;   // TASK 40: the level's entities are still being built/rebuilt
 		if (rd32(w + 4) != p.level)
 			return;   // another level: keep it queued (a level change may be in progress)
 		EnterCriticalSection(&g_pick_cs);
@@ -1011,8 +1187,8 @@ static void peer_apply_pickups(void)
 		}
 		unsigned ch = human_with_tag(p.ch_tag);
 		void **vt = *(void ***)(uintptr_t)ent;
-		if (!ch || !vt || IsBadReadPtr(vt, 27 * sizeof(void *)) || !code_in_exe((DWORD)(uintptr_t)vt[26]) ||
-		    !mem_ok((const void *)(uintptr_t)ent, 0xac)) {
+		if (!ch || !vt || !image_ptr((DWORD)(uintptr_t)vt) || IsBadReadPtr(vt, 27 * sizeof(void *)) ||
+		    !code_in_exe((DWORD)(uintptr_t)vt[26]) || !mem_ok((const void *)(uintptr_t)ent, 0xac)) {
 			InterlockedIncrement(&g_pickup_missing);
 			logf("%s: item pickup class %s id %s: no character or item vtable",
 				g_role == 2 ? "guest" : "host", tag4(p.cls, c), tag4(p.id, i));
@@ -1076,7 +1252,7 @@ static int prop_item_tag(unsigned t)
 	return 0;
 }
 
-typedef struct { unsigned ent; DWORD cls, id, broken; unsigned carrier, drop; } prop_slot;
+typedef struct { unsigned ent; DWORD cls, id, broken, vt; unsigned carrier, drop; } prop_slot;
 static void prop_defer_break(unsigned ent, DWORD dcls, DWORD did, const float *dpos, int host_word);
 static void prop_apply_break(unsigned ent, DWORD dcls, DWORD did, const float *dpos, int host_word);
 static void prop_align_drop(unsigned ent, DWORD dcls, DWORD did, const float *dpos, int host_word);
@@ -1085,6 +1261,7 @@ static prop_slot g_props[PROP_MAX];
 static int g_prop_n;
 static DWORD g_prop_level;                 // the level the table was built in
 static unsigned g_prop_world;              // ... and the world object it was scanned from (TASK 39)
+static DWORD g_prop_gen;                   // ... and the world generation it belongs to (TASK 40)
 // The level the previous scan belongs to: the first scan of a level records its already-broken props
 // without announcing them (they are the level's state, not a break this copy performed).
 static DWORD g_prev_level;
@@ -1093,9 +1270,16 @@ static unsigned char g_prop_listed[PROP_MAX];   // 1 = the manager's lists hold 
 
 // A prop pointer is only used when the object is still alive and still the class it was: an entity that
 // was rebuilt (level change) or freed must never be called through.
-static int prop_alive(unsigned e, DWORD cls)
+// TASK 40: the class vtable at ent+0 is checked too. A freed block the heap has reused holds another
+// object (or heap data) there; the tag at +0x10 alone survived long enough in the crash of
+// claude_verify_39_soak2.log for the mod to call the prop's "mesh" pointer.
+static int prop_alive(unsigned e, DWORD cls, DWORD vt)
 {
-	return e && e > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)e, 0x120) && rd32(e + 0x10) == cls;
+	if (!e || e <= 0x10000 || IsBadReadPtr((void *)(uintptr_t)e, 0x120) || rd32(e + 0x10) != cls)
+		return 0;
+	if (vt && rd32(e) != vt)
+		return 0;
+	return 1;
 }
 
 // The live fields of the prop in slot `i` (the same offsets the packet names: class +0x10, id +4,
@@ -1105,6 +1289,7 @@ static void prop_refresh(int i)
 	unsigned e = g_props[i].ent;
 	g_props[i].cls = rd32(e + 0x10);
 	g_props[i].id = rd32(e + 4);
+	g_props[i].vt = rd32(e);   // TASK 40: the class vtable is the identity a reused block cannot fake
 	g_props[i].broken = rd32(e + 0xa4);
 	g_props[i].carrier = rd32(e + 0xc4);
 	g_props[i].drop = rd32(e + 0x118);
@@ -1126,12 +1311,15 @@ static void prop_scan(unsigned w, DWORD level)
 {
 	unsigned mgr = rd32(w + 0x1768);
 	int was_n = g_prop_n;
-	DWORD old_level = g_prop_level;
+	// TASK 40: the old entries may only be carried over inside the SAME world generation. After a
+	// rebuild they name entities of the world the game just freed.
+	int same_world = (g_prop_gen == g_world_gen && g_prop_world == w);
 	prop_slot old[PROP_MAX];
 	memcpy(old, g_props, sizeof(prop_slot) * (size_t)g_prop_n);
 	g_prop_n = 0;
 	g_prop_level = level;
 	g_prop_world = w;
+	g_prop_gen = g_world_gen;
 	if (mgr)
 		for (int h = 0; h < 2; h++) {
 			unsigned head = rd32(mgr + (h == 0 ? 8 : 0x18));
@@ -1163,13 +1351,13 @@ static void prop_scan(unsigned w, DWORD level)
 				node = nx;
 			}
 		}
-	if (level == old_level)   // same level: keep the props the lists left out (carried, re-parented)
+	if (same_world)   // same level + same world: keep the props the lists left out (carried, re-parented)
 		for (int i = 0; i < was_n && g_prop_n < PROP_MAX; i++) {
 			int have = 0;
 			for (int k = 0; k < g_prop_n; k++)
 				if (g_props[k].ent == old[i].ent)
 					have = 1;
-			if (have || !prop_alive(old[i].ent, old[i].cls))
+			if (have || !prop_alive(old[i].ent, old[i].cls, old[i].vt))
 				continue;
 			int n = g_prop_n++;
 			g_props[n].ent = old[i].ent;
@@ -1177,19 +1365,22 @@ static void prop_scan(unsigned w, DWORD level)
 			prop_refresh(n);
 		}
 	// A prop whose broken flag the game cleared again (the 20 s respawn of FUN_00413c00) is worth a line:
-	// the copies must end up the same way here too.
-	for (int i = 0; i < g_prop_n; i++) {
-		for (int j = 0; j < was_n; j++)
-			if (old[j].ent == g_props[i].ent) {
-				if (old[j].broken && !g_props[i].broken) {
-					char c[5], i4[5];
-					logf("%s: prop went back to whole: %s id %s ent %x (the game respawned it)",
-						g_role == 2 ? "guest" : "host", tag4(g_props[i].cls, c), tag4(g_props[i].id, i4),
-						g_props[i].ent);
+	// the copies must end up the same way here too. TASK 40: only inside the same world - after a
+	// rebuild the heap can hand the same address to a different prop ("went back to whole" in the
+	// guest log of claude_verify_39_soak2.log was exactly that false positive).
+	if (same_world)
+		for (int i = 0; i < g_prop_n; i++) {
+			for (int j = 0; j < was_n; j++)
+				if (old[j].ent == g_props[i].ent) {
+					if (old[j].broken && !g_props[i].broken) {
+						char c[5], i4[5];
+						logf("%s: prop went back to whole: %s id %s ent %x (the game respawned it)",
+							g_role == 2 ? "guest" : "host", tag4(g_props[i].cls, c), tag4(g_props[i].id, i4),
+							g_props[i].ent);
+					}
+					break;
 				}
-				break;
-			}
-	}
+		}
 	if (g_prop_n != was_n || level != g_prev_level) {
 		char lv[5];
 		logf("%s: prop table: %d breakable/carryable entit%s in level %s", g_role == 2 ? "guest" : "host",
@@ -1206,7 +1397,7 @@ static unsigned prop_find(DWORD cls, DWORD id, const float *pp)
 	float bd = 400.0f * 400.0f;   // a prop further away than this is not the one the packet means
 	for (int i = 0; i < g_prop_n; i++) {
 		prop_slot *p = &g_props[i];
-		if (p->cls != cls || (id && p->id != id) || !prop_alive(p->ent, cls))
+		if (p->cls != cls || (id && p->id != id) || !prop_alive(p->ent, cls, p->vt))
 			continue;
 		float dx = g_prop_pos[i][0] - pp[0], dy = g_prop_pos[i][1] - pp[1], dz = g_prop_pos[i][2] - pp[2];
 		float d = dx * dx + dy * dy + dz * dz;
@@ -1222,9 +1413,23 @@ static unsigned prop_held_chair(unsigned ch, DWORD cls)
 	if (!ch || IsBadReadPtr((void *)(uintptr_t)(ch + 0x2bc), 4))
 		return 0;
 	unsigned cur = rd32(ch + 0x2bc);
-	if (!prop_alive(cur, cls) || cur == ch)
+	if (!prop_alive(cur, cls, 0) || cur == ch)
 		return 0;
 	return cur;
+}
+
+// 1 when a character of this world holds the prop in its hand (TASK 27: a carried prop leaves the
+// manager's lists, so world_has_entity cannot see it).
+static int prop_held_anywhere(unsigned ent)
+{
+	if (!ent)
+		return 0;
+	unsigned hs[MAX_CH];
+	int n = world_humans(hs, MAX_CH);
+	for (int i = 0; i < n; i++)
+		if (rd32(hs[i] + 0x2bc) == ent)
+			return 1;
+	return 0;
 }
 
 // The item entity at +0x118 (the one the break enabled) or, when it is 0, none.
@@ -1258,7 +1463,8 @@ static unsigned prop_candidate(unsigned ent, DWORD cls, DWORD id)
 static void prop_item_enable(unsigned item, const float *pp)
 {
 	void **vt = *(void ***)(uintptr_t)item;
-	if (!vt || IsBadReadPtr(vt, 35 * sizeof(void *)) || !mem_ok((const void *)(uintptr_t)(item + 0xa8), 4))
+	if (!vt || !image_ptr((DWORD)(uintptr_t)vt) || IsBadReadPtr(vt, 35 * sizeof(void *)) ||
+	    !mem_ok((const void *)(uintptr_t)(item + 0xa8), 4))
 		return;
 	if (!code_in_exe((DWORD)(uintptr_t)vt[34]) || !code_in_exe((DWORD)(uintptr_t)vt[32]) ||
 	    !code_in_exe((DWORD)(uintptr_t)vt[33]))
@@ -1272,7 +1478,8 @@ static void prop_item_enable(unsigned item, const float *pp)
 static void prop_item_hide(unsigned item)
 {
 	void **vt = *(void ***)(uintptr_t)item;
-	if (vt && !IsBadReadPtr(vt, 34 * sizeof(void *)) && code_in_exe((DWORD)(uintptr_t)vt[33]))
+	if (vt && image_ptr((DWORD)(uintptr_t)vt) && !IsBadReadPtr(vt, 34 * sizeof(void *)) &&
+	    code_in_exe((DWORD)(uintptr_t)vt[33]))
 		((void(__fastcall *)(void *, void *, int))vt[33])((void *)(uintptr_t)item, NULL, 0);
 }
 
@@ -1346,13 +1553,18 @@ static int prop_break_state(unsigned ent)
 	unsigned mesh = rd32(ent + 0x34);
 	if (mesh && !IsBadReadPtr((void *)(uintptr_t)mesh, 8)) {
 		void **mvt = *(void ***)(uintptr_t)mesh;
-		if (mvt && !IsBadReadPtr(mvt, 34 * sizeof(void *)) && code_in_exe((DWORD)(uintptr_t)mvt[33]))
+		// TASK 40: the vtable itself must be an image address. In claude_verify_39_soak2.log the mesh
+		// of a prop that the rebuilt world had replaced held a heap pointer here, its slot 33 a code
+		// address by chance, and the call ran an unrelated game function on the dead object.
+		if (mvt && image_ptr((DWORD)(uintptr_t)mvt) && !IsBadReadPtr(mvt, 34 * sizeof(void *)) &&
+		    code_in_exe((DWORD)(uintptr_t)mvt[33]))
 			((void(__fastcall *)(void *, void *, int))mvt[33])((void *)(uintptr_t)mesh, NULL, 0);
 	}
 	unsigned col = rd32(ent + 0x68);
 	if (col && !IsBadReadPtr((void *)(uintptr_t)col, 8)) {
 		void **cvt = *(void ***)(uintptr_t)col;
-		if (cvt && !IsBadReadPtr(cvt, 18 * sizeof(void *)) && code_in_exe((DWORD)(uintptr_t)cvt[17]))
+		if (cvt && image_ptr((DWORD)(uintptr_t)cvt) && !IsBadReadPtr(cvt, 18 * sizeof(void *)) &&
+		    code_in_exe((DWORD)(uintptr_t)cvt[17]))
 			((void(__fastcall *)(void *, void *, int))cvt[17])((void *)(uintptr_t)col, NULL, 0);
 	}
 	*(DWORD *)(uintptr_t)(ent + 0x24) = 0;
@@ -1363,6 +1575,14 @@ static int prop_break_state(unsigned ent)
 
 static void prop_apply_break(unsigned ent, DWORD dcls, DWORD did, const float *dpos, int host_word)
 {
+	// TASK 40: never touch an entity that is not one of this world's live entities (or in a hand)
+	if (!ent || IsBadReadPtr((void *)(uintptr_t)ent, 0x120) ||
+	    (!world_has_entity(ent) && !prop_held_anywhere(ent))) {
+		InterlockedIncrement(&g_prop_missing);
+		logf("%s: prop break (deferred): ent %x is not in this world any more: not applied",
+			g_role == 2 ? "guest" : "host", ent);
+		return;
+	}
 	// A prop the other copy broke and this one also broke (the normal case) is already flagged: nothing to
 	// do, and no log line - the host repeats its state once a second.
 	if (!rd32(ent + 0xa4)) {
@@ -1410,13 +1630,14 @@ static void prop_apply_carry(unsigned ch, unsigned ent)
 		if (rd32(cur + 0xa4))
 			return;   // a broken chair stays where the break left it
 		void **vt = *(void ***)(uintptr_t)cur;
-		if (vt && !IsBadReadPtr(vt, 30 * sizeof(void *)) && vt[28] == (void *)(uintptr_t)PROP_ATTACH_CHAIR &&
-		    code_in_exe((DWORD)(uintptr_t)vt[29]))
+		if (vt && image_ptr((DWORD)(uintptr_t)vt) && !IsBadReadPtr(vt, 30 * sizeof(void *)) &&
+		    vt[28] == (void *)(uintptr_t)PROP_ATTACH_CHAIR && code_in_exe((DWORD)(uintptr_t)vt[29]))
 			((void(__fastcall *)(void *, void *))vt[29])((void *)(uintptr_t)cur, NULL);   // detach
 	}
 	if (ent) {
 		void **vt = *(void ***)(uintptr_t)ent;
-		if (vt && !IsBadReadPtr(vt, 29 * sizeof(void *)) && vt[28] == (void *)(uintptr_t)PROP_ATTACH_CHAIR)
+		if (vt && image_ptr((DWORD)(uintptr_t)vt) && !IsBadReadPtr(vt, 29 * sizeof(void *)) &&
+		    vt[28] == (void *)(uintptr_t)PROP_ATTACH_CHAIR)
 			((void(__fastcall *)(void *, void *, void *))vt[28])((void *)(uintptr_t)ent, NULL, (void *)(uintptr_t)ch);
 	}
 	char c[5], i[5];
@@ -1568,12 +1789,14 @@ static void peer_apply_props(void)
 		}
 		if (!g || !w || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0)
 			return;   // menu or loading: keep it queued
+		if (!world_ready() || g_prop_gen != g_world_gen)
+			return;   // TASK 40: the world is being built/rebuilt: keep it queued, never apply on a half table
 		if (rd32(w + 4) != p.level)
 			return;   // another level: keep it queued
 		EnterCriticalSection(&g_prop_cs);
 		g_prop_head = (g_prop_head + 1) & 7;
 		LeaveCriticalSection(&g_prop_cs);
-		if (rd32(w + 4) != g_prop_level)
+		if (g_prop_gen != g_world_gen || rd32(w + 4) != g_prop_level)
 			prop_scan(w, rd32(w + 4));   // a level change since the last scan
 		if (!prop_apply_packet(&p))
 			prop_retry_add(&p);
@@ -1634,6 +1857,8 @@ static void guest_apply_prop_state(void)
 {
 	if (g_role != 2 || !g_rx_props_new)
 		return;
+	if (!world_ready() || g_prop_gen != g_world_gen)
+		return;   // TASK 40: keep the newest packet until the world is settled and the table is ours
 	pkt_props p;
 	EnterCriticalSection(&g_prop_cs);
 	memcpy(&p, &g_rx_props, sizeof p);
@@ -1653,7 +1878,7 @@ static void guest_apply_prop_state(void)
 
 // A break announcement that is not applied at once (see peer_apply_props): after the delay the prop is
 // broken only if this copy's own game still has it whole.
-typedef struct { unsigned ent; DWORD at, dcls, did, cls, id; float dpos[3]; int host_word; } prop_pending;
+typedef struct { unsigned ent; DWORD at, dcls, did, cls, id, vt; float dpos[3]; int host_word; } prop_pending;
 static prop_pending g_pend[8];
 static int g_pend_n;
 
@@ -1676,6 +1901,7 @@ static void prop_defer_break(unsigned ent, DWORD dcls, DWORD did, const float *d
 	// in between frees it. Remember what it was, so the apply below cannot run on a reused heap block.
 	p->cls = (ent && !IsBadReadPtr((void *)(uintptr_t)ent, 0x20)) ? rd32(ent + 0x10) : 0;
 	p->id = p->cls ? rd32(ent + 4) : 0;
+	p->vt = p->cls ? rd32(ent) : 0;   // TASK 40: and the class vtable (a reused block has another)
 }
 
 // A level change frees every entity the pending list names (TASK 35).
@@ -1694,7 +1920,7 @@ static void prop_tick_pending(void)
 		}
 		prop_pending p = g_pend[i];
 		g_pend[i] = g_pend[--g_pend_n];
-		if (!p.ent || !p.cls || !prop_alive(p.ent, p.cls) || (p.id && rd32(p.ent + 4) != p.id)) {
+		if (!p.ent || !p.cls || !prop_alive(p.ent, p.cls, p.vt) || (p.id && rd32(p.ent + 4) != p.id)) {
 			logf("%s: prop break: the entity is gone (the world was rebuilt): not applied", g_role == 2 ? "guest" : "host");
 			continue;
 		}
@@ -1729,7 +1955,8 @@ static unsigned prop_held_by(unsigned ch)
 	if (!cur || IsBadReadPtr((void *)(uintptr_t)cur, 0xcc))
 		return 0;
 	void **vt = *(void ***)(uintptr_t)cur;
-	if (!vt || IsBadReadPtr(vt, 29 * sizeof(void *)) || vt[28] != (void *)(uintptr_t)PROP_ATTACH_CHAIR)
+	if (!vt || !image_ptr((DWORD)(uintptr_t)vt) || IsBadReadPtr(vt, 29 * sizeof(void *)) ||
+	    vt[28] != (void *)(uintptr_t)PROP_ATTACH_CHAIR)
 		return 0;
 	if (rd32(cur + 0xa4))
 		return 0;   // a broken chair stays linked (the game keeps it in hand): it is not "carried"
@@ -1789,14 +2016,22 @@ static void prop_tick(void)
 	unsigned g = game_obj();
 	if (!w || !g || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0)
 		return;
+	// TASK 40: nothing of this table is used while the world is not settled. The game builds a new
+	// world over several frames (the guest log of claude_verify_39_soak2.log: the table grew 11 -> 19
+	// entities while game3.sav loaded into J002); a table built in that window names entities the game
+	// replaces a frame later. The peer's announcements stay in their queue meanwhile.
+	if (!world_ready()) {
+		g_prop_n = 0;
+		prop_pending_flush();
+		return;
+	}
 	DWORD level = rd32(w + 4);
 	DWORD now = GetTickCount();
-	// TASK 39: the table is keyed on the WORLD, not only on the level tag. A save load of the level this
-	// copy is already in (the soak loads game3.sav while it is in J002) rebuilds the world under an
-	// unchanged level tag, and every entity pointer in the table then points into freed memory: the guest
-	// died in prop_tick that way (run_s39_soak3.log: the drop's mesh slot 33 called on a torn-down world,
-	// Obscure2.exe+0x184fc7, read at 0). door_ensure keys on g_door_world for the same reason.
-	if (w != g_prop_world || level != g_prop_level) {
+	// TASK 39/40: the table is keyed on the WORLD and its GENERATION, not on the level tag. A save load
+	// of the level this copy is already in (the soak loads game3.sav while it is in J002) rebuilds the
+	// world under an unchanged level tag, and every entity pointer in the table then points into freed
+	// memory: the guest died in prop_tick that way (run_s39_soak3.log, Obscure2.exe+0x184fc7).
+	if (g_prop_gen != g_world_gen || w != g_prop_world || level != g_prop_level) {
 		prop_scan(w, level);
 		prop_pending_flush();   // TASK 35: no entity pointer survives the rebuild
 	}
@@ -1925,10 +2160,12 @@ static void props_dump(char *reply, size_t replysz)
 #define APT_MAX 12
 static const unsigned APT_OFF[APT_FIELDS] = { 0x20, 0x24, 0xa8, 0x120, 0x124, 0x128, 0x184, 0x1ec, 0x1f0, 0x150 };
 
-typedef struct { unsigned ent; DWORD cls, id; DWORD v[APT_FIELDS]; float pos[3]; } apt_slot;
+typedef struct { unsigned ent; DWORD cls, id, vt; DWORD v[APT_FIELDS]; float pos[3]; } apt_slot;
 static apt_slot g_apts[APT_MAX];
 static int g_apt_n;
 static DWORD g_apt_level, g_apt_scan_at;
+static unsigned g_apt_world;
+static DWORD g_apt_gen;   // TASK 40: the world generation the table belongs to
 static volatile LONG g_apt_sent, g_apt_rcv, g_apt_applied, g_apt_actions;
 
 static int apt_class(DWORD t)
@@ -1947,6 +2184,7 @@ static void apt_read(apt_slot *a)
 {
 	for (int i = 0; i < APT_FIELDS; i++)
 		a->v[i] = rd32(a->ent + APT_OFF[i]);
+	a->vt = rd32(a->ent);   // TASK 40: the class vtable is part of the identity (cf. prop_refresh)
 	if (mem_ok((const void *)(uintptr_t)(a->ent + 0x6c), 12))
 		memcpy(a->pos, (const void *)(uintptr_t)(a->ent + 0x6c), sizeof a->pos);
 }
@@ -1962,10 +2200,14 @@ static void apt_scan(unsigned w, DWORD level)
 {
 	int was_n = g_apt_n;
 	DWORD old_level = g_apt_level;
+	// TASK 40: compare against the previous table only inside the same world generation
+	int same_world = (g_apt_gen == g_world_gen && g_apt_world == w && level == old_level);
 	apt_slot old[APT_MAX];
 	memcpy(old, g_apts, sizeof(apt_slot) * (size_t)g_apt_n);
 	g_apt_n = 0;
 	g_apt_level = level;
+	g_apt_world = w;
+	g_apt_gen = g_world_gen;
 	unsigned mgr = rd32(w + 0x1768);
 	unsigned node = mgr ? rd32(mgr + 8) : 0;
 	unsigned seen[600];
@@ -2026,7 +2268,7 @@ static void apt_scan(unsigned w, DWORD level)
 	if (g_apt_n != was_n || level != old_level)
 		logf("%s: ability objects: %d watched entit%s in level %x", g_role == 2 ? "guest" : "host",
 		     g_apt_n, g_apt_n == 1 ? "y" : "ies", level);
-	if (level == old_level)   // same level: compare and announce what changed on this copy
+	if (same_world)   // same level + world: compare and announce what changed on this copy
 		for (int i = 0; i < g_apt_n; i++) {
 			apt_slot *a = &g_apts[i];
 			for (int j = 0; j < was_n; j++) {
@@ -2065,7 +2307,7 @@ static void apt_scan(unsigned w, DWORD level)
 // A result this copy applied from the peer must not be announced back.
 static void apt_apply_packet(const pkt_apt *p)
 {
-	unsigned best = 0;
+	int best = -1;
 	float bd = 400.0f * 400.0f;
 	for (int i = 0; i < g_apt_n; i++) {
 		apt_slot *a = &g_apts[i];
@@ -2073,9 +2315,14 @@ static void apt_apply_packet(const pkt_apt *p)
 			continue;
 		float dx = a->pos[0] - p->before[0], dy = a->pos[1] - p->before[1], dz = a->pos[2] - p->before[2];
 		float d = dx * dx + dy * dy + dz * dz;
-		if (d < bd) { bd = d; best = a->ent; }
+		if (d < bd) { bd = d; best = i; }
 	}
-	if (!best || IsBadWritePtr((void *)(uintptr_t)best, 0x200)) {
+	unsigned ent = best >= 0 ? g_apts[best].ent : 0;
+	// TASK 40: the slot's entity is re-checked against the identity the scan recorded (class vtable,
+	// class tag, id) right before the writes - the table can be a world rebuild old.
+	if (best < 0 || !ent || rd32(ent) != g_apts[best].vt || rd32(ent + 0x10) != g_apts[best].cls ||
+	    (p->id && g_apts[best].id && rd32(ent + 4) != g_apts[best].id) || !world_has_entity(ent) ||
+	    IsBadWritePtr((void *)(uintptr_t)ent, 0x200)) {
 		InterlockedIncrement(&g_apt_rcv);
 		return;
 	}
@@ -2084,22 +2331,22 @@ static void apt_apply_packet(const pkt_apt *p)
 		unsigned off = APT_OFF[f];
 		if (p->old[f] == p->now[f])
 			continue;
-		if (rd32(best + off) == p->old[f]) {
-			*(DWORD *)(uintptr_t)(best + off) = p->now[f];
+		if (rd32(ent + off) == p->old[f]) {
+			*(DWORD *)(uintptr_t)(ent + off) = p->now[f];
 			wrote++;
 		}
 	}
 	float np[3];
-	memcpy(np, (const void *)(uintptr_t)(best + 0x6c), sizeof np);
+	memcpy(np, (const void *)(uintptr_t)(ent + 0x6c), sizeof np);
 	if (adist(np, p->before) <= 5.0f && adist(np, p->pos) > 0.1f) {
-		memcpy((void *)(uintptr_t)(best + 0x6c), p->pos, sizeof p->pos);
+		memcpy((void *)(uintptr_t)(ent + 0x6c), p->pos, sizeof p->pos);
 		wrote++;
 	}
-	prop_mark_applied(best);
+	prop_mark_applied(ent);
 	InterlockedIncrement(&g_apt_applied);
 	char c[5];
 	logf("%s: ability result applied: %s id %s ent %x (%d writes)", g_role == 2 ? "guest" : "host",
-	     tag4(p->cls, c), tag4(p->id, c), best, wrote);
+	     tag4(p->cls, c), tag4(p->id, c), ent, wrote);
 }
 
 static CRITICAL_SECTION g_aptq_cs;
@@ -2126,6 +2373,11 @@ static void apt_tick(void)
 	unsigned w = world_obj(), g = game_obj();
 	if (!w || !g || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0)
 		return;
+	// TASK 40: same rule as the prop table - no scan and no game call while the world is being built
+	if (!world_ready()) {
+		g_apt_n = 0;
+		return;
+	}
 	DWORD level = rd32(w + 4);
 	// apply what the peer announced (on the game thread)
 	for (;;) {
@@ -2803,7 +3055,7 @@ static void weapons_for(int k, unsigned h, const ch_state *c)
 	if (c->wcur < 4 && rd32(h + 0x714) != c->wcur) {
 		unsigned wp = rd32(h + 0x704 + 4 * c->wcur);
 		unsigned vt = wp ? rd32(wp) : 0, show = vt ? rd32(vt + 0xcc) : 0;
-		if (wp && show && !IsBadReadPtr((const void *)(uintptr_t)show, 1) && code_in_exe(show)) {
+		if (wp && vt && image_ptr(vt) && show && !IsBadReadPtr((const void *)(uintptr_t)show, 1) && code_in_exe(show)) {
 			*(DWORD *)(uintptr_t)(h + 0x714) = c->wcur;
 			if (g_wep_seen_cur[k] != c->wcur) {
 				g_wep_seen_cur[k] = c->wcur;
@@ -3161,7 +3413,7 @@ static void guest_apply_npcs(void)
 				float dlt = hl - *gl;
 				if (dlt > 0.01f || dlt < -0.01f) {
 					void **vt = *(void ***)(uintptr_t)hs[best];
-					if (vt && vt[9] && !IsBadCodePtr((FARPROC)vt[9])) {
+					if (vt && image_ptr((DWORD)(uintptr_t)vt) && vt[9] && !IsBadCodePtr((FARPROC)vt[9])) {
 						((void(__thiscall *)(void *, float))vt[9])((void *)(uintptr_t)hs[best], hl - *gl);
 						InterlockedIncrement(&g_npc_life);
 						if (hl <= 0.0f)
@@ -4216,6 +4468,7 @@ static door_slot g_doors[DOOR_MAX];
 static int g_door_n;
 static DWORD g_door_level, g_door_scan_at, g_door_scanned;
 static unsigned g_door_world;
+static DWORD g_door_gen;                 // TASK 40: the world generation the table belongs to
 static unsigned g_door_prev;             // the last +0x2bc seen on this copy's own character
 static unsigned g_door_echo_ent;         // a door use this copy applied from the peer: do not echo it
 static DWORD g_door_echo_until;
@@ -4250,6 +4503,7 @@ static void door_scan(unsigned w, DWORD level)
 	g_door_n = 0;
 	g_door_level = level;
 	g_door_world = w;
+	g_door_gen = g_world_gen;
 	g_door_scan_at = GetTickCount();
 	g_door_scanned = level;
 	g_door_prev = 0;
@@ -4291,7 +4545,15 @@ static void door_ensure(void)
 	DWORD lvl = rd32(w + 4);
 	if (!lvl)
 		return;
-	if (w != g_door_world || lvl != g_door_level || (!g_door_n && g_door_scanned != lvl))
+	// TASK 40: a door table built while the game fills a new world names entities that are replaced a
+	// frame later. No table at all until the world has settled; it is rebuilt from then on.
+	if (!world_ready()) {
+		g_door_n = 0;
+		g_door_gen = 0;
+		return;
+	}
+	if (g_door_gen != g_world_gen || w != g_door_world || lvl != g_door_level ||
+	    (!g_door_n && g_door_scanned != lvl))
 		door_scan(w, lvl);
 }
 
@@ -4301,7 +4563,7 @@ static void door_watch(void)
 	if (!g_peer_ok || g_role == 0)
 		return;
 	unsigned w = world_obj();
-	if (!w || !rd32(w + 4) || rd32(w + 4) != g_door_level || w != g_door_world)
+	if (!w || !rd32(w + 4) || rd32(w + 4) != g_door_level || w != g_door_world || g_door_gen != g_world_gen)
 		return;   // door_ensure (door_tick) rebuilds the table first
 	unsigned h = player_human(g_role == 2 ? 1 : 0);
 	if (!h || IsBadReadPtr((const void *)(uintptr_t)(h + 0x2bc), 4))
@@ -4370,7 +4632,7 @@ static void door_apply(const pkt_door *p)
 	unsigned w = world_obj();
 	if (!w || !g_peer_ok || rd32(w + 4) != p->level)
 		return;   // not in that level (yet): nothing here to replay it on
-	if (w != g_door_world || rd32(w + 4) != g_door_level)
+	if (w != g_door_world || rd32(w + 4) != g_door_level || g_door_gen != g_world_gen)
 		door_scan(w, rd32(w + 4));
 	door_slot *best = 0;
 	float bd = 200.0f;
@@ -4393,12 +4655,12 @@ static void door_apply(const pkt_door *p)
 	// a level change or freed by the game is never called through.
 	unsigned e = best->ent;
 	if (!e || IsBadReadPtr((void *)(uintptr_t)e, 0x150) || rd32(e + 0x10) != best->tag || rd32(e) != best->cls ||
-	    rd32(e + 4) != best->id) {
+	    rd32(e + 4) != best->id || !world_has_entity(e)) {
 		InterlockedIncrement(&g_door_missed);
 		return;
 	}
 	DWORD vt = rd32(e);
-	if (!vt || IsBadReadPtr((void *)(uintptr_t)vt, 0x74))
+	if (!vt || !image_ptr(vt) || IsBadReadPtr((void *)(uintptr_t)vt, 0x74))
 		return;
 	DWORD f34 = rd32(vt + 0x34), f70 = rd32(vt + 0x70);
 	if (f34 < base || f34 >= base + size || f70 < base || f70 >= base + size) {
@@ -4469,6 +4731,9 @@ static void door_apply(const pkt_door *p)
 static void door_apply_tick(void)
 {
 	pkt_door p;
+	// TASK 40: the peer's use stays queued while this copy's world is being built or rebuilt
+	if (!world_ready())
+		return;
 	for (;;) {
 		EnterCriticalSection(&g_door_cs);
 		if (g_door_qh == g_door_qt) {
@@ -4659,14 +4924,14 @@ static int door_use_run(unsigned h, door_slot *best, float bd)
 	// slot holding heap data and the game thread executing 0x44754000): the entity must still be that
 	// exact object - class vtable, class tag, id - before its two use entries are called through.
 	if (!e || IsBadReadPtr((void *)(uintptr_t)e, 0x150) || rd32(e) != best->cls || rd32(e + 0x10) != best->tag ||
-	    (best->id && rd32(e + 4) != best->id)) {
+	    (best->id && rd32(e + 4) != best->id) || !world_has_entity(e)) {
 		// TASK 39: the slot was rebuilt under the 400 ms settle (a level change landed between the pick and
 		// the use). That is not a failed use: the caller picks again from the CURRENT table.
 		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: door %x is gone from this world", e);
 		return 3;
 	}
 	DWORD vt = rd32(e);
-	DWORD f34 = (vt && !IsBadReadPtr((void *)(uintptr_t)vt, 0x74)) ? rd32(vt + 0x34) : 0;
+	DWORD f34 = (vt && image_ptr(vt) && !IsBadReadPtr((void *)(uintptr_t)vt, 0x74)) ? rd32(vt + 0x34) : 0;
 	DWORD f70 = f34 ? rd32(vt + 0x70) : 0;
 	char c[5];
 	if (!f34 || f34 < base || f34 >= base + size || f70 < base || f70 >= base + size) {
@@ -4790,14 +5055,14 @@ static void door_use_frame(void)
 	// under the 400 ms settle, and the whole door table would be stale - so WAIT for the rebuild to finish
 	// instead of answering "not in a level" (the soak's guest phase hit this every time right after the
 	// host's own door changed the level). The pipe's 15 s answer still bounds the wait.
-	if (!w || !rd32(w + 4) || rd32(game_obj() + 0x320) != 0) {
+	if (!w || !rd32(w + 4) || rd32(game_obj() + 0x320) != 0 || !world_ready()) {
 		if (g_dooru_req_at && GetTickCount() - g_dooru_req_at < DOORU_WAIT_MS - 3000)
 			return;
 		g_dooru_state = DOORU_DONE;
 		_snprintf(g_dooru_msg, sizeof g_dooru_msg, "error usedoor: not in a level");
 		return;
 	}
-	if (w != g_door_world || rd32(w + 4) != g_door_level) {
+	if (g_door_gen != g_world_gen || w != g_door_world || rd32(w + 4) != g_door_level) {
 		door_scan(w, rd32(w + 4));
 		g_dooru_ndoors = 0;   // the entities are new: pick again
 		g_dooru_ent = 0;
@@ -5264,8 +5529,8 @@ static void apt_frame(void)
 		return;
 	}
 	void **vt = *(void ***)(uintptr_t)e;
-	if (!vt || IsBadReadPtr(vt, 0x78) || !code_in_exe((DWORD)(uintptr_t)vt[0x70 / 4]) ||
-	    !code_in_exe((DWORD)(uintptr_t)vt[0x74 / 4])) {
+	if (!vt || !image_ptr((DWORD)(uintptr_t)vt) || IsBadReadPtr(vt, 0x78) ||
+	    !code_in_exe((DWORD)(uintptr_t)vt[0x70 / 4]) || !code_in_exe((DWORD)(uintptr_t)vt[0x74 / 4])) {
 		_snprintf(g_apt_msg, sizeof g_apt_msg, "error aptdone: lock %x has no usable vtable", e);
 		g_apt_verdict = 0;
 		g_apt_state = APT_DONE;
@@ -5982,6 +6247,8 @@ static void frame_tick(void)
 	}
 	hang_phase("in menu_tick (shared menus)");
 	menu_tick();   // TASK 36: publish the menu state and make both copies show the same menu
+	hang_phase("in world_gen_tick (world generation)");
+	world_gen_tick();   // TASK 40: every entity table is keyed on this world generation
 	{   // every 10 s: a line the testers can send along with the log
 		static DWORD last_stat;
 		DWORD now = GetTickCount();
