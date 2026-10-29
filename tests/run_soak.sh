@@ -66,12 +66,14 @@ cleanup() {
 }
 start_relay() {
 	mkdir -p "$RUNDIR/$1"
-	"$PY" -I - "$RELAY" "$RUNDIR_WIN/$1" "$1" "$LAG" "$JIT" "$LOSS" <<'PY' > "$RUNDIR/$1/start.txt" 2>&1
+	"$PY" -I - "$RELAY" "$RUNDIR_WIN/$1" "$1" "$LAG" "$JIT" "$LOSS" "$PROFILE" <<'PY' > "$RUNDIR/$1/start.txt" 2>&1
 import os, subprocess, sys
-exe, cwd, role, lag, jit, loss = sys.argv[1:7]
+exe, cwd, role, lag, jit, loss, profile = sys.argv[1:8]
 args = [exe, role, '27961' if role == 'host' else '27962',
         '--udp-link', 'listen:28000' if role == 'host' else '28000',
         '--lag', lag, '--jitter', jit, '--loss', loss]
+if profile:
+    args += ['--profile', profile]
 out = open(os.path.join(cwd, 'relay.out'), 'wb')
 p = subprocess.Popen(args, cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
                      creationflags=0x00000008 | 0x00000200)
@@ -95,7 +97,13 @@ wait_relay() {
 	return 1
 }
 
+PROFILE=${OBSCOOP_LINK:-}
+case "$PROFILE" in
+''|steam) ;;
+*) echo "unknown OBSCOOP_LINK '$PROFILE' (only: steam)" >&2; exit 2 ;;
+esac
 LAG=45 JIT=10 LOSS=1
+[ "$PROFILE" = steam ] && LAG=0 JIT=0   # the profile brings its own delay, jitter, bursts and blackouts
 OB=$(count_image Obscure2.exe)
 RL=$(count_image obscoop-relay.exe)
 if [ "$OB" != 0 ] || [ "$RL" != 0 ]; then
@@ -106,7 +114,8 @@ if [ ! -f "$RELAY" ]; then echo "no relay at $RELAY" >&2; exit 2; fi
 if [ ! -f "$DLL" ]; then echo "no dll at $DLL" >&2; exit 2; fi
 
 trap cleanup EXIT INT TERM
-echo "=== soak run (lag $LAG jitter $JIT loss $LOSS, $ITERS iterations)  run dir $RUNDIR"
+echo "=== soak run (${PROFILE:+profile $PROFILE, }lag $LAG jitter $JIT loss $LOSS, $ITERS iterations)  run dir $RUNDIR"
+echo "transport pump: $([ "${OBSCOOP_TRANSPORT_FRAME:-0}" = 1 ] && echo frame || echo thread)"
 echo "root $ROOT"
 echo "relay $RELAY"
 echo "dll $DLL"

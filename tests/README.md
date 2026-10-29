@@ -27,6 +27,7 @@ and stops the game processes it owns; none of them touch the owner's install.
 | `run_named_load.sh <dll>` | the file the host's load names (`o2.sav`) exists only on the host; the guest may only get it by transfer |
 | `run_second_load.sh <dll> [checks...]` | a second load in one session, from the game's own pause menu, the guest must follow again |
 | `run_chaos.sh <dll> [lag jitter loss] [--save-xfer]` | the pair through two relays with lag/jitter/loss on a plain-UDP link, then the convergence checks |
+| `OBSCOOP_LINK=steam <runner>` (TASK 41) | any runner above gets the relay's `--profile steam` link: ~75 ms RTT, -40..+40 ms jitter, ~150 ms spikes, packets released together every 16-33 ms, 300-800 ms blackouts. `run_pair_menu.sh` starts the relays itself; `run_soak.sh`/`run_chaos.sh` add the profile to theirs. `OBSCOOP_TRANSPORT_FRAME=1` runs the pair with the OLD per-frame transport pump (test only), `OBSCOOP_TRANSPORT_FPS=N` also caps it to a modelled frame rate |
 | `run_solo_slot.sh <dll> <slot> <check...>` | ONE host copy, load the slot through the game's menu-load path, run checks against that copy |
 | `run_scan_slots.sh <dll> [slots]` | ONE copy, load every save slot and scan the live level of each |
 | `run_scan_transitions.sh <dll> [slots]` | ONE copy, read every level-transition destination the entities of every slot carry |

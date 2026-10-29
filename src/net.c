@@ -193,6 +193,20 @@ static DWORD g_tx_seq;
 static volatile float g_guest_rtt;      // host: the round trip the guest measured
 static float g_rtt_max;                 // guest: the largest of the last 16 round trips (the delay has to cover it)
 
+// ---- TASK 41: one transport thread for both transports ---------------------------------------------
+// udp_thread used to own receive + net_tick for UDP (every <= 2 ms) while the Steam path ran the same work
+// once per rendered frame inside net_frame, i.e. not at all during loads, long frames and stalls: the owner's
+// Steam playtest was unplayable while every (UDP) test passed. Now one thread does receive + net_tick for UDP
+// AND Steam at the same pacing; net_frame keeps only what belongs to the game thread (Steam init).
+// OBSCOOP_TRANSPORT_FRAME=1 (test only) puts the old per-frame pump back on UDP, so the difference can be
+// measured with the same DLL, the same link and the same checks.
+static int g_transport_frame;            // OBSCOOP_TRANSPORT_FRAME=1: no transport thread, net_frame pumps
+static int g_transport_fps;             // OBSCOOP_TRANSPORT_FPS=N: the modelled frame rate of the pump (0 = every Present)
+static HANDLE g_net_thread, g_net_timer;
+static volatile LONG g_net_ticks;         // transport loop iterations (pacing evidence)
+static DWORD g_net_last_note;
+static void net_tick(void);               // below
+
 // ---- test-only link pause (TASK 25 part B) -----------------------------------------------------
 // `netpause <ms>` on the pipe stops this copy from sending and receiving for that long, which is how the
 // reconnect test drops the link in the middle of play without touching the transport. 0 clears it.
@@ -626,35 +640,116 @@ static void net_tick(void)
 	}
 }
 
-static DWORD WINAPI udp_thread(LPVOID arg)
+// Everything that has arrived on the UDP socket, applied through net_handle. Runs on the transport thread
+// (and, with OBSCOOP_TRANSPORT_FRAME=1, in net_frame on the game thread - the old pump).
+static void udp_drain(void)
 {
-	(void)arg;
 	char buf[4096];
+	if (g_sock == INVALID_SOCKET)
+		return;
 	for (;;) {
 		fd_set rd;
 		FD_ZERO(&rd);
 		FD_SET(g_sock, &rd);
-		struct timeval tv = { 0, 2000 };
-		if (select(0, &rd, NULL, NULL, &tv) > 0) {
-			struct sockaddr_in from;
-			int fl = sizeof from;
-			int n = recvfrom(g_sock, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
-			if (n > 0) {
-				if (g_role == 1 && !g_peer_ok)
-					g_udp_peer = from;
-				net_handle(buf, n, udp_key(&from));
-			}
-		}
-		net_tick();
+		struct timeval tv = { 0, 0 };
+		if (select(0, &rd, NULL, NULL, &tv) <= 0)
+			return;
+		struct sockaddr_in from;
+		int fl = sizeof from;
+		int n = recvfrom(g_sock, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+		if (n <= 0)
+			return;
+		if (g_role == 1 && !g_peer_ok)
+			g_udp_peer = from;
+		net_handle(buf, n, udp_key(&from));
 	}
 }
 
-// Steam: once per frame on the main thread (Present hook).
+// 1 ms pacing for the transport loop. Windows' default timer is 15.6 ms, so a 1 ms wait would really be
+// 15.6 ms without a resolution request; timeBeginPeriod is resolved at run time from winmm.dll so the
+// documented build line (no -lwinmm) still links. A periodic auto-reset waitable timer is re-armed once and
+// simply waited on: a loop body that took longer than 1 ms finds it already signalled.
+static void net_pace_init(void)
+{
+	HMODULE mm = LoadLibraryA("winmm.dll");
+	if (mm) {
+		typedef UINT(WINAPI *time_begin_t)(UINT);
+		time_begin_t tb = (time_begin_t)GetProcAddress(mm, "timeBeginPeriod");
+		if (tb && tb(1) == 0)
+			logf("net: 1 ms timer resolution requested (transport pacing)");
+	}
+	g_net_timer = CreateWaitableTimerA(NULL, FALSE, NULL);
+	if (g_net_timer) {
+		LARGE_INTEGER due;
+		due.QuadPart = -10000;   // 1 ms (100 ns units, relative)
+		SetWaitableTimer(g_net_timer, &due, 1, NULL, NULL, FALSE);
+	}
+}
+
+static void net_pace_wait(void)
+{
+	if (g_net_timer)
+		WaitForSingleObject(g_net_timer, 10);
+	else
+		Sleep(1);
+}
+
+// The one transport thread (UDP and Steam): receive everything, then run net_tick, every <= 2 ms. It runs the
+// same net_tick the old UDP thread ran, so it touches exactly the state that was already touched off the game
+// thread (virtual pads, pad rings, the queued sync work - all locked/queued); the Steam calls inside net_tick
+// and net_handle are serialised with the game thread's Steamworks callback thread by steam_lock().
+static DWORD WINAPI net_thread(LPVOID arg)
+{
+	(void)arg;
+	net_pace_init();
+	for (;;) {
+		if (g_use_steam) {
+			if (g_steam_ok)   // SteamAPI_Init is the game thread's; nothing to poll before it ran
+				steam_poll();
+			else
+				Sleep(2);
+		} else {
+			udp_drain();
+		}
+		if (!g_use_steam || g_steam_ok) {
+			net_tick();
+			InterlockedIncrement(&g_net_ticks);
+			DWORD now = GetTickCount(), dt = now - g_net_last_note, span = g_net_last_note ? 10000u : 1000u;
+			if (dt >= span) {   // pacing evidence: after 1 s, then every 10 s
+				LONG n = g_net_ticks;
+				logf("net: transport thread (%s): %ld ticks over %lu ms = %.0f per second (state rx %ld tx %ld)",
+					g_use_steam ? "steam" : "udp", n, (unsigned long)dt, dt ? (double)n * 1000.0 / dt : 0.0,
+					g_net_rx, g_net_tx);
+				g_net_ticks = 0;
+				g_net_last_note = now;
+			}
+		}
+		net_pace_wait();
+	}
+}
+
+static void net_thread_start(void)
+{
+	if (g_net_thread)
+		return;
+	g_net_thread = CreateThread(NULL, 0, net_thread, NULL, 0, NULL);
+	if (g_net_thread)
+		CloseHandle(g_net_thread);
+	logf("net: transport thread started (receive + net_tick every <= 2 ms, %s)", g_use_steam ? "steam" : "udp");
+}
+
+// The game thread, once per Present. TASK 41: it keeps only what belongs to this thread - SteamAPI_Init is
+// done by the game on this thread and the game calls SteamAPI_RunCallbacks here too (Obscure2.exe.c:185958),
+// so the P2PSessionRequest callback keeps running here. Receive and net_tick belong to the transport thread.
+// OBSCOOP_TRANSPORT_FRAME=1 (test only) puts the OLD per-frame pump back on UDP: no transport thread, and this
+// function receives and runs net_tick once per Present - exactly what the Steam path did before TASK 41.
 static void net_frame(void)
 {
-	if (!g_use_steam || !g_role)
+	if (!g_role)
 		return;
-	if (!g_steam_ok) {
+	if (!g_use_steam && !g_transport_frame)
+		return;   // udp: the transport thread owns receive and net_tick
+	if (g_use_steam && !g_steam_ok) {
 		static DWORD last_try;
 		if (GetTickCount() - last_try < 1000)
 			return;
@@ -677,9 +772,37 @@ static void net_frame(void)
 		}
 		if (g_host_self_test)
 			g_host_sid_cfg = g_self_sid;
+		if (!g_transport_frame)
+			net_thread_start();   // TASK 41: from now on the transport thread receives and ticks
 	}
-	steam_poll();
-	net_tick();
+	if (!g_transport_frame)
+		return;
+	{   // OBSCOOP_TRANSPORT_FRAME=1: the old per-frame pump, and its rate
+		static DWORD last_note, last_pump;
+		static LONG n;
+		DWORD now = GetTickCount();
+		if (g_transport_fps) {   // model a game that renders at this rate (the test copies render at 120-150 fps)
+			DWORD period = 1000u / (DWORD)g_transport_fps;
+			if (last_pump && now - last_pump < period)
+				return;   // this Present was faster than the modelled frame
+			last_pump = now;
+		}
+		if (g_use_steam)
+			steam_poll();
+		else
+			udp_drain();
+		net_tick();
+		n++;
+		if (!last_note)
+			last_note = now;
+		else if (now - last_note >= 10000) {
+			logf("net: OLD per-frame pump: %ld ticks over %lu ms = %.1f per second (one per Present%s)", n,
+				(unsigned long)(now - last_note), (double)n * 1000.0 / (double)(now - last_note),
+				g_transport_fps ? ", capped by OBSCOOP_TRANSPORT_FPS" : "");
+			last_note = now;
+			n = 0;
+		}
+	}
 }
 
 static int env_int(const char *name, int def)
@@ -701,19 +824,28 @@ static void net_start(void)
 	GetEnvironmentVariableA("OBSCOOP_PEER", peer, sizeof peer);
 	GetEnvironmentVariableA("OBSCOOP_HOST_STEAMID", hostid, sizeof hostid);
 	GetEnvironmentVariableA("OBSCOOP_HOST_NAME", g_host_name, sizeof g_host_name);
+	g_transport_frame = env_int("OBSCOOP_TRANSPORT_FRAME", 0) != 0;
+	g_transport_fps = g_transport_frame ? env_int("OBSCOOP_TRANSPORT_FPS", 0) : 0;
 	g_role = !_stricmp(role, "host") ? 1 : !_stricmp(role, "guest") ? 2 : 0;
 	if (!g_role)
 		return;
+	if (g_transport_frame)
+		logf("net: OBSCOOP_TRANSPORT_FRAME=1 (TEST): the OLD per-frame pump - receive and net_tick once per Present%s, no transport thread",
+			g_transport_fps ? " (capped to the modelled frame rate)" : "");
+	if (g_transport_fps)
+		logf("net: OBSCOOP_TRANSPORT_FPS=%d: the per-frame pump models a game that renders at %d fps (the test copies render at 120-150 fps)",
+			g_transport_fps, g_transport_fps);
 	g_remote_pad = env_int("OBSCOOP_REMOTE_PAD", 1) & 3;
 	g_remote_pad_idx = g_remote_pad;
 	g_local_pad = env_int("OBSCOOP_LOCAL_PAD", 0) & 3;
 	if (!_stricmp(net, "steam")) {
 		g_use_steam = 1;
+		steam_lock_init();   // one (recursive) lock for every Steamworks call, game thread and transport thread
 		g_host_sid_cfg = _strtoui64(hostid, NULL, 10);
 		g_host_self_test = !_stricmp(hostid, "self");
 		logf("net: %s over steam (starts after SteamAPI_Init), remote pad %d, local pad %d, host id %s",
 			g_role == 1 ? "host" : "guest", g_remote_pad, g_local_pad, g_host_sid_cfg ? "configured" : "from friends list");
-		return;
+		return;   // the transport thread starts in net_frame once steam_start() succeeded
 	}
 	if (_stricmp(net, "udp")) {
 		logf("net: transport '%s' unknown", net);
@@ -742,7 +874,8 @@ static void net_start(void)
 	}
 	logf("net: %s over udp, %s port %d, remote pad %d, local pad %d", g_role == 1 ? "host" : "guest",
 		g_role == 1 ? "listening on 127.0.0.1" : peer, port, g_remote_pad, g_local_pad);
-	CloseHandle(CreateThread(NULL, 0, udp_thread, NULL, 0, NULL));
+	if (!g_transport_frame)
+		net_thread_start();
 }
 
 // One line for the window title: who we are and whether we are linked.
@@ -782,6 +915,6 @@ static void net_status(char *reply, size_t replysz)
 			g_steam_session_requests, g_steam_accepted, g_steam_refused, g_steam_tx_fail, g_last_candidates);
 	l = strlen(reply);
 	if (l < replysz)
-		_snprintf(reply + l, replysz - l, " paused %d rxdrop %d guest_level %08lx", net_paused(), net_rx_dropped(),
-			(unsigned long)(g_role == 1 ? g_hello_level : 0));
+		_snprintf(reply + l, replysz - l, " paused %d rxdrop %d guest_level %08lx pump %s transport_ticks %ld", net_paused(), net_rx_dropped(),
+			(unsigned long)(g_role == 1 ? g_hello_level : 0), g_transport_frame ? "frame" : "thread", g_net_ticks);
 }

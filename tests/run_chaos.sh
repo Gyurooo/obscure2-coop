@@ -52,7 +52,12 @@ while [ $# -gt 0 ]; do
 	esac
 	shift
 done
-TAG="lag${LAG}-jit${JIT}-loss${LOSS}"
+PROFILE=${OBSCOOP_LINK:-}
+case "$PROFILE" in
+''|steam) ;;
+*) echo "unknown OBSCOOP_LINK '$PROFILE' (only: steam)" >&2; exit 2 ;;
+esac
+TAG="lag${LAG}-jit${JIT}-loss${LOSS}${PROFILE:+-$PROFILE}"
 RUNDIR=${TMPDIR:-/tmp}/obscoop-chaos-$$
 mkdir -p "$RUNDIR" || exit 2
 RUNDIR_WIN=$(cygpath -w "$RUNDIR")
@@ -90,12 +95,14 @@ cleanup() {
 
 start_relay() {   # role exe rundirwin lag jit loss
 	mkdir -p "$RUNDIR/$1"
-	"$PY" -I - "$RELAY" "$RUNDIR_WIN/$1" "$1" "$LAG" "$JIT" "$LOSS" <<'PY' > "$RUNDIR/$1/start.txt" 2>&1
+	"$PY" -I - "$RELAY" "$RUNDIR_WIN/$1" "$1" "$LAG" "$JIT" "$LOSS" "$PROFILE" <<'PY' > "$RUNDIR/$1/start.txt" 2>&1
 import os, subprocess, sys
-exe, cwd, role, lag, jit, loss = sys.argv[1:7]
+exe, cwd, role, lag, jit, loss, profile = sys.argv[1:8]
 args = [exe, role, '27961' if role == 'host' else '27962',
         '--udp-link', 'listen:28000' if role == 'host' else '28000',
         '--lag', lag, '--jitter', jit, '--loss', loss]
+if profile:
+    args += ['--profile', profile]
 out = open(os.path.join(cwd, 'relay.out'), 'wb')
 p = subprocess.Popen(args, cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
                      creationflags=0x00000008 | 0x00000200)

@@ -371,6 +371,33 @@ static int g_link_peer_known, g_use_link;
 
 // ---- test only: delay, jitter and loss on the plain-UDP link, to behave like the internet ------------------------
 static int g_lag_ms, g_jit_ms, g_loss_pct;
+
+// TASK 41: `--profile steam` makes the plain-UDP test link look like what the OLD per-frame Steam path delivered:
+// ~75 ms RTT (12 ms base delay plus the 16-33 ms burst grid; measured mean RTT 75-86 ms, FINDINGS_41 §4),
+// -40..+40 ms jitter, ~1.5 % of packets spiked by +75 ms one way (~150 ms RTT), packets held and released
+// together on a 16-33 ms grid (bursts, which also reorder), and short 300-800 ms blackouts in which every packet
+// is dropped (a load / long frame / stall on the old path sent and received nothing).
+static int g_steam_profile;
+static double g_blackout_until;          // a blackout runs while ms_now() < this
+static double g_next_blackout;           // when the next blackout may start (0 = arm on the first packet)
+static double g_bw[32];                  // upcoming 16-33 ms release boundaries (a window's packets leave together)
+static int g_bw_h, g_bw_n;               // the ring's first entry and how many it holds
+static double g_bw_gen;                  // the last boundary generated
+static unsigned long g_prof_sent, g_prof_lost, g_prof_spikes, g_prof_blackouts, g_prof_blackout_drops, g_prof_bursts;
+static double g_prof_note;
+enum { PROF_LAG_MS = 12, PROF_JIT_MS = 40, PROF_SPIKE_MS = 75 };
+
+static const char *link_desc(void)
+{
+	static char b[200];
+	if (g_steam_profile)
+		snprintf(b, sizeof b, "profile steam: %d ms base + 16-33 ms bursts (~75 ms RTT), jitter -40..+40 ms, "
+			"1.5%% spikes +%d ms, 300-800 ms blackouts, loss %d%%", PROF_LAG_MS, PROF_SPIKE_MS, g_loss_pct);
+	else
+		snprintf(b, sizeof b, "lag %d ms, jitter %d ms, loss %d%%", g_lag_ms, g_jit_ms, g_loss_pct);
+	return b;
+}
+
 static double ms_now(void)
 {
 	static LARGE_INTEGER f;
@@ -390,35 +417,115 @@ static void link_send_now(const unsigned char *data, int len)
 		sendto(g_link, (const char *)data, len, 0, (struct sockaddr *)&g_link_peer, sizeof g_link_peer);
 }
 
+// The release time for a packet whose unshaped time would be t: the first 16-33 ms window boundary at or after t.
+// The grid is generated in sequence, so packets that fall in one window leave together, while a packet that needs
+// a later window (more jitter/spike) does not push a packet that fits an earlier window out of it. Such a link
+// reorders (as +-40 ms jitter does anyway); the protocol handles that (sequence numbers, timeline stamps).
+static double burst_release(double t)
+{
+	double now = ms_now();
+	if (g_bw_gen < now) {   // the grid is stale (no packets for a while): re-anchor it
+		g_bw_gen = now;
+		g_bw_h = g_bw_n = 0;
+	}
+	while (g_bw_n > 0 && g_bw[g_bw_h] < now) {   // drop boundaries that already passed
+		g_bw_h = (g_bw_h + 1) % 32;
+		g_bw_n--;
+	}
+	while (g_bw_n == 0 || g_bw[(g_bw_h + g_bw_n - 1) % 32] < t) {
+		g_bw_gen += 16.0 + (double)(rand() % 18);
+		if (g_bw_n >= 32)   // ring full (a long spike): use the last boundary
+			break;
+		g_bw[(g_bw_h + g_bw_n) % 32] = g_bw_gen;
+		g_bw_n++;
+		g_prof_bursts++;
+	}
+	for (int i = 0; i < g_bw_n; i++) {
+		double b = g_bw[(g_bw_h + i) % 32];
+		if (b >= t)
+			return b;
+	}
+	return g_bw[(g_bw_h + g_bw_n - 1) % 32];
+}
+
 static void link_send(const unsigned char *data, int len)
 {
-	if (!g_lag_ms && !g_jit_ms && !g_loss_pct) {
+	if (!g_lag_ms && !g_jit_ms && !g_loss_pct && !g_steam_profile) {
 		link_send_now(data, len);
 		return;
 	}
-	if (g_loss_pct && (rand() % 100) < g_loss_pct)
+	double now = ms_now();
+	if (g_steam_profile) {
+		if (!g_next_blackout)
+			g_next_blackout = now + 4000.0 + (double)(rand() % 4000);
+		if (now < g_blackout_until) {
+			g_prof_blackout_drops++;
+			return;
+		}
+		if (now >= g_next_blackout) {   // start a blackout: everything in it is dropped
+			g_blackout_until = now + 300.0 + (double)(rand() % 501);   // 300..800 ms
+			g_next_blackout = g_blackout_until + 4000.0 + (double)(rand() % 4001);
+			g_prof_blackouts++;
+			g_prof_blackout_drops++;
+			logf_("link: blackout %.0f ms starts (the old per-frame path sent nothing during a load or long frame)",
+				g_blackout_until - now);
+			return;
+		}
+	}
+	if (g_loss_pct && (rand() % 100) < g_loss_pct) {
+		g_prof_lost++;
 		return;
-	if (len > 1500 || ((g_lag_tail + 1) & 2047) == g_lag_head)
+	}
+	if (len > 1500 || ((g_lag_tail + 1) & 2047) == g_lag_head) {
+		g_prof_lost++;   // a full queue drops the packet, like a congested link
 		return;
+	}
+	double delay;
+	if (g_steam_profile) {
+		delay = (double)PROF_LAG_MS + (double)((int)(rand() % (2 * PROF_JIT_MS + 1)) - PROF_JIT_MS);
+		if (delay < 1.0)
+			delay = 1.0;
+		if ((rand() % 1000) < 15) {   // occasional spike, ~1.5 % of packets
+			delay += (double)PROF_SPIKE_MS;
+			g_prof_spikes++;
+		}
+	} else {
+		delay = (double)g_lag_ms + (double)(g_jit_ms ? rand() % (g_jit_ms + 1) : 0);
+	}
+	double due = now + delay;
+	if (g_steam_profile) {   // bursts: hold the packet until the next 16-33 ms release window
+		due = burst_release(due);
+	}
 	lag_pkt *p = &g_lagq[g_lag_tail];
-	p->due = ms_now() + g_lag_ms + (g_jit_ms ? (double)(rand() % (g_jit_ms + 1)) : 0.0);
+	p->due = due;
 	p->len = len;
 	memcpy(p->data, data, len);
 	g_lag_tail = (g_lag_tail + 1) & 2047;
+	g_prof_sent++;
 }
 
 static void lag_pump(void)
 {
+	double now = ms_now();
 	// jitter can reorder: send everything that is due, scanning the whole queue
 	for (int i = g_lag_head; i != g_lag_tail; i = (i + 1) & 2047) {
 		lag_pkt *p = &g_lagq[i];
-		if (p->len > 0 && p->due <= ms_now()) {
+		if (p->len > 0 && p->due <= now) {
 			link_send_now(p->data, p->len);
 			p->len = 0;
 		}
 	}
 	while (g_lag_head != g_lag_tail && g_lagq[g_lag_head].len == 0)
 		g_lag_head = (g_lag_head + 1) & 2047;
+	if (g_steam_profile) {   // what the shaped link did, cumulative, every 10 s
+		if (!g_prof_note)
+			g_prof_note = now;
+		else if (now - g_prof_note >= 10000) {
+			g_prof_note = now;
+			logf_("link profile steam (cumulative): %lu sent, %lu lost, %lu spikes, %lu blackouts (%lu packets dropped), %lu burst windows",
+				g_prof_sent, g_prof_lost, g_prof_spikes, g_prof_blackouts, g_prof_blackout_drops, g_prof_bursts);
+		}
+	}
 }
 
 static void to_game(const unsigned char *data, int len)
@@ -571,7 +678,7 @@ static int selftest(void)
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		puts("usage: obscoop-relay host [udp_port] | guest [host id|name|lobby:id] [udp_port] | selftest   [--udp-link ...]");
+		puts("usage: obscoop-relay host [udp_port] | guest [host id|name|lobby:id] [udp_port] | selftest   [--udp-link ...] [--profile steam] [--lag ms --jitter ms --loss %]");
 		return 1;
 	}
 	const char *mode = argv[1];
@@ -588,13 +695,22 @@ int main(int argc, char **argv)
 	for (int i = 2; i < argc; i++) {
 		if (!strcmp(argv[i], "--udp-link") && i + 1 < argc)
 			link = argv[++i];
-		else if (!strcmp(argv[i], "--lag") && i + 1 < argc)
+		else if (!strcmp(argv[i], "--profile") && i + 1 < argc) {
+			const char *p = argv[++i];
+			if (!strcmp(p, "steam"))
+				g_steam_profile = 1;
+			else if (strcmp(p, "plain"))
+				logf_("unknown profile '%s' (known: steam, plain)", p), exit(2);
+		} else if (!strcmp(argv[i], "--lag") && i + 1 < argc)
 			g_lag_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--jitter") && i + 1 < argc)
 			g_jit_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--loss") && i + 1 < argc)
 			g_loss_pct = atoi(argv[++i]);
-		else if (g_role == 2 && !target[0] && !(argv[i][0] >= '0' && argv[i][0] <= '9' && strlen(argv[i]) < 6))
+		else if (argv[i][0] == '-' && argv[i][1] == '-') {
+			logf_("unknown option '%s'", argv[i]);   // a stale relay must not silently shape nothing
+			exit(2);
+		} else if (g_role == 2 && !target[0] && !(argv[i][0] >= '0' && argv[i][0] <= '9' && strlen(argv[i]) < 6))
 			target = argv[i];
 		else if (atoi(argv[i]) > 0 && strlen(argv[i]) < 6)
 			port = atoi(argv[i]);
@@ -613,6 +729,17 @@ int main(int argc, char **argv)
 	}
 	if (link) {   // plain UDP link between two relays
 		g_use_link = 1;
+		{   // the shaper's timings are milliseconds: without a 1 ms timer resolution select()'s 2 ms timeout
+			// really waits up to 15.6 ms, which would smear the profile's RTT and burst grid
+			HMODULE mm = LoadLibraryA("winmm.dll");
+			int timer_ok = 0;
+			if (mm) {
+				typedef UINT(WINAPI * time_begin_t)(UINT);
+				time_begin_t tb = (time_begin_t)GetProcAddress(mm, "timeBeginPeriod");
+				timer_ok = tb && tb(1) == 0;
+			}
+			logf_("link: 1 ms timer resolution %s", timer_ok ? "granted" : "UNAVAILABLE (the pump's 2 ms select is really ~15.6 ms)");
+		}
 		g_link = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 		struct sockaddr_in me;
 		memset(&me, 0, sizeof me);
@@ -621,7 +748,7 @@ int main(int argc, char **argv)
 		if (!strncmp(link, "listen:", 7)) {
 			me.sin_port = htons((u_short)atoi(link + 7));
 			bind(g_link, (struct sockaddr *)&me, sizeof me);
-			logf_("udp link: listening on 127.0.0.1:%d (lag %d ms, jitter %d ms, loss %d%%)", atoi(link + 7), g_lag_ms, g_jit_ms, g_loss_pct);
+			logf_("udp link: listening on 127.0.0.1:%d (%s)", atoi(link + 7), link_desc());
 		} else {
 			bind(g_link, (struct sockaddr *)&me, sizeof me);
 			memset(&g_link_peer, 0, sizeof g_link_peer);
@@ -629,7 +756,7 @@ int main(int argc, char **argv)
 			g_link_peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 			g_link_peer.sin_port = htons((u_short)atoi(strchr(link, ':') ? strchr(link, ':') + 1 : link));
 			g_link_peer_known = 1;
-			logf_("udp link: sending to 127.0.0.1:%d", ntohs(g_link_peer.sin_port));
+			logf_("udp link: sending to 127.0.0.1:%d (%s)", ntohs(g_link_peer.sin_port), link_desc());
 		}
 	} else if (!steam_up()) {
 		return 1;
