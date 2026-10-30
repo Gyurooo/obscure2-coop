@@ -29,7 +29,7 @@ PCs. Attacks, enemies and character abilities are not proven (see the table).
 | scripted events / cutscenes | the scene state is streamed; a skip on **either** copy ends it on both, through the game's own skip | `check_cutscene.py`, `run_cutscene_pair.sh` (`FINDINGS_30`, `FINDINGS_31`) |
 | late join (guest starts after the host is in a level) | the guest joins into the running level | `run_late_join.sh` (`FINDINGS_14`) |
 | reconnect | an 8 s link drop resumes in ~0.5 s with no level reload; a restarted guest gets the saves again | `run_reconnect.sh` (`FINDINGS_25`) |
-| pause | START on either controller pauses both copies | `run_pair.sh` runs (`FINDINGS_12`) |
+| pause and menus | START on either controller pauses both copies; the pause menu and the inventory (WEAPONS/ITEMS/TEAM, the documents and map panels they open) are shown on both screens and BOTH pads drive them; the weapon wheel and item menu show on both | `check_menus.py` (`FINDINGS_36`) |
 | camera | free look stays local; `CAMERA=shared` makes the guest follow player 1 | `check_movement.py` |
 | abilities (lock pick, heavy case) | **unverified**: `PKT_APT` result sync is in the build, but the game's use never linked in the tests | `check_abilities.py` (`FINDINGS_28`) |
 | attacks, combat, enemies | **unproven**: the test levels' aim/target search accepts no NPC at all (with the mod passive too), so no attack could be driven; enemies are simulated twice | `check_combat.py`, `measure_combat.py` (`FINDINGS_21`, `FINDINGS_29`) |

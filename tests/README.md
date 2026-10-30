@@ -57,6 +57,7 @@ mismatch.
 | `check_itemuse.py` | using an item (healing) on one copy is applied on the other |
 | `check_breakables.py` | a chair carried and broken on one copy shows carried and broken on the other; SKIPs where the save has no usable chair |
 | `check_cutscene.py` | a skip on one copy ends the scripted event on both, and ends in normal play in the same level |
+| `check_menus.py` | a menu is shared: the pause menu and the inventory open/close on BOTH copies from either pad, the guest's pad drives them, and the weapon wheel shows on both |
 | `check_combat.py` | the real attack input (hold LB + press A) and the fight, synced; needs a level with live enemies |
 | `check_abilities.py` | lock picking / heavy case driven on both copies; the result must reach the other copy |
 | `check_tp.py` | proves `tp` is safe on five targets: each settles or is refused with the old position restored |

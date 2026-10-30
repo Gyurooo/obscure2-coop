@@ -13,7 +13,8 @@ Phases (defined in TASK13):
   A. IDLE         5 s, no input: nobody may move on either copy; the copies must agree.
   B. HOST PAD     player 1 forward 3 s, then sideways 2 s; host copy vs guest copy, both characters.
   C. GUEST PAD    player 2 the same way, driven from the GUEST's own pad.
-  D. BOTH AT ONCE host pad and guest pad moving in different directions for 4 s.
+  D. BOTH AT ONCE host pad and guest pad moving at the same time (forward 3 s, then sideways 2 s; TASK 38:
+                  the same path phases B and C use, so no character is left walking into a wall).
   E. RIGHT AFTER LOAD  B again, started by the runner immediately after the load script returns
                   (--early); this is before the 5 s weapon retry and the idle settle.
 
@@ -437,9 +438,14 @@ def main():
         show_verdict('C', ok, why, warn)
         rc |= 0 if ok else 1
     if 'D' in parts:
-        res = r.run('D BOTH AT ONCE (host pad forward, guest pad sideways, 4 s)',
-                    [(4.0, (0, STICK), (STICK, 0))])
+        # TASK 38: both pads at once, in the SAME path phases B and C use (forward, then sideways), so
+        # neither character is left pushing into the wall that stopped it (the old D drove BOY1 forward
+        # from B's end position - blocked after 19.5 units - and GIR1 sideways into a wall: 0.0 units).
+        # The point of the phase is that both pads move their character at the same time.
+        res = r.run('D BOTH AT ONCE (host pad and guest pad: forward 3 s, sideways 2 s)',
+                    [(3.0, (0, STICK), (0, STICK)), (2.0, (STICK, 0), (STICK, 0))])
         print_phase(res, ctl_h, ctl_g)
+        print_motion(res)
         why, warn = [], []
         for t in (ctl_h[0], ctl_g[1]):
             if t in ('-', None):

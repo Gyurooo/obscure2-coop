@@ -7,7 +7,7 @@ Summarised in our own words; check a value live before relying on it.
 ## Controls (controller)
 - The owner plays with a controller on the game's DEFAULT layout. The mod ships its own map `obscoop_o2.ipt`: check that it
   matches the default and does not move the attack.
-- Attack: HOLD LB (aim / attack stance, locks onto a target), then press A to attack (owner; TASK 23 saw LB+A give the stance
+- Attack (owner, confirmed in a real two-PC playtest): HOLD LB = attack stance, TAP RB = attack. SPECIAL attack = HOLD RB (not tap) then release. (Earlier notes said LB + A: that was wrong; A is the action/use button.)
   0x64/0x66 but no hit: the attack may be another button with LB held, or the enemies may be inactive). LB alone only enters the stance
   (TASK 22 saw LB set character `+0x2dc` = 0x64: that is the aim state).
 - While aiming you can attack while holding forward or back on the stick, NOT while holding left or right (guide; game quirk).
