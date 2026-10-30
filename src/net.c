@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 22   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 23   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -61,6 +61,12 @@
                         //     and the selected weapon slot (+0x714). The receiver writes them on the puppet's
                         //     controller record and calls the game's own HUD functions for that player, so
                         //     each player sees the other's wheel / item menu as before the puppet model.
+                        // 23: TASK 46, the MOVE INTENT (Obscure 1 `host_record_wanted` + intent): pkt_char
+                        //     also carries the owner's move direction (character+0x288, the value its input
+                        //     controller writes through vtable slot 0x60) and the owner's last four state
+                        //     changes with a sequence number. The receiver writes the intent into the puppet
+                        //     and lets the game's own movement state machine run in the locomotion states,
+                        //     so the game picks the gait and the lower-body animation layer (FINDINGS_46).
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,
@@ -86,7 +92,19 @@ typedef struct { pkt_hdr h; DWORD level; DWORD in_level; DWORD need_saves; } pkt
 // uses to choose idle/walk/run); anim = character+0x2dc (the state id the whole game switches on, see
 // FINDINGS_42 §1).
 typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; ch_state me; float vel[3]; DWORD speed;
-                 DWORD ui; DWORD wsel; } pkt_char;
+                 DWORD ui; DWORD wsel;
+                 // TASK 46: the MOVE INTENT. intent = character+0x288..0x290 (what the owner's input
+                 // controller wrote through vtable slot 0x60; the move direction the game's own movement
+                 // state machine turns into a step and into the lower-body animation layer at +0x224).
+                 // wanted = the owner's current state (+0x2dc); ev_seq/ev_val = the last four value CHANGES
+                 // of it, recorded on the owner before its update (Obscure 1 `host_record_wanted`), so a
+                 // state that lasts less than one send interval (a swing, a use, a climb start) still
+                 // reaches the receiver and is replayed in order.
+                 float intent[3]; DWORD wanted; DWORD ev_seq; DWORD ev_val[4];
+                 // gait: the owner's lower-body gait index (character+0x2e0: 0 pause, 1 forward, 2 back,
+                 // 3 right, 4 left - what FUN_004da570 computes from the intent and the aim target and
+                 // what FUN_004e7420 (vtable slot 0x4c) turns into the lower-body clip +0x224).
+                 DWORD gait; } pkt_char;
 typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; DWORD seq; } pkt_req;
 // life = character+0x320 (float bits), state = character+0x2dc (the NPC's AI/animation/death state; the
 // same field the humans stream as `anim`). TASK 21: the host owns enemy life and death, the guest applies

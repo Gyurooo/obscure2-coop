@@ -155,6 +155,7 @@ run_check() {   # label timeout script args...
 }
 
 run_check "check_attack_anim.py" 180 "$PY" -I "$HERE/check_attack_anim.py" "$HP" "$GP"
+run_check "check_anim_sync.py (what is played: both animation layers)" 180 "$PY" -I "$HERE/check_anim_sync.py" "$HP" "$GP"
 run_check "check_controls.py" 180 "$PY" -I "$HERE/check_controls.py" "$HP" "$GP"
 run_check "check_visible.py (the peer character is drawn)" 150 "$PY" -I "$HERE/check_visible.py" "$HP" "$GP"
 run_check "check_fight_pair.py (players attack each other)" 240 "$PY" -I "$HERE/check_fight_pair.py" "$HP" "$GP"

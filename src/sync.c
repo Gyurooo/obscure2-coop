@@ -2547,7 +2547,8 @@ static volatile LONG g_rx_state_new;
 #define PUP_DELAY_MIN 55.0f
 #define PUP_DELAY_MAX 220.0f
 #define PUP_EXTRAP_MAX 120  // ms of dead reckoning past the newest sample
-typedef struct { DWORD t; float pos[3], dir[3], vel[3]; DWORD speed, anim, ui, wsel; } psample;
+typedef struct { DWORD t; float pos[3], dir[3], vel[3]; DWORD speed, anim, ui, wsel;
+                 float intent[3]; DWORD wanted, ev_seq, ev_val[4], gait; } psample;
 
 static CRITICAL_SECTION g_pb_cs;
 static psample g_pb[PBUF];        // sorted by t, oldest first
@@ -2598,6 +2599,11 @@ static void peer_on_char(const char *buf, int n)
 	s->anim = p->me.anim;
 	s->ui = p->ui;
 	s->wsel = p->wsel;
+	memcpy(s->intent, p->intent, sizeof s->intent);
+	s->wanted = p->wanted;
+	s->ev_seq = p->ev_seq;
+	memcpy(s->ev_val, p->ev_val, sizeof s->ev_val);
+	s->gait = p->gait;
 	g_pb_n = i + 1;
 	while (i > 0 && (LONG)(g_pb[i - 1].t - g_pb[i].t) > 0) {   // out of order (jitter)
 		psample tmp = g_pb[i - 1];
@@ -2668,6 +2674,10 @@ static int puppet_pose(psample *out)
 				out->speed = b->speed;
 				out->ui = b->ui;       // TASK 43: the per-player UI the owner had then
 				out->wsel = b->wsel;
+				memcpy(out->intent, b->intent, sizeof out->intent);   // TASK 46: the intent then too
+				out->ev_seq = b->ev_seq;                              // ... and the state changes then
+				memcpy(out->ev_val, b->ev_val, sizeof out->ev_val);
+				out->gait = b->gait;
 				for (int c = 0; c < 3; c++) {
 					out->pos[c] = b->pos[c] + (a->pos[c] - b->pos[c]) * k;
 					out->vel[c] = b->vel[c] + (a->vel[c] - b->vel[c]) * k;
@@ -2860,6 +2870,16 @@ static void puppet_write(unsigned ch, const psample *s, int move)
 	}
 	if (!IsBadWritePtr((void *)(uintptr_t)(ch + 0x278), 4))
 		*(DWORD *)(uintptr_t)(ch + 0x278) = s->speed;   // the speed the walk/run decision uses
+	// TASK 46: the MOVE DIRECTION, written the way the owner's input controller writes it (vtable slot
+	// 0x60 = FUN_004c6bd0 stores it in +0x288/0x28c/0x290 when +0x2c4 == 0, decompile 121046). Without
+	// it the game's own movement state machine (and with it the lower-body animation layer +0x224) sees
+	// whatever the character was built with - measured on HEAD: the puppet kept the idle facing while the
+	// owner turned (FINDINGS_46 section 2).
+	if (rd32(ch + 0x2c4) == 0 && !IsBadWritePtr((void *)(uintptr_t)(ch + 0x288), 12)) {
+		float *it = (float *)(uintptr_t)(ch + 0x288);
+		for (int c = 0; c < 3; c++)
+			it[c] = s->intent[c];
+	}
 	// The swing state (200 = 0xc8) makes the game's OWN code read its attack target,
 	// human+0x824[human+0x820], and dereference it:
 	//   0x4dd243  mov 0x820(esi),edx / mov 0x824(esi,edx,4),eax / 0x4dd250 cmp 0,0x64(eax)
@@ -2881,24 +2901,151 @@ static void puppet_write(unsigned ch, const psample *s, int move)
 }
 
 // The state: through the game's own setter, and only when it changes (the setter restarts the clip).
-static void puppet_anim(unsigned ch, const psample *s)
+static void puppet_anim(unsigned ch, DWORD st)
 {
 	DWORD tag = rd32(ch + H_TAG);
 	if (g_pb_anim_tag != tag) {
 		g_pb_anim_tag = tag;
 		g_pb_anim_done = rd32(ch + 0x2dc);
 	}
-	if (s->anim == g_pb_anim_done)
+	if (st == g_pb_anim_done)
 		return;
 	unsigned vt = rd32(ch), fn = vt ? rd32(vt + 0x48) : 0;
 	if (!fn || !code_in_exe(fn)) {
-		*(DWORD *)(uintptr_t)(ch + 0x2dc) = s->anim;   // fallback: the value at least
-		g_pb_anim_done = s->anim;
+		*(DWORD *)(uintptr_t)(ch + 0x2dc) = st;   // fallback: the value at least
+		g_pb_anim_done = st;
 		return;
 	}
-	((char_state_t)fn)((void *)(uintptr_t)ch, NULL, s->anim);
-	g_pb_anim_done = s->anim;
+	((char_state_t)fn)((void *)(uintptr_t)ch, NULL, st);
+	g_pb_anim_done = st;
 	InterlockedIncrement(&g_pb_anim_sets);
+}
+
+// TASK 46: the LOWER-BODY animation layer in the states the movement machine may not run on the puppet
+// (the aim stance: its machine path is the action path TASK 42 gated). The machine changes that layer
+// exactly like this (decompile 142194..142199): when the gait index character+0x2e0 differs, it stops the
+// old layer clip (vtable slot 0x6c = FUN_004c7620) and plays the new one (vtable slot 0x4c =
+// FUN_004e7420, which writes the new index into +0x224). The gait itself is FUN_004da570's answer from
+// the intent AND the AIM TARGET (+0x750, FUN_004db0e0) - the aim target is not streamed, so the owner's
+// gait index is (measured on HEAD: the owner's +0x224 is LWAF/LWAL in the aim stance, the puppet's LPAU).
+typedef void(__fastcall *char_stop_t)(void *, void *, DWORD, int);
+typedef void(__fastcall *char_gait_t)(void *, void *, DWORD);
+static volatile LONG g_pb_gaits;
+static int puppet_aim(DWORD st);   // below: the aim-stance family
+
+static void puppet_gait(unsigned ch, const psample *s)
+{
+	DWORD st = rd32(ch + 0x2dc);
+	if (!puppet_aim(st) || s->gait > 4 || IsBadWritePtr((void *)(uintptr_t)(ch + 0x2e0), 4))
+		return;
+	unsigned vt = rd32(ch), stop = vt ? rd32(vt + 0x6c) : 0, set = vt ? rd32(vt + 0x4c) : 0;
+	if (rd32(ch + 0x2e0) != s->gait) {   // the gait changed: stop the old layer clip, as the machine does
+		unsigned tab = rd32(ch + 0x210), idx = rd32(ch + 0x224);
+		if (stop && code_in_exe(stop) && tab && idx < 0x1000)
+			((char_stop_t)stop)((void *)(uintptr_t)ch, NULL, rd32(tab + idx * 0x28 + 0xc), -1);
+		InterlockedIncrement(&g_pb_gaits);
+	}
+	// FUN_004c74e0 returns early when the clip is already playing, so this is idempotent per frame - and
+	// it repairs a layer the state setter had pointed at a different clip.
+	if (set && code_in_exe(set))
+		((char_gait_t)set)((void *)(uintptr_t)ch, NULL, s->gait);
+}
+
+// ---- TASK 46: the owner's state changes as EVENTS (Obscure 1 `host_record_wanted`) -----------------
+// A swing, an item use or a climb start can last less than one 16 ms stream interval, so streaming the
+// current state alone loses it and the receiver never plays that clip. Each copy records every CHANGE of
+// its own character's state (+0x2dc) with a sequence number BEFORE its update (the value the game is
+// about to consume, Obscure 1 sync.c ~1728), streams the last four with every PKT_CHAR, and the receiver
+// replays the ones it missed, one per update, in order (Obscure 1 sync.c ~1745).
+#define EV_KEEP 4
+typedef struct { volatile LONG seq; DWORD val[EV_KEEP]; } evring;   // val[seq & (EV_KEEP-1)] = the change seq
+static evring g_ev_host;        // this copy's own character: what this copy records and sends
+static DWORD g_ev_last_tag, g_ev_last_val;
+static DWORD g_ev_tag, g_ev_applied;   // receiver: the character, and the last sequence number replayed
+static volatile LONG g_ev_rec, g_ev_rep;
+
+static void host_record_state(DWORD tag, DWORD st)
+{
+	if (tag != g_ev_last_tag) {   // another character (a respawn, a rebuilt party): start its own history
+		g_ev_last_tag = tag;
+		g_ev_last_val = st;
+		return;
+	}
+	if (st == g_ev_last_val)
+		return;
+	LONG n = InterlockedIncrement(&g_ev_host.seq);
+	g_ev_host.val[n & (EV_KEEP - 1)] = st;
+	g_ev_last_val = st;
+	InterlockedIncrement(&g_ev_rec);
+}
+
+// The states a puppet may run. Locomotion is the game's own movement-machine set (0 idle, 1 walk, 2 run,
+// 4 sprint - decompile 142018..142075); the action states are the ones the state setter FUN_004e3ed0 has
+// explicit cases for and a human reaches in normal play (aim 100/0x65/0x66/0xc9, swing 200, charged 300,
+// the combat family 500/600/700, the interaction family 0x12d/0x12e/0x12f, death 5). Anything else keeps
+// the state the puppet already has and is named once in the log (Obscure 1 `puppet_state_ok`).
+static int puppet_state_ok(DWORD st)
+{
+	switch (st) {
+	case 0: case 1: case 2: case 4:              // idle, walk, run, sprint
+	case 5:                                      // death
+	case 100: case 0x65: case 0x66: case 0xc9:   // aim stance and its variants
+	case 200: case 300:                          // swing, charged/special attack
+	case 500: case 600: case 700:                // the combat/stance family of the setter
+	case 0x12d: case 0x12e: case 0x12f:          // use/interaction family (FINDINGS_29 section 2)
+		return 1;
+	}
+	static DWORD logged[32];
+	for (int i = 0; i < 32; i++) {
+		if (logged[i] == st)
+			return 0;
+		if (!logged[i]) {
+			logged[i] = st;
+			logf("puppet: state %lu is not on the safe list (the puppet holds its pose)", (unsigned long)st);
+			return 0;
+		}
+	}
+	return 0;
+}
+
+// The locomotion states: the ones where the game's own movement/state machine may run on the puppet. The
+// machine's action paths need local context this copy does not have (the swing reads the attack target
+// list +0x820/+0x824, FINDINGS_44 section 3), so those keep TASK 42's gate.
+static int puppet_locomotion(DWORD st)
+{
+	return st == 0 || st == 1 || st == 2 || st == 4;
+}
+
+// The aim-stance family: the owner keeps walking/strafing while the upper body aims, and its LOWER-BODY
+// layer then follows the direction (+0x224 = LWAF/LWAL/LWAB - measured on HEAD). That layer is the only
+// thing this copy has to drive itself in these states (puppet_gait); the state and the upper clip stay
+// with the game's own setter (puppet_anim) and the movement machine stays gated, as TASK 42 left it.
+static int puppet_aim(DWORD st)
+{
+	return st == 100 || st == 0x65 || st == 0x66;
+}
+
+// Which state the owner is in at the playback instant, replaying a state change that arrived since the
+// last update (one per update, in order). A state outside the safe list keeps the puppet where it is.
+static DWORD puppet_wanted(unsigned ch, const psample *s)
+{
+	DWORD tag = rd32(ch + H_TAG);
+	if (tag != g_ev_tag) {   // another character: start from now, do not replay history
+		g_ev_tag = tag;
+		g_ev_applied = s->ev_seq;
+	}
+	DWORD want = s->anim;    // the state at the playback instant (TASK 42's value)
+	if (s->ev_seq != g_ev_applied && (LONG)(s->ev_seq - g_ev_applied) < 64) {
+		DWORD next = g_ev_applied + 1;
+		if ((LONG)(s->ev_seq - next) >= EV_KEEP)   // more than four behind: skip to the oldest still known
+			next = s->ev_seq - (EV_KEEP - 1);
+		want = s->ev_val[next & (EV_KEEP - 1)];
+		g_ev_applied = next;
+		InterlockedIncrement(&g_ev_rep);
+	}
+	if (!puppet_state_ok(want))
+		return rd32(ch + 0x2dc);   // hold: not a state a puppet may run
+	return want;
 }
 
 // Called before the game's own character update for every human: is this the puppet, and if so put it in
@@ -2913,7 +3060,21 @@ static int puppet_prepare(unsigned ch)
 		InterlockedIncrement(&g_pb_nosample);
 		return 0;
 	}
-	puppet_anim(ch, &s);
+	DWORD want = puppet_wanted(ch, &s);
+	DWORD cur = rd32(ch + 0x2dc);
+	if (puppet_locomotion(want) && puppet_locomotion(cur)) {
+		// TASK 46: a locomotion state is the MOVEMENT MACHINE's job. Its request field +0x2e8 gets the
+		// owner's state; the machine (let through by hk_char_move) picks the gait from the streamed speed
+		// and drives the lower-body animation layer +0x224 from the streamed intent direction. Calling the
+		// state setter here too would race the machine's own transition.
+		if (!IsBadWritePtr((void *)(uintptr_t)(ch + 0x2e8), 4))
+			*(DWORD *)(uintptr_t)(ch + 0x2e8) = want;
+	} else {
+		// an action state (the aim stance included - its machine path is the one TASK 42 gated), or the
+		// way back from one: the game's own state setter
+		puppet_anim(ch, want);
+		puppet_gait(ch, &s);   // ... and its lower-body layer follows the owner's gait
+	}
 	puppet_write(ch, &s, 1);   // TASK 45: through SetPosition, so the collision body follows
 	puppet_ui(ch, &s);
 	return 1;
@@ -3024,7 +3185,10 @@ static void puppet_finish(unsigned ch)
 		InterlockedIncrement(&g_char_snaps);
 	puppet_write(ch, &s, 0);
 	if (!IsBadWritePtr((void *)(uintptr_t)(ch + 0x2dc), 4)) {
-		if (rd32(ch + 0x2dc) == s.anim) {
+		if (puppet_locomotion(s.anim)) {
+			// TASK 46: the movement machine owns the locomotion states on the puppet (it picks the gait
+			// from the streamed speed); leave the state it chose.
+		} else if (rd32(ch + 0x2dc) == s.anim) {
 			InterlockedIncrement(&g_pb_anim_ok);
 		} else {
 			*(DWORD *)(uintptr_t)(ch + 0x2dc) = s.anim;   // the game's own update moved it: the owner wins
@@ -3058,6 +3222,21 @@ static int puppet_is(unsigned ch)
 	return puppet_active(ch);
 }
 
+// TASK 46: may the game's own movement/state machine run for this character this frame? Only in the
+// locomotion states - the machine's action paths need local context this copy does not have (the swing
+// reads the attack target list +0x820/+0x824, FINDINGS_44 section 3). Elsewhere TASK 42's gate stays.
+static int puppet_move_ok(unsigned ch)
+{
+	return ch && puppet_locomotion(rd32(ch + 0x2dc));
+}
+
+// TASK 46: is this the character THIS copy owns (the one it streams, see char_send_local)? Its state
+// changes are what the peer replays - the host side of Obscure 1's `host_record_wanted`.
+static int own_char(unsigned ch)
+{
+	return g_role && ch && ch == player_human(g_role == 1 ? 0 : 1);
+}
+
 // ---- each copy streams the character its own pad drives -------------------------------------------
 // TASK 42: 16 ms = 60 Hz, called from the transport thread (net.c net_tick), so the rate does not depend
 // on the frame rate; the receiver interpolates it.
@@ -3087,6 +3266,15 @@ static void char_send_local(void)
 	p.speed = rd32(me + 0x278);
 	p.me.anim = rd32(me + 0x2dc);
 	p.me.life = rd32(me + 0x320);
+	// TASK 46: the move intent (character+0x288, written by the owner's input controller through vtable
+	// slot 0x60) and the owner's state-change events. The receiver writes the intent into the puppet and
+	// lets the game's own movement machine run, so the gait and the lower-body layer follow the owner.
+	memcpy(p.intent, (const void *)(uintptr_t)(me + 0x288), sizeof p.intent);
+	p.wanted = rd32(me + 0x2dc);
+	p.gait = rd32(me + 0x2e0);
+	p.ev_seq = (DWORD)g_ev_host.seq;
+	for (int i = 0; i < EV_KEEP; i++)
+		p.ev_val[i] = g_ev_host.val[i];
 	// TASK 43: the owner's per-player UI (the wheel / item menu / aim state) and the selected slot, so the
 	// other copy shows what this player is doing (the puppet's own controller no longer runs there).
 	{
@@ -6644,6 +6832,13 @@ static void frame_tick(void)
 				     g_pb_err_n ? g_pb_err_sum / g_pb_err_n : 0.0f, g_pb_err_max, g_pb_err_n,
 				     (long)g_pb_anim_ok, an, an ? 100.0 * (double)g_pb_anim_ok / (double)an : 0.0,
 				     g_pb_anim_sets, g_pb_under, g_pb_extrap, g_net_rtt_ms);
+				// TASK 46: the intent path - state-change events recorded/replayed, frames where the
+				// game's own movement machine ran for the puppet / was gated by the action states, and
+				// the puppet's own move direction (what the machine consumes).
+				logf("puppet intent: events recorded %ld replayed %ld | movement machine ran %ld gated %ld | peer intent %.2f,%.2f",
+				     (long)g_ev_rec, (long)g_ev_rep, (long)g_puppet_move_run, (long)g_puppet_move_gated,
+				     pup ? *(const float *)(uintptr_t)(pup + 0x288) : 0.0f,
+				     pup ? *(const float *)(uintptr_t)(pup + 0x28c) : 0.0f);
 				// TASK 43: which guard of puppet_target() refused this copy's puppet in the last 10 s.
 				{
 					char gs[220];

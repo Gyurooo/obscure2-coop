@@ -306,8 +306,11 @@ static int __fastcall hk_party_table(void *game, void *edx, int flag, unsigned l
 typedef void(__fastcall *input_update_t)(void *, void *, int);
 static input_update_t g_input_update;
 static void guest_weapons_frame(void);   // sync.c: the guest's held weapons, applied in the game's own update
-static volatile LONG g_puppet_gated, g_puppet_frames, g_puppet_move_gated;   // TASK 42 gating counters
+static volatile LONG g_puppet_gated, g_puppet_frames, g_puppet_move_gated, g_puppet_move_run;   // TASK 42/46 gating counters
 static int puppet_is(unsigned ch);       // sync.c (TASK 42): is this character the peer's puppet?
+static int puppet_move_ok(unsigned ch);  // sync.c (TASK 46): may the movement machine run for it?
+static int own_char(unsigned ch);        // sync.c (TASK 46): is this the character THIS copy owns?
+static void host_record_state(DWORD tag, DWORD st);   // sync.c (TASK 46): record a state change
 static int puppet_prepare(unsigned ch);  // sync.c (TASK 42): the owner's pose/state before the game's update
 static void puppet_finish(unsigned ch);  // sync.c (TASK 42): the owner's pose after it
 
@@ -343,17 +346,24 @@ static void __fastcall hk_input_update(void *self, void *edx, int dt)
 //     0x4e811e  mov 0x820(human), ecx
 //     0x4e8124  mov 0x824(human,ecx,4), edx   ; the attack target list the aim/attack search fills
 //     0x4e812b  cmp ebx, 0x64(edx)            ; edx = 0 -> access violation
-// (crash report of run run_s42_3.log, host). The puppet must not run that machine: its state, its pose
-// and its speed come from the owner, the animation clips are played by the game's own setter, and the
-// movement function only has to be out of the way. Prologue 55 8b ec 81 ec 30 07 00 00 (9 bytes).
+// (crash report of run run_s42_3.log, host). TASK 46: in the LOCOMOTION states the machine DOES run for
+// the puppet, with the owner's intent written into +0x288/+0x278 before it (puppet_prepare): that is how
+// the game itself picks the gait (speed thresholds 200/850, decompile 142018..142075) and drives the
+// lower-body animation layer +0x224 from the intent direction (slot 0x4c, decompile 142282..142299) -
+// which TASK 42's gate left stale (FINDINGS_46 section 2). The action states keep the gate: their paths
+// need local context this copy does not have (the swing's attack-target list above).
+// Prologue 55 8b ec 81 ec 30 07 00 00 (9 bytes).
 typedef void(__fastcall *char_move_t)(void *, void *, int);
 static char_move_t g_char_move;
 
 static void __fastcall hk_char_move(void *ch, void *edx, int dt)
 {
 	if (!g_passive && puppet_is((unsigned)(uintptr_t)ch)) {
-		InterlockedIncrement(&g_puppet_move_gated);
-		return;
+		if (!puppet_move_ok((unsigned)(uintptr_t)ch)) {
+			InterlockedIncrement(&g_puppet_move_gated);
+			return;
+		}
+		InterlockedIncrement(&g_puppet_move_run);
 	}
 	if (g_char_move)
 		g_char_move(ch, edx, dt);
@@ -385,6 +395,11 @@ static void __fastcall hk_char_update(void *ch, void *edx, float dt)
 			}
 		}
 		puppet = puppet_prepare(c);
+		// TASK 46: the host side of Obscure 1's `host_record_wanted`: this copy records every change of
+		// its OWN character's state (+0x2dc) before the update consumes it, so a state that lasts less
+		// than one stream interval still reaches the peer (puppet_wanted replays it there).
+		if (own_char(c))
+			host_record_state(rd32(c + 0x14), rd32(c + 0x2dc));
 	}
 	if (g_char_update)
 		g_char_update(ch, edx, dt);
