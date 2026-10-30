@@ -448,10 +448,24 @@ static void teammate_want(unsigned ch)
 	}
 }
 
+// TASK 45 (test switch): OBSCOOP_NO_TEAMMATE=1 leaves the world the game built itself alone - no
+// attach_player2, no teammate_unlink - so a test can see what the game's OWN player-2 join does.
+static int no_teammate(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		char b[8];
+		v = GetEnvironmentVariableA("OBSCOOP_NO_TEAMMATE", b, sizeof b) != 0;
+	}
+	return v;
+}
+
 static void attach_player2(void)
 {
 	static DWORD last;
 	DWORD now = GetTickCount();
+	if (no_teammate())
+		return;
 	if (now - last < 500) return;
 	last = now;
 	unsigned w = world_obj();
@@ -2796,13 +2810,49 @@ static unsigned puppet_target(void)
 	return ch;
 }
 
+// TASK 45: the position has THREE copies in the game, not one, and the game's own update reads the other
+// two every frame:
+//   * human+0x23c - the position the renderer/model matrix uses (what TASK 42 wrote);
+//   * human+0x27c - the MOVE TARGET. FUN_004de4f0 (the human update) measures pos-target and, when the
+//     character has a target and "can move there" (slot 0x38), calls the character's own SetPosition
+//     (slot 0x10) with the TARGET - every frame. On a puppet nothing ever wrote the target, so the update
+//     walked it back to the level origin (guest) or the spawn point (host) each frame and `puppet_finish`
+//     put the pose back - the "drift" of FINDINGS_44 section 2;
+//   * human+0x30c -> +0xcc - the COLLISION BODY (CCharacterImpactManager; its vtable slot 7 = 0x449bd0 is
+//     `lea eax,[ecx+0xcc]`). Only the game's own SetPosition moves it (slot 3 of the body), and only the
+//     movement state machine calls SetPosition for a real player - so on a puppet the body stayed where
+//     the character was BUILT (observed: (0,0,z) on the guest, the spawn point on the host), i.e. in
+//     another sector/room than the drawn model. That is the stale body of FINDINGS_44 section 2.2.
+// Fix: write the move target with the pose and move the character through the game's OWN SetPosition
+// (CCharacterHuman vtable slot 4 = FUN_004c6880: it writes +0x23c, moves the collision body, tells the
+// kinematic object at +0x124 and +0x314, and copies the body position back when the body is active).
+// `move` = 0 only in puppet_finish, where the platform/collision calls of a second SetPosition in the same
+// frame are not needed: there the plain fields are enough (the body is already on the pose).
+typedef void(__fastcall *char_setpos_t)(void *, void *, float *);
+static volatile LONG g_pb_moves;
+
+static void puppet_body(unsigned ch, const float *p, int move)
+{
+	float q[3] = { p[0], p[1], p[2] };
+	if (!IsBadWritePtr((void *)(uintptr_t)(ch + 0x27c), 12))
+		memcpy((void *)(uintptr_t)(ch + 0x27c), q, 12);
+	if (!move)
+		return;
+	unsigned vt = rd32(ch), fn = vt ? rd32(vt + 0x10) : 0;
+	if (fn && code_in_exe(fn)) {   // __thiscall(this, float *position)
+		((char_setpos_t)fn)((void *)(uintptr_t)ch, NULL, q);
+		InterlockedIncrement(&g_pb_moves);
+	}
+}
+
 // Position, facing, velocity and the owner's speed: the four fields the game's own movement code reads.
-static void puppet_write(unsigned ch, const psample *s)
+static void puppet_write(unsigned ch, const psample *s, int move)
 {
 	float *pos = (float *)(uintptr_t)(ch + H_POS), *dir = (float *)(uintptr_t)(ch + H_DIR);
 	float *vel = (float *)(uintptr_t)(ch + 0x294);
 	if (IsBadWritePtr(pos, 12) || IsBadWritePtr(dir, 12) || IsBadWritePtr(vel, 12))
 		return;
+	puppet_body(ch, s->pos, move);
 	for (int c = 0; c < 3; c++) {
 		pos[c] = s->pos[c];
 		dir[c] = s->dir[c];
@@ -2864,7 +2914,7 @@ static int puppet_prepare(unsigned ch)
 		return 0;
 	}
 	puppet_anim(ch, &s);
-	puppet_write(ch, &s);
+	puppet_write(ch, &s, 1);   // TASK 45: through SetPosition, so the collision body follows
 	puppet_ui(ch, &s);
 	return 1;
 }
@@ -2954,15 +3004,25 @@ static void puppet_finish(unsigned ch)
 				}
 			}
 			LeaveCriticalSection(&g_pb_cs);
-			logf("puppet drift %s: %.2f units; pose %.1f,%.1f,%.1f char %.1f,%.1f,%.1f state %u vel %.1f,%.1f,%.1f"
-			     " | buffered %d newest %.1f,%.1f,%.1f prev %.1f,%.1f,%.1f",
+			// TASK 45: the COLLISION BODY (human+0x30c, position +0xcc) next to the pose, so a log shows
+			// whether the body follows the streamed position (it did not before this task: it stayed at
+			// the place the character was built).
+			unsigned imp = rd32(ch + 0x30c), ib = imp && mem_ok((const void *)(uintptr_t)imp, 0x100) ? imp : 0;
+			float bx = 0, by = 0, bz = 0;
+			if (ib) {
+				bx = *(float *)(uintptr_t)(ib + 0xcc);
+				by = *(float *)(uintptr_t)(ib + 0xd0);
+				bz = *(float *)(uintptr_t)(ib + 0xd4);
+			}
+			logf("puppet drift %s: %.2f units; pose %.1f,%.1f,%.1f char %.1f,%.1f,%.1f body %.1f,%.1f,%.1f"
+			     " state %u vel %.1f,%.1f,%.1f | buffered %d newest %.1f,%.1f,%.1f prev %.1f,%.1f,%.1f",
 			     tag4(rd32(ch + H_TAG), tg), err, s.pos[0], s.pos[1], s.pos[2], pos[0], pos[1], pos[2],
-			     rd32(ch + 0x2dc), vel[0], vel[1], vel[2], ns, sl0, sl1, sl2, pt0, pt1, pt2);
+			     bx, by, bz, rd32(ch + 0x2dc), vel[0], vel[1], vel[2], ns, sl0, sl1, sl2, pt0, pt1, pt2);
 		}
 	}
 	if (err > 0.05f)
 		InterlockedIncrement(&g_char_snaps);
-	puppet_write(ch, &s);
+	puppet_write(ch, &s, 0);
 	if (!IsBadWritePtr((void *)(uintptr_t)(ch + 0x2dc), 4)) {
 		if (rd32(ch + 0x2dc) == s.anim) {
 			InterlockedIncrement(&g_pb_anim_ok);
@@ -6694,7 +6754,8 @@ static void sync_status(char *reply, size_t replysz)
 			g_apt_sent, g_apt_rcv, g_apt_applied, g_apt_actions);
 	l = strlen(reply);
 	if (l < replysz)
-		_snprintf(reply + l, replysz - l, " | puppet gated %ld frames %ld", g_puppet_gated, g_puppet_frames);
+		_snprintf(reply + l, replysz - l, " | puppet gated %ld frames %ld moves %ld", g_puppet_gated, g_puppet_frames,
+		          g_pb_moves);   // TASK 45: moves = SetPosition calls (the collision body follows the pose)
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | door sent %ld rcv %ld applied %ld missed %ld | ask sent %ld pend %ld",

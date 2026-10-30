@@ -33,6 +33,7 @@ GAME = 0x6c3068
 H_TAG, H_POS, H_DIR, H_ANIM = 0x14, 0x23c, 0x248, 0x2dc
 LB = 0x100
 POS_TOL = 2.0           # world units the two copies' positions of the peer may differ (1 unit = 1 cm)
+BODY_TOL = 8.0          # world units the peer's COLLISION BODY may be behind its streamed pose (TASK 45)
 AHEAD = 130.0           # 1.3 m in front of the local character
 SIDE = 40.0             # 0.4 m to the side, so the peer is not hidden behind the local character
 SHOTS = os.environ.get('OBSCOOP_SHOT_DIR') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'shots', 'visible')
@@ -72,8 +73,18 @@ class View:
             if not b or len(b) < 24:
                 continue
             f = struct.unpack('<6f', b)
+            # TASK 45: the character's COLLISION BODY (human+0x30c = CCharacterImpactManager, its
+            # position at +0xcc; the class' vtable slot 7 = 0x449bd0 is `lea eax,[ecx+0xcc]`). It is the
+            # second copy of the position the game moves, collides with and culls by - TASK 44 measured
+            # it left at the level origin on the guest copy while the pose was 278 units away.
+            imp = self.p.u32(h + 0x30c)
+            body = None
+            if imp:
+                bb = self.p.read(imp + 0xcc, 12)
+                if bb and len(bb) == 12:
+                    body = struct.unpack('<3f', bb)
             out[tag4(self.p.u32(h + H_TAG))] = dict(pos=f[0:3], dir=f[3:6], anim=self.p.u32(h + H_ANIM),
-                                                   obj=h, wired=self.p.u32(h + 8))
+                                                   obj=h, wired=self.p.u32(h + 8), body=body)
         return out
 
     def controllers(self):
@@ -146,19 +157,49 @@ def brightness(px):
     return tot / max(1, n)
 
 
+def same(a, b, step=8):
+    """the two grabs are the very same picture (a PrintWindow that was not re-rendered)"""
+    if a is None or b is None or a[2] == b[2]:
+        return True
+    pa, pb = a[2], b[2]
+    for i in range(0, min(len(pa), len(pb)), step):
+        if pa[i] != pb[i]:
+            return False
+    return True
+
+
 def capture(pid, name):
     hwnd = window_of(pid)
     if not hwnd:
         print('  %s: the game has no visible window' % name)
         return None
     w, h, px, ok = grab(hwnd)
+    first = (w, h, px)
     if brightness(px) < 24 * 0.02:
-        # a covered or unfocused D3D window can hand out a black frame: bring it to the front (no click:
-        # that would be input into the game) and grab again
+        frozen = True   # a covered or unfocused D3D window hands out a black frame
+    else:
+        # TASK 45: PrintWindow also returns the LAST rendered frame when the window is fully covered by
+        # another window (the two test copies are 2560x1440 and 800x600 on one desktop). A second grab a
+        # moment later tells it apart from a real (static) picture of a live game: if it is identical,
+        # bring the window to the front (no click: that would be input into the game) and grab again.
+        time.sleep(0.35)
+        frozen = same(first, grab(hwnd))
+    if frozen:
         user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 1 | 2 | 0x40)   # HWND_TOPMOST, NOMOVE|NOSIZE|SHOWWINDOW
         time.sleep(1.0)
         w, h, px, ok = grab(hwnd)
         user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 1 | 2)          # HWND_NOTOPMOST
+        time.sleep(0.2)
+        if brightness(px) < 24 * 0.02:
+            # TASK 45: with the DISPLAY OFF (the desktop's monitor sleeps after the idle timeout) DWM does
+            # not compose and every D3D window hands out a black frame - measured with the two test copies
+            # (brightness 0.00 on both windows, 28.97/40.71 on the same windows after the monitor was woken
+            # with SC_MONITORPOWER). There is no picture to judge then; say so instead of failing the game.
+            print('  %s: no picture -- the window hands out a black frame (a display that is off or a '
+                  'covered D3D window); the pixel checks are skipped' % name)
+            return None
+        if same((w, h, px), grab(hwnd), 64):
+            print('  %s: PrintWindow keeps returning the same frame' % name)
     if KEEP:
         os.makedirs(SHOTS, exist_ok=True)
         write_png(os.path.join(SHOTS, name + '.png'), w, h, px)
@@ -187,7 +228,7 @@ def dist(a, b):
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
 
 
-def check_copy(label, viewer_pid, viewer_v, peer_v, peer_pipe, peer_pl, own_idx):
+def check_copy(label, viewer_pid, viewer_v, peer_v, peer_pipe, peer_pl, own_idx, viewer_pipe=None):
     """viewer_v = the copy whose window is examined; peer_v = the copy that OWNS the peer character."""
     hs = viewer_v.humans()
     ctl = viewer_v.controllers()
@@ -237,30 +278,57 @@ def check_copy(label, viewer_pid, viewer_v, peer_v, peer_pipe, peer_pl, own_idx)
     print('  peer on its own copy at (%.1f, %.1f, %.1f) state %d -> the two copies differ by %.2f units'
           % (owner['pos'][0], owner['pos'][1], owner['pos'][2], owner['anim'], d))
     bad = []
+    # TASK 45: the collision body must be where the character is. It is what the game's update reads (the
+    # move target drives the character to it), what the physics collides and what the room/sector culling
+    # sees - a body left at the level origin is the owner's "the character is not there" symptom.
+    db = None
+    if peer.get('body'):
+        db = dist(peer['body'], owner['pos'])
+        print('  peer collision body at (%.1f, %.1f, %.1f) -> %.2f units from its owner (tolerance %.1f)'
+              % (peer['body'][0], peer['body'][1], peer['body'][2], db, BODY_TOL))
+        if db > BODY_TOL:
+            bad.append("the peer's collision body is %.2f units from the streamed position (stale body)" % db)
+    else:
+        bad.append('the peer has no collision body (human+0x30c = 0)')
     if d > POS_TOL:
         bad.append('the peer stands %.2f units from where its owner is' % d)
     if peer['anim'] != owner['anim']:
         bad.append('the peer shows state %d while its owner shows %d' % (peer['anim'], owner['anim']))
     if not wired:
         bad.append('the peer is not wired to the controller record the renderer/stream uses')
-    # 3: the window is a live picture of the game
-    a = capture(viewer_pid, label.split()[0].lower() + '_idle')
+    # 3: the window is a live picture of the game. TASK 45: an idle scene is a STATIC picture (the co-op
+    # camera only moves when a character does), so "two shots differ" is not a liveness test - in I100 both
+    # copies sat still and every grab was identical. Move the LOCAL character for a moment instead (the
+    # camera follows it, so a frame that still does not change is a frozen/blank capture), and keep the
+    # peer's aim stance as the advisory pose measurement of TASK 44.
+    vpipe = viewer_pipe or Pipe(viewer_pid)   # the pipe server has ONE instance: reuse the caller's
+    name = label.split()[0].lower()
+    a = capture(viewer_pid, name + '_idle')
     pad(peer_pipe, 0, LB)            # the peer's own pad: aim stance (a pose the renderer must show)
     time.sleep(1.2)
-    b = capture(viewer_pid, label.split()[0].lower() + '_stance')
+    b = capture(viewer_pid, name + '_stance')
     pad(peer_pipe, 0, 0)
-    time.sleep(1.2)
-    c = capture(viewer_pid, label.split()[0].lower() + '_idle2')
-    if not (a and b and c):
-        bad.append('no picture of the game window')
+    vpipe.cmd('pad 0 0 0 26000')     # the local character walks (stick up): the camera follows it
+    time.sleep(0.9)
+    pad(vpipe, 0, 0)
+    time.sleep(0.7)
+    c = capture(viewer_pid, name + '_walked')
+    time.sleep(1.0)
+    e = capture(viewer_pid, name + '_idle2')
+    if viewer_pipe is None:
+        vpipe.f.close()
+    if not (a and b and c and e):
+        print('  picture: not judged (no usable window grab) - the memory checks above are the verdict')
     else:
         stance = changed(a, b)
-        noise = changed(a, c)
         live = changed(a, c)
-        print('  picture: %dx%d, stance vs idle %.2f %% changed, idle vs idle (control) %.2f %% (advisory)'
-              % (a[0], a[1], stance * 100, noise * 100))
-        if live is not None and live < 0.0005:
-            bad.append('the window does not change at all between two shots (a frozen or blank picture)')
+        noise = changed(a, e)
+        print('  picture: %dx%d, walk vs idle %.2f %% changed, peer stance vs idle %.2f %% (advisory),'
+              ' idle vs idle (control) %.2f %%'
+              % (a[0], a[1], live * 100, stance * 100, noise * 100))
+        if live is not None and live < 0.005:   # a frozen frame is 0.00 %; a walking camera is many %
+            bad.append('the window does not change when the local character walks (a frozen or blank '
+                       'picture; %.2f %% changed)' % (live * 100))
     print('%s: %s%s' % (label, 'PASS -- the peer character is present in this copy\'s render world at its '
                         'streamed position and state, and the window draws' if not bad else 'FAIL -- ',
                         '; '.join(bad)))
@@ -283,8 +351,8 @@ def main():
     ok = True
     try:
         # host window: its own character is controller 0 on the host copy, the guest's is controller 1
-        ok &= check_copy('host window', hp, hv, gv, gp_pipe, 1, 0)
-        ok &= check_copy('guest window', gp, gv, hv, hp_pipe, 0, 1)
+        ok &= check_copy('host window', hp, hv, gv, gp_pipe, 1, 0, hp_pipe)
+        ok &= check_copy('guest window', gp, gv, hv, hp_pipe, 0, 1, gp_pipe)
     finally:
         try:
             pad(hp_pipe, 0, 0)

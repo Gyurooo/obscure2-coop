@@ -590,13 +590,28 @@ static void drop_remote_look(xstate *s)
 // START pulse on player 1's pad on this copy as well.
 static volatile LONG g_p2_start_edges;
 static int g_p2_start_down;
+// TASK 45: the owner's NATIVE drop-in. A world loaded from a ONE-player save has player 2 unattached and
+// the partner on the teammate AI; the game itself joins player 2 when START is pressed on the second pad.
+// The mod drops START from player 2's pad on purpose (with two players it pauses both copies or opens
+// "player 2 is leaving"), so a test needs a switch that lets the game see it: OBSCOOP_ALLOW_P2_START=1.
+static int allow_p2_start(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		char b[8];
+		v = GetEnvironmentVariableA("OBSCOOP_ALLOW_P2_START", b, sizeof b) != 0;
+	}
+	return v;
+}
+
 static void drop_remote_start(xstate *s)
 {
 	int down = (s->buttons & 0x0010) != 0;
 	if (down && !g_p2_start_down)
 		InterlockedIncrement(&g_p2_start_edges);
 	g_p2_start_down = down;
-	s->buttons &= ~0x0010;
+	if (!allow_p2_start())
+		s->buttons &= ~0x0010;
 }
 
 static volatile DWORD g_pause_pulse_until;   // host: keep START on player 1 until this tick (guest asked to pause)
