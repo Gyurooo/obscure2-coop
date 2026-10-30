@@ -7,3 +7,4 @@ __pycache__/
 tests/*.pid
 *.dll
 _archive/
+_fake/
