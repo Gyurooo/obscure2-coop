@@ -12,7 +12,7 @@ $PY -I duo_start_game.py | tail -1 | cut -c1-100
 $PY -I start_save.py "$(cat duo_host.pid)" | tail -1
 sleep 15
 RC=0
-for c in "$@"; do
+for c in "$@" check_visible.py; do
   echo "== $c"
   $PY -I "$c" "$(cat duo_host.pid)" "$(cat duo_guest.pid)" || RC=1
 done

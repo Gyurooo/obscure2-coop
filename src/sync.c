@@ -2931,6 +2931,35 @@ static void puppet_finish(unsigned ch)
 	g_pb_err_sum += err;
 	if (err > g_pb_err_max) g_pb_err_max = err;
 	InterlockedIncrement(&g_pb_err_n);
+	if (err > 1.0f) {
+		// TASK 44 diagnostic: WHAT the game's own update did to the puppet between our write of the pose
+		// and this point. Once a second, so a link that makes the game drag the character is visible in
+		// the log without swamping it.
+		static DWORD last_drift;
+		DWORD now = GetTickCount();
+		if (now - last_drift >= 1000) {
+			char tg[5];
+			float *vel = (float *)(uintptr_t)(ch + 0x294);
+			last_drift = now;
+			float sl0 = 0, sl1 = 0, sl2 = 0, pt0 = 0, pt1 = 0, pt2 = 0;
+			int ns;
+			EnterCriticalSection(&g_pb_cs);
+			ns = g_pb_n;
+			if (ns > 0) {
+				const psample *L = &g_pb[ns - 1];
+				sl0 = L->pos[0]; sl1 = L->pos[1]; sl2 = L->pos[2];
+				if (ns > 1) {
+					const psample *P = &g_pb[ns - 2];
+					pt0 = P->pos[0]; pt1 = P->pos[1]; pt2 = P->pos[2];
+				}
+			}
+			LeaveCriticalSection(&g_pb_cs);
+			logf("puppet drift %s: %.2f units; pose %.1f,%.1f,%.1f char %.1f,%.1f,%.1f state %u vel %.1f,%.1f,%.1f"
+			     " | buffered %d newest %.1f,%.1f,%.1f prev %.1f,%.1f,%.1f",
+			     tag4(rd32(ch + H_TAG), tg), err, s.pos[0], s.pos[1], s.pos[2], pos[0], pos[1], pos[2],
+			     rd32(ch + 0x2dc), vel[0], vel[1], vel[2], ns, sl0, sl1, sl2, pt0, pt1, pt2);
+		}
+	}
 	if (err > 0.05f)
 		InterlockedIncrement(&g_char_snaps);
 	puppet_write(ch, &s);

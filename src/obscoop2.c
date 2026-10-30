@@ -629,6 +629,8 @@ static void props_dump(char *reply, size_t replysz);
 static int menu_input_active(void);                    // sync.c, TASK 36: a shared menu is up (merge both pads)
 static int menu_paused(void);                          // sync.c, TASK 36: the menu stops the characters
 static void menu_status(char *reply, size_t replysz);  // sync.c, TASK 36: the menu state (pipe `menu`)
+static void screen_cmd(const char *args, char *reply, size_t replysz);  // window.c, TASK 44: pipe `screen`
+static void vmat_cmd(const char *args, char *reply, size_t replysz);     // window.c, TASK 44: pipe `vmat`
 
 
 static volatile float g_cam_yaw;
@@ -1483,6 +1485,13 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		menu_status(reply, replysz);   // TASK 36: this copy's and the peer's menu state (tests)
 	} else if (!strncmp(line, "sync", 4)) {
 		sync_status(reply, replysz);
+	} else if (!strncmp(line, "screen", 6)) {
+		// TASK 44 (test-only): the pixel the game's own camera projects this world position to, using the
+		// view/projection matrices of the last frame. check_visible.py uses it to look exactly where the
+		// peer's character must be drawn.
+		screen_cmd(line + 6, reply, replysz);
+	} else if (!strncmp(line, "vmat", 4)) {
+		vmat_cmd(line + 4, reply, replysz);   // TASK 44 diagnostic: the view/projection pairs seen last frame
 	} else if (!strncmp(line, "scene", 5)) {
 		// TASK 30: the world's scripted-event state (cutscene / FMV / scripted camera / dialog) on this copy
 		// and on the peer, plus the skip counters. Read-only; a test uses it to see both copies leave a

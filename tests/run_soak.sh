@@ -156,6 +156,8 @@ run_check() {   # label timeout script args...
 
 run_check "check_attack_anim.py" 180 "$PY" -I "$HERE/check_attack_anim.py" "$HP" "$GP"
 run_check "check_controls.py" 180 "$PY" -I "$HERE/check_controls.py" "$HP" "$GP"
+run_check "check_visible.py (the peer character is drawn)" 150 "$PY" -I "$HERE/check_visible.py" "$HP" "$GP"
+run_check "check_fight_pair.py (players attack each other)" 240 "$PY" -I "$HERE/check_fight_pair.py" "$HP" "$GP"
 run_check "soak34.py ($ITERS location changes)" 1500 "$PY" -I "$HERE/soak34.py" "$HP" "$GP" "$ITERS"
 run_check "check_doors.py --reset game3.sav" 300 "$PY" -I "$HERE/check_doors.py" "$HP" "$GP" --reset game3.sav
 
