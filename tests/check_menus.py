@@ -180,7 +180,10 @@ press(HP, 0, 'B', 0.2)
 wait_for(lambda: both(lambda m: menu_state(m) == 1), 6.0)
 show('after host B')
 
-print('\n== 6. the weapon wheel (controller+0xa4 = 3) shows on both copies from either pad')
+print('\n== 6. the per-player UI (controller+0xa4) shows on both copies from either pad')
+# TASK 43: the wheel and the aim stance are the CHARACTER'S OWN controller state, and the puppet's
+# controller does not run on the other copy any more (TASK 42) - the owner now streams the state and the
+# other copy makes the game's own HUD calls for that player, so this works again by design.
 HP.cmd('pad 0 8')          # the host's D-pad RIGHT held
 time.sleep(0.5)
 show('host pad RIGHT')
@@ -199,6 +202,25 @@ GP.cmd('pad 0 0')
 time.sleep(0.4)
 show('after release')
 results.append(check(both(lambda m: menu_state(m) == 1), 'back to normal play on both'))
+# the same per-player UI channel, the aim stance (controller+0xa4 == 1, FINDINGS_36 section 4)
+HP.cmd('pad 0 0x100')      # the host's LB held
+time.sleep(0.5)
+show('host pad LB')
+h = ui_state(H)
+g = ui_state(G)
+results.append(check(h[0] == 1 and g[0] == 1, "host's aim stance (UI 1) on both copies"))
+HP.cmd('pad 0 0')
+time.sleep(0.3)
+GP.cmd('pad 0 0x100')      # the guest's LB held
+time.sleep(0.5)
+show('guest pad LB')
+h = ui_state(H)
+g = ui_state(G)
+results.append(check(h[1] == 1 and g[1] == 1, "guest's aim stance (UI 1) on both copies"))
+GP.cmd('pad 0 0')
+time.sleep(0.4)
+show('after LB release')
+results.append(check(both(lambda m: menu_state(m) == 1), 'still normal play on both'))
 
 print('\n== 7. after the menus: the two copies are in the same state')
 show('final')

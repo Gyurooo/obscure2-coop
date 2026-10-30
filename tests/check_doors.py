@@ -285,10 +285,22 @@ def reset_level(save, lvl):
         time.sleep(0.2)
     if not left:
         print('   note: neither copy left the level within 30 s (the load may not have started)')
+    # TASK 43: "in one level" right after the load is often still the OLD world - the load tears it down a
+    # moment later. The next phase then ran while the load landed and its own door transition was replaced
+    # by the save's level (steam soak run_s43_soak_steam3: phase 2 compared the door's J000 with J002/J002,
+    # 0.5 s after the reset said "both copies in level I010"). The reset only counts when the one-level
+    # state STAYS for 2 s, i.e. when the world the save brought is up on both copies.
+    stable_since = None
     while time.time() - t0 < 90:
         if in_level(H) and in_level(G) and tag(level(H)) == tag(level(G)):
-            print('   both copies in level %s after %.1f s' % (tag(level(H)), time.time() - t0))
-            return True
+            if stable_since is None:
+                stable_since = time.time()
+            elif time.time() - stable_since >= 2.0:
+                print('   both copies in level %s after %.1f s (stable for %.1f s)'
+                      % (tag(level(H)), time.time() - t0, time.time() - stable_since))
+                return True
+        else:
+            stable_since = None
         time.sleep(0.5)
     print('   NOT back in one level after 90 s (host %s guest %s)' % (tag(level(H)), tag(level(G))))
     return False

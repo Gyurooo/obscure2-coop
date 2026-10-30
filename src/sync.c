@@ -61,6 +61,7 @@ static volatile LONG g_scene_sent, g_scene_rcv, g_scene_skips, g_scene_left, g_s
 static int scene_local_cinematic(void);
 static void scene_tick(void);
 static int door_animation_running(void);   // TASK 34: a local door use is still animating
+static void door_probe_arm(unsigned ent);  // TASK 43: watch what the game's own door transition does
 
 // Fills out with the characters in the human manager; returns how many.
 static int world_humans(unsigned *out, int max)
@@ -2532,7 +2533,7 @@ static volatile LONG g_rx_state_new;
 #define PUP_DELAY_MIN 55.0f
 #define PUP_DELAY_MAX 220.0f
 #define PUP_EXTRAP_MAX 120  // ms of dead reckoning past the newest sample
-typedef struct { DWORD t; float pos[3], dir[3], vel[3]; DWORD speed, anim; } psample;
+typedef struct { DWORD t; float pos[3], dir[3], vel[3]; DWORD speed, anim, ui, wsel; } psample;
 
 static CRITICAL_SECTION g_pb_cs;
 static psample g_pb[PBUF];        // sorted by t, oldest first
@@ -2581,6 +2582,8 @@ static void peer_on_char(const char *buf, int n)
 	memcpy(s->vel, p->vel, 12);
 	s->speed = p->speed;
 	s->anim = p->me.anim;
+	s->ui = p->ui;
+	s->wsel = p->wsel;
 	g_pb_n = i + 1;
 	while (i > 0 && (LONG)(g_pb[i - 1].t - g_pb[i].t) > 0) {   // out of order (jitter)
 		psample tmp = g_pb[i - 1];
@@ -2649,6 +2652,8 @@ static int puppet_pose(psample *out)
 				*out = *a;
 				out->anim = b->anim;   // the state the owner was in at the playback instant
 				out->speed = b->speed;
+				out->ui = b->ui;       // TASK 43: the per-player UI the owner had then
+				out->wsel = b->wsel;
 				for (int c = 0; c < 3; c++) {
 					out->pos[c] = b->pos[c] + (a->pos[c] - b->pos[c]) * k;
 					out->vel[c] = b->vel[c] + (a->vel[c] - b->vel[c]) * k;
@@ -2666,26 +2671,81 @@ static int puppet_pose(psample *out)
 	return 1;
 }
 
+// TASK 43: WHY the puppet was not driven. TASK 42 left five coherence guards in puppet_target() and one
+// dropout in the D phase ("the puppet stopped being driven and the game moved it itself", FINDINGS_42
+// section 8) with no way to tell which one fired. One counter per guard, reset by the 10 s stats line, plus
+// a WINDOW counter: if any guard rejects for longer than PUP_REJ_LOG_MS while the stream and the game are
+// live, one log line names the guard and the duration. A single rejected frame (a level change in flight)
+// is normal and stays silent.
+#define PUP_GUARDS 12
+enum {
+	PG_NO_LINK = 0, PG_NO_GAME, PG_MODE, PG_NO_WORLD, PG_WSTATE, PG_LEVEL, PG_NO_CTL, PG_NO_CHAR,
+	PG_UNWRITABLE, PG_TAG, PG_WIRING, PG_ANIM
+};
+static volatile LONG g_pup_rej[PUP_GUARDS];
+static const char *const g_pup_guard_name[PUP_GUARDS] = {
+	"no link/stream", "no game object", "game mode", "no world", "world state", "level",
+	"no controller table", "no character", "unwritable character", "character tag", "controller wiring",
+	"animation system"
+};
+
 // The character the peer drives here (0 = none). The role decides which local slot it is: the host's own
 // pad drives player 1, so the guest's character is player 2; on the guest it is the other way round.
-static unsigned puppet_target(void)
+static unsigned puppet_target_g(int *guard)
 {
+#define PUP_REJECT(gid) do { InterlockedIncrement(&g_pup_rej[(gid)]); if (guard) *guard = (gid); return 0; } while (0)
 	if (!g_role || !g_peer_ok || !g_pb_tag)
-		return 0;
+		PUP_REJECT(PG_NO_LINK);
 	// This runs from the per-character and per-controller hooks, i.e. on frames where a world is being
 	// built or torn down: every pointer is checked before it is dereferenced.
 	unsigned g = game_obj();
 	if (!g || !mem_ok((const void *)(uintptr_t)g, 0x380))
-		return 0;
+		PUP_REJECT(PG_NO_GAME);
 	if (rd32(g + 0x310) != 1)
+		PUP_REJECT(PG_MODE);
+	unsigned w = rd32(g + 0x378);
+	if (!w || !mem_ok((const void *)(uintptr_t)w, 0x1800))
+		PUP_REJECT(PG_NO_WORLD);
+	if (rd32(w + 0x11c) != 1)
+		PUP_REJECT(PG_WSTATE);   // a menu, a load, a scripted event: the game's own code owns both characters
+	if (g_pb_level && rd32(w + 4) != g_pb_level)
+		PUP_REJECT(PG_LEVEL);   // the stream is from another level (the level change is still in flight)
+	unsigned ctl = rd32(w + 0x1748);
+	if (!ctl || !mem_ok((const void *)(uintptr_t)ctl, 0x764 * 2))
+		PUP_REJECT(PG_NO_CTL);
+	unsigned ctlrec = ctl + 0x764 * (g_role == 1 ? 1 : 0);
+	unsigned ch = rd32(ctlrec + 4);
+	if (!ch || !mem_ok((const void *)(uintptr_t)ch, 0x330))
+		PUP_REJECT(PG_NO_CHAR);
+	if (IsBadWritePtr((void *)(uintptr_t)(ch + H_POS), 12))
+		PUP_REJECT(PG_UNWRITABLE);
+	if (rd32(ch + H_TAG) != g_pb_tag)
+		PUP_REJECT(PG_TAG);   // the local world's character is not the one streamed (a rebuild in progress)
+	// The character must be WIRED to that controller record (human+8 is the controller the body answers,
+	// see check_movement's wiring dump). A world that is being rebuilt has characters allocated but not
+	// yet attached; driving one of those (the state setter walks the animation list at +0x210 and the
+	// objects at +0x2bc) is how a level change would crash this copy.
+	if (rd32(ch + 8) != ctlrec)
+		PUP_REJECT(PG_WIRING);
+	if (!rd32(ch + 0x210) || !rd32(ch + 0x30c))
+		PUP_REJECT(PG_ANIM);   // no animation system yet
+	if (guard) *guard = -1;
+	return ch;
+#undef PUP_REJECT
+}
+
+// The identity of the peer's character WITHOUT the pose/state guards: the tag the peer streams decides it.
+// The controller and the movement state machine are gated on this, because a guard that fails for a
+// moment must never hand the character back to the game's own input (that is the TASK 42 dropout: the
+// refused puppet was walked by the game's controller). Writing the pose still needs puppet_target().
+static unsigned puppet_identity(void)
+{
+	unsigned g = game_obj();
+	if (!g_role || !g_peer_ok || !g_pb_tag || !g || !mem_ok((const void *)(uintptr_t)g, 0x380))
 		return 0;
 	unsigned w = rd32(g + 0x378);
 	if (!w || !mem_ok((const void *)(uintptr_t)w, 0x1800))
 		return 0;
-	if (rd32(w + 0x11c) != 1)
-		return 0;   // a menu, a load, a scripted event: the game's own code owns both characters
-	if (g_pb_level && rd32(w + 4) != g_pb_level)
-		return 0;   // the stream is from another level (the level change is still in flight)
 	unsigned ctl = rd32(w + 0x1748);
 	if (!ctl || !mem_ok((const void *)(uintptr_t)ctl, 0x764 * 2))
 		return 0;
@@ -2693,18 +2753,46 @@ static unsigned puppet_target(void)
 	unsigned ch = rd32(ctlrec + 4);
 	if (!ch || !mem_ok((const void *)(uintptr_t)ch, 0x330))
 		return 0;
-	if (IsBadWritePtr((void *)(uintptr_t)(ch + H_POS), 12))
-		return 0;
 	if (rd32(ch + H_TAG) != g_pb_tag)
-		return 0;   // the local world's character is not the one streamed (a rebuild in progress)
-	// The character must be WIRED to that controller record (human+8 is the controller the body answers,
-	// see check_movement's wiring dump). A world that is being rebuilt has characters allocated but not
-	// yet attached; driving one of those (the state setter walks the animation list at +0x210 and the
-	// objects at +0x2bc) is how a level change would crash this copy.
-	if (rd32(ch + 8) != ctlrec)
 		return 0;
-	if (!rd32(ch + 0x210) || !rd32(ch + 0x30c))
-		return 0;   // no animation system yet
+	return ch;
+}
+
+// Is any guard rejecting a live character right now? The window tracker turns "the puppet was not driven
+// for a while" into one log line with the guard's name and the duration.
+#define PUP_REJ_LOG_MS 800
+static int g_pup_rej_guard = -1;
+static int g_pup_rej_logged;
+static DWORD g_pup_rej_since;
+static DWORD g_pup_drive_since;   // last time the puppet WAS drivable
+
+static unsigned puppet_target(void)
+{
+	int gi = -1;
+	unsigned ch = puppet_target_g(&gi);
+	DWORD now = GetTickCount();
+	if (gi >= 0) {
+		if (g_pup_rej_guard != gi) {
+			g_pup_rej_guard = gi;
+			g_pup_rej_since = now;
+		} else if (now - g_pup_rej_since >= PUP_REJ_LOG_MS && g_pup_drive_since &&
+		           (LONG)(now - g_pup_drive_since) < 60000) {
+			// log once per window: the first call after the window opened logs, later ones do not
+			if (!g_pup_rej_logged) {
+				g_pup_rej_logged = 1;
+				logf("puppet: the peer's character is NOT driven for %lu ms (guard: %s)", (unsigned long)(now - g_pup_rej_since),
+				     g_pup_guard_name[gi]);
+			}
+		}
+	} else {
+		if (g_pup_rej_guard >= 0 && g_pup_rej_logged) {
+			logf("puppet: driving the peer's character again after %lu ms (was: %s)", (unsigned long)(GetTickCount() - g_pup_rej_since),
+			     g_pup_guard_name[g_pup_rej_guard]);
+		}
+		g_pup_rej_guard = -1;
+		g_pup_rej_logged = 0;
+		g_pup_drive_since = now;
+	}
 	return ch;
 }
 
@@ -2765,6 +2853,7 @@ static void puppet_anim(unsigned ch, const psample *s)
 
 // Called before the game's own character update for every human: is this the puppet, and if so put it in
 // the pose/state the owner has. Returns 1 when the update must be completed by puppet_finish.
+static void puppet_ui(unsigned ch, const psample *s);
 static int puppet_prepare(unsigned ch)
 {
 	if (ch != puppet_target())
@@ -2776,7 +2865,56 @@ static int puppet_prepare(unsigned ch)
 	}
 	puppet_anim(ch, &s);
 	puppet_write(ch, &s);
+	puppet_ui(ch, &s);
 	return 1;
+}
+
+// TASK 43: the owner's per-player UI on the other copy. The weapon wheel and the item menu are the
+// CHARACTER'S OWN controller state (controller+0xa4 = 3 / 4, FINDINGS_36 section 4) and the controller
+// update (FUN_004cf940) ends by publishing them to the HUD:
+//     FUN_00552360(character, ui == 3);      // the weapon wheel of that player
+//     FUN_00551b70(character, world+0x1790, ui == 4);   // the shared item panel, arbitrated by the game
+// (decompile 126846/126847). The puppet's controller does not run any more (TASK 42), so the owner
+// streams the state and this copy makes the same two game calls for the puppet's character: the wheel
+// panel is per player (HUD+0x88 / +0x8c) and the game itself arbitrates the shared item panel (HUD+0x90).
+// The selected weapon slot (character+0x714, the wheel's selection) is mirrored as the plain int it is.
+typedef void(__fastcall *hud_wheel_t)(void *, void *, void *, int);
+typedef void(__fastcall *hud_items_t)(void *, void *, void *, unsigned, int);
+static DWORD g_puppet_ui_done_tag, g_puppet_ui_done;
+static volatile LONG g_puppet_ui_sets;
+
+static void puppet_ui(unsigned ch, const psample *s)
+{
+	unsigned ctl = rd32(ch + 8);
+	if (!ctl || IsBadWritePtr((void *)(uintptr_t)(ctl + 0xa4), 4))
+		return;
+	unsigned want = s->ui & 7;
+	if (!IsBadWritePtr((void *)(uintptr_t)(ch + 0x714), 4) && s->wsel < 8)
+		*(DWORD *)(uintptr_t)(ch + 0x714) = s->wsel;   // the wheel's selection (a plain int)
+	if (rd32(ctl + 0xa4) != want)
+		*(DWORD *)(uintptr_t)(ctl + 0xa4) = want;
+	// The two HUD calls, only when the state changes (the panel keeps its state between frames). ECX is the
+	// HUD manager (game+0x470: +0x88 / +0x8c are the two players' wheel panels and +0x90 the shared item
+	// panel - FUN_00552440 reads the same object, decompile 206560), the character is the first argument,
+	// exactly as FUN_004cf940 calls them (126846/126847).
+	DWORD tag = rd32(ch + H_TAG);
+	if (g_puppet_ui_done_tag == tag && g_puppet_ui_done == want)
+		return;
+	unsigned g = game_obj();
+	unsigned hud = g && mem_ok((const void *)(uintptr_t)(g + 0x470), 4) ? rd32(g + 0x470) : 0;
+	if (!hud) {   // the world keeps the same object (world+0x17a0 = game+0x470, decompile 109388)
+		unsigned w = world_obj();
+		hud = w && mem_ok((const void *)(uintptr_t)(w + 0x17a0), 4) ? rd32(w + 0x17a0) : 0;
+	}
+	if (!hud || IsBadReadPtr((const void *)(uintptr_t)hud, 0x94) || !code_in_exe(0x552360) || !code_in_exe(0x551b70))
+		return;
+	unsigned w = world_obj();
+	unsigned inv = w ? rd32(w + 0x1790) : 0;
+	((hud_wheel_t)0x552360)((void *)(uintptr_t)hud, NULL, (void *)(uintptr_t)ch, want == 3);
+	((hud_items_t)0x551b70)((void *)(uintptr_t)hud, NULL, (void *)(uintptr_t)ch, inv, want == 4);
+	g_puppet_ui_done_tag = tag;
+	g_puppet_ui_done = want;
+	InterlockedIncrement(&g_puppet_ui_sets);
 }
 
 // Called after the game's own character update: the update may have moved the puppet or changed its
@@ -2807,10 +2945,28 @@ static void puppet_finish(unsigned ch)
 	InterlockedIncrement(&g_char_applied);
 }
 
+// Is this character the peer's puppet for the purpose of the CONTROLLER gate? Structural conditions only:
+// the tag the peer streams, the game mode and the world state (normal play). The pose guards (level,
+// controller wiring, animation system) are deliberately NOT part of it - when one of them fails for a
+// moment, the character must stay gated, not be handed back to the game's own input, which walks it (that
+// is the TASK 42 D-phase dropout: the refused puppet was driven by the game's controller).
+static int puppet_active(unsigned ch)
+{
+	if (!ch || ch != puppet_identity())
+		return 0;
+	unsigned g = game_obj();
+	if (!g || !mem_ok((const void *)(uintptr_t)g, 0x380) || rd32(g + 0x310) != 1)
+		return 0;
+	unsigned w = rd32(g + 0x378);
+	if (!w || !mem_ok((const void *)(uintptr_t)w, 0x1800) || rd32(w + 0x11c) != 1)
+		return 0;
+	return 1;
+}
+
 // Is this character the puppet (used by the input hook to leave its controller alone)?
 static int puppet_is(unsigned ch)
 {
-	return ch && ch == puppet_target();
+	return puppet_active(ch);
 }
 
 // ---- each copy streams the character its own pad drives -------------------------------------------
@@ -2842,6 +2998,13 @@ static void char_send_local(void)
 	p.speed = rd32(me + 0x278);
 	p.me.anim = rd32(me + 0x2dc);
 	p.me.life = rd32(me + 0x320);
+	// TASK 43: the owner's per-player UI (the wheel / item menu / aim state) and the selected slot, so the
+	// other copy shows what this player is doing (the puppet's own controller no longer runs there).
+	{
+		unsigned ctl = rd32(me + 8);
+		p.ui = ctl && mem_ok((const void *)(uintptr_t)(ctl + 0xa4), 4) ? rd32(ctl + 0xa4) : 0;
+		p.wsel = rd32(me + 0x714);
+	}
 	net_send(PKT_CHAR, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
 	InterlockedIncrement(&g_char_sent);
 }
@@ -4647,6 +4810,7 @@ static void door_watch(void)
 		memcpy(p.pos, (const void *)(uintptr_t)(cur + 0x6c), sizeof p.pos);
 	net_send(PKT_DOOR, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
 	InterlockedIncrement(&g_door_sent);
+	door_probe_arm(cur);
 	{
 		char c[5], i4[5];
 		logf("%s: used door %s id %s at level %x (ent %x): telling the peer", g_role == 2 ? "guest" : "host",
@@ -4738,6 +4902,7 @@ static void door_apply(const pkt_door *p)
 		g_door_echo_ent = e;
 		g_door_echo_until = GetTickCount() + 2500;
 		InterlockedIncrement(&g_door_applied);
+		door_probe_arm(e);
 		char c[5];
 		logf("%s: door %s (ent %x) was already used by %s here: not replayed", g_role == 2 ? "guest" : "host",
 		     tag4(best->tag, c), e, tag4(p->ch_tag, c));
@@ -4768,6 +4933,7 @@ static void door_apply(const pkt_door *p)
 	g_door_echo_ent = e;
 	g_door_echo_until = GetTickCount() + 2500;
 	InterlockedIncrement(&g_door_applied);
+	door_probe_arm(e);
 	{
 		char c[5], i4[5], t[5];
 		logf("%s: door %s id %s use replayed on ent %x for character %s", g_role == 2 ? "guest" : "host",
@@ -5027,6 +5193,7 @@ static int door_use_run(unsigned h, door_slot *best, float bd)
 	((void(__fastcall *)(void *, void *, void *))f70)((void *)(uintptr_t)e, NULL, (void *)(uintptr_t)h);
 	g_door_prev = 0;   // the watch sees this use as its own and announces it to the peer
 	InterlockedIncrement(&g_dooru_verdict);
+	door_probe_arm(e);
 	// TASK 36: FUN_0042c2b0 has an early branch (door+0x120 != 0) that only plays the "cannot use" sound and
 	// clears the user, so a use can pass the gate and still do nothing. The use is only proven by the state
 	// it leaves: door+0xc4 = the character and character+0x2bc = the door.
@@ -5281,6 +5448,62 @@ static int door_use_request(int player, char *reply, size_t replysz)
 }
 
 // Both roles, game thread: the door table and the two transition helpers.
+// TASK 43 diagnostic: what the game's own door transition does with a use. The transition lives inside the
+// door object (FUN_0042c0c0 -> FUN_0042aa70, FINDINGS_43 section 1): it needs door+0xb8 ("in use") still
+// set, door+0x24 ("enabled") still 1, the USER character's state 0x708 to end or the deadline door+0x4e to
+// pass, and then door+0x118 (the destination) to differ from the level. A use that ends without a
+// ChangeLevel is exactly the TASK 42 regression, so every CHANGE of one of those fields is one log line.
+// The probe watches one entity for 8 s after a use (its own or a replayed one) and says when it is gone.
+static unsigned g_dp_ent;
+static DWORD g_dp_until, g_dp_at;
+static DWORD g_dp_prev[8];
+
+static void door_probe_arm(unsigned ent)
+{
+	g_dp_ent = ent;
+	g_dp_at = 0;
+	g_dp_until = GetTickCount() + 8000;
+	memset(g_dp_prev, 0xff, sizeof g_dp_prev);
+}
+
+static void door_probe_tick(void)
+{
+	if (!g_dp_ent)
+		return;
+	DWORD now = GetTickCount();
+	if ((LONG)(now - g_dp_until) > 0) {
+		g_dp_ent = 0;
+		return;
+	}
+	if (g_dp_at && now - g_dp_at < 120)
+		return;
+	g_dp_at = now;
+	unsigned e = g_dp_ent, w = world_obj();
+	char t[5];
+	if (!w || IsBadReadPtr((void *)(uintptr_t)e, 0x150) || !world_has_entity(e)) {
+		logf("doorprobe %s: the door ent %x is gone 8 s watch end (level %x)", g_role == 2 ? "guest" : "host", e,
+		     w ? (unsigned)rd32(w + 4) : 0);
+		g_dp_ent = 0;
+		return;
+	}
+	unsigned u = rd32(e + 0xc4);
+	DWORD v[8];
+	v[0] = u;
+	v[1] = u && !IsBadReadPtr((void *)(uintptr_t)(u + 0x2dc), 4) ? rd32(u + 0x2dc) : 0;
+	v[2] = u && !IsBadReadPtr((void *)(uintptr_t)(u + 0x220), 4) ? rd32(u + 0x220) : 0;
+	v[3] = rd32(e + 0xb8);
+	v[4] = rd32(e + 0x24);
+	v[5] = rd32(e + 0x120);
+	v[6] = rd32(e + 0x118);
+	v[7] = rd32(w + 4);
+	if (!memcmp(v, g_dp_prev, sizeof v))
+		return;
+	memcpy(g_dp_prev, v, sizeof v);
+	logf("doorprobe %s ent %x %s: user %x state %lu clip %lu | in use %lu enabled %lu d120 %lx dest %x | level %x",
+	     g_role == 2 ? "guest" : "host", e, tag4(rd32(e + 0x10), t), v[0], (unsigned long)v[1], (unsigned long)v[2],
+	     (unsigned long)v[3], (unsigned long)v[4], (unsigned long)v[5], (unsigned)v[6], (unsigned)v[7]);
+}
+
 static void door_tick(void)
 {
 	door_ensure();
@@ -5289,13 +5512,22 @@ static void door_tick(void)
 	door_use_frame();
 	level_ask_tick();
 	host_levelask_tick();
+	door_probe_tick();
 }
 
-// The guest's own door animation is still running: do not rebuild the world under it. hk_change_level
-// clears g_door_use_at when the animation reaches its ChangeLevel, so this is only a safety net.
+// This copy's own door use is still running: do not rebuild the world under it. The window is a safety
+// net: the game clears character+0x2bc when it ends the use (FUN_0042a870) and that ends the guard at
+// once, so the 6 s cap only matters for a use that never ends. The cap must be LONGER than a real door
+// animation (measured 2.3-3.4 s on the shaped Steam link, run_s43_steam2: a 3 s cap let the guest's ask
+// cut the host's own door off at exactly 3.0 s).
 static int door_animation_running(void)
 {
-	return g_door_use_at && GetTickCount() - g_door_use_at < 3000;
+	if (!g_door_use_at || GetTickCount() - g_door_use_at >= 6000)
+		return 0;
+	unsigned h = player_human(g_role == 2 ? 1 : 0);
+	if (h && !IsBadReadPtr((const void *)(uintptr_t)(h + 0x2bc), 4) && rd32(h + 0x2bc) == 0)
+		return 0;   // the game's own use is over
+	return 1;
 }
 
 
@@ -6323,6 +6555,22 @@ static void frame_tick(void)
 				     g_pb_err_n ? g_pb_err_sum / g_pb_err_n : 0.0f, g_pb_err_max, g_pb_err_n,
 				     (long)g_pb_anim_ok, an, an ? 100.0 * (double)g_pb_anim_ok / (double)an : 0.0,
 				     g_pb_anim_sets, g_pb_under, g_pb_extrap, g_net_rtt_ms);
+				// TASK 43: which guard of puppet_target() refused this copy's puppet in the last 10 s.
+				{
+					char gs[220];
+					int l = 0;
+					gs[0] = 0;
+					for (int i = 0; i < PUP_GUARDS; i++) {
+						LONG n = InterlockedExchange(&g_pup_rej[i], 0);
+						if (!n)
+							continue;
+						l += _snprintf(gs + l, sizeof gs - l, "%s%s %ld", l ? ", " : "", g_pup_guard_name[i], (long)n);
+						if (l < 0 || l >= (int)sizeof gs)
+							break;
+					}
+					if (gs[0])
+						logf("puppet guards (last 10 s): %s", gs);
+				}
 			}
 			g_pb_err_sum = 0; g_pb_err_max = 0; g_pb_err_n = 0;
 			g_stat_sum = 0; g_stat_max = 0; g_stat_n = 0;

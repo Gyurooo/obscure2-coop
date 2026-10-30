@@ -98,6 +98,7 @@ static void host_send_progress(int force);            // sync.c
 static int guest_party_copy(unsigned level, BYTE *out);   // sync.c: the host's party table for this level
 static void game_load_tick(unsigned game);                // sync.c: a real save load, on the game thread
 static void teammate_game_guard(unsigned game, int before_update);   // sync.c (TASK 38)
+static int door_animation_running(void);                // sync.c (TASK 34/43): this copy's own door use is running
 static void host_save_include(const char *name);          // sync.c: remember the loaded file, send it to the guest
 static void host_save_forget(void);                       // sync.c: the world no longer comes from a save file
 
@@ -119,6 +120,23 @@ static int host_apply_guest_level(unsigned level, unsigned entry, unsigned flag)
 	unsigned g = *(volatile unsigned *)0x6c3068;
 	if (!g)
 		return 1;
+	// TASK 43: this copy's OWN door use is still animating, and the guest's ask must not cut it short.
+	// The peer's copy replays the same use on a PUPPET: the door's own "wait for the walk-through"
+	// (FUN_0042aa70: character+0x2dc == 0x708 && now < door+0x4e) sees the streamed state, which lags the
+	// owner's, so the door there changes the level on the very next update and the ask arrives 800 ms
+	// later - while the owner's own door is still playing. Rebuilding the world here then destroyed the
+	// door mid-use, so the host's own ChangeLevel never happened (soak34 race A of TASK 42:
+	// "the door reached its ChangeLevel: NO"). The ask is DEFERRED (return 0: the caller keeps it
+	// pending), bounded by door_animation_running's own window.
+	if (door_animation_running()) {
+		static DWORD logged_door;
+		DWORD now = GetTickCount();
+		if (!logged_door || now - logged_door > 2000) {
+			logged_door = now;
+			logf("host: the guest's ask for %s waits: this copy's own door use is still running", tag4(level, t));
+		}
+		return 0;
+	}
 	if (*(unsigned *)((BYTE *)g + 0x320) != 0) {
 		static DWORD logged;
 		if (!logged || GetTickCount() - logged > 2000) {
