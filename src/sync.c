@@ -6762,19 +6762,25 @@ static int menu_world_menu(int st)
 // at +0x84..+0x94; the ACTIVE panel keeps one cursor per player at panel+0x138 (player 1, red) and
 // panel+0x13c (player 2, blue) - measured live and in the decompile (FINDINGS_51 §1).
 // Two per-copy jobs while it is up:
-//  1. the pad-2 D-pad bindings of the panel's own binding array carry player 1's dispatch parameter in the
-//     shipped table (actions 0x1b..0x1e, pad base 0x28, param 0: measured), so either D-pad moved the red
+//  1. the pad-2 D-pad bindings of the panel's own binding array carry player 1's dispatch parameter in
+//     the shipped table (actions 0x1b..0x1e, pad base 0x28, param 0: measured), so either D-pad moved the red
 //     cursor; the stick directions in the same table DO carry param 0 / param 1, so the table is meant to be
-//     per player. Give the pad-2 D-pad bindings their own parameter (4 dwords, re-applied because the game
-//     rebuilds the array when the menu opens: repeat 500 -> 600, measured).
+//     per player. The parameter is the game's OWN menu data (menus\inventory_pc.xmc: FUN_00543710 reads
+//     offset/param from each <input> node, decompile 196429-196447), not our o2.ipt (which has no param
+//     field at all), so it can only be corrected in the built array: one scan per build, a write only
+//     where the game still has 0 (FINDINGS_52 §1).
 //  2. each cursor belongs to the copy that owns that player (host: player 1, guest: player 2). The peer's pad
 //     arrives with network jitter, so a held direction can repeat a different number of times on the two
 //     copies (measured: 0/3 -> 0/7 on the host, 0/11 on the guest for one guest DOWN). Copy the peer's OWN
-//     cursor here, so both screens show the same two cursors.
-static volatile LONG g_menu_cursors_rcv, g_menu_cursor_fixes;
+//     cursor here, so both screens show the same two cursors; this copy never writes its OWN cursor.
+static volatile LONG g_menu_cursor_w0, g_menu_cursor_w1, g_menu_bind_fixes;
 static volatile LONG g_peer_menu_tab = -1, g_peer_menu_cur0 = -1, g_peer_menu_cur1 = -1;
 static volatile DWORD g_menu_tab = (DWORD)-1;
 static volatile LONG g_menu_cur0 = -1, g_menu_cur1 = -1;
+// TASK 52: the binding array the patch was last applied to (the game rebuilds it when the menu opens).
+static unsigned g_menu_bind_obj, g_menu_bind_arr;
+static int g_menu_bind_n;
+static volatile DWORD g_menu_sent_tab = (DWORD)-1, g_menu_sent_cur0 = (DWORD)-1, g_menu_sent_cur1 = (DWORD)-1;
 
 // The active inventory tab and its two cursors (all -1 when the inventory is not open).
 static void menu_read_cursors(int *tab, int *c0, int *c1)
@@ -6804,15 +6810,25 @@ static int menu_cursor_ok(int c)
 	return c == -1 || (c >= 0 && c < 0x40);
 }
 
-static void menu_inventory_tick(void)
+static void menu_inventory_tick(int just_opened)
 {
 	unsigned g = game_obj();
 	unsigned inv = g ? rd32(g + 0x46c) : 0;
-	if (!inv)
+	if (!inv) {
+		g_menu_tab = (DWORD)-1;
+		g_menu_cur0 = -1;
+		g_menu_cur1 = -1;
 		return;
-	// 1. player 2's D-pad carries its own parameter (see above).
+	}
+	// 1. player 2's D-pad carries its own parameter (see above): one scan per built array, and a write
+	// only where the game still has 0. After that this block does nothing until the game rebuilds it.
 	unsigned n = rd32(inv + 0x48), arr = rd32(inv + 0x50);
-	if (arr && n >= 8 && n <= 0x80 && mem_ok((const void *)(uintptr_t)arr, n * 0x20)) {
+	if (arr && n >= 8 && n <= 0x80 &&
+	    (just_opened || inv != g_menu_bind_obj || arr != g_menu_bind_arr || (int)n != g_menu_bind_n) &&
+	    mem_ok((const void *)(uintptr_t)arr, n * 0x20)) {
+		g_menu_bind_obj = inv;
+		g_menu_bind_arr = arr;
+		g_menu_bind_n = (int)n;
 		LONG fixed = 0;
 		for (unsigned i = 0; i < n; i++) {
 			unsigned *bd = (unsigned *)(uintptr_t)(arr + i * 0x20);
@@ -6821,17 +6837,24 @@ static void menu_inventory_tick(void)
 				fixed++;
 			}
 		}
-		if (fixed && fixed != g_menu_cursor_fixes) {
-			g_menu_cursor_fixes = fixed;
-			logf("%s: inventory: player 2's D-pad bindings now carry their own cursor parameter (%ld bindings)",
-			     g_role == 2 ? "guest" : "host", (long)fixed);
+		if (fixed) {
+			InterlockedExchangeAdd(&g_menu_bind_fixes, fixed);
+			logf("%s: inventory: player 2's D-pad bindings now carry their own cursor parameter (%ld of %u bindings)",
+			     g_role == 2 ? "guest" : "host", (long)fixed, n);
 		}
 	}
-	// 2. mirror the peer's own cursor (the peer owns the player this copy does not drive).
+	// 2. publish this copy's cursors, then mirror the peer's OWN cursor (the peer owns the player this
+	// copy does not drive). The owner copy never writes its own cursor from the network.
 	int tab, c0, c1;
 	menu_read_cursors(&tab, &c0, &c1);
+	g_menu_tab = (DWORD)tab;
+	g_menu_cur0 = c0;
+	g_menu_cur1 = c1;
 	if (tab < 0 || (int)g_peer_menu_tab != tab || (int)g_peer_menu_state != 2)
 		return;
+	unsigned w = world_obj();
+	if (!w || (DWORD)g_peer_menu_level != rd32(w + 4))
+		return;   // the peer's cursor is from another level
 	if (!g_peer_menu_at || GetTickCount() - g_peer_menu_at > MENU_FRESH_MS)
 		return;
 	unsigned p = rd32(inv + 0x84 + 4 * tab);
@@ -6841,13 +6864,13 @@ static void menu_inventory_tick(void)
 		int want = (int)g_peer_menu_cur1;
 		if (menu_cursor_ok(want) && want != c1) {
 			*(int *)(uintptr_t)(p + 0x13c) = want;
-			InterlockedIncrement(&g_menu_cursors_rcv);
+			InterlockedIncrement(&g_menu_cursor_w1);
 		}
 	} else if (g_role == 2) {   // the host owns player 1's cursor
 		int want = (int)g_peer_menu_cur0;
 		if (menu_cursor_ok(want) && want != c0) {
 			*(int *)(uintptr_t)(p + 0x138) = want;
-			InterlockedIncrement(&g_menu_cursors_rcv);
+			InterlockedIncrement(&g_menu_cursor_w0);
 		}
 	}
 }
@@ -6884,14 +6907,17 @@ int menu_paused(void)
 // Pipe/status text (game thread values; the pipe thread reads them at its own risk, like the other dumps).
 static void menu_status(char *reply, size_t replysz)
 {
-	int st, ui0, ui1;
+	int st, ui0, ui1, tab, c0, c1;
 	menu_read(&st, &ui0, &ui1);
+	menu_read_cursors(&tab, &c0, &c1);
 	_snprintf(reply, replysz,
-	          "menu local st %d ui %d/%d seq %lu | peer st %ld ui %ld/%ld seq %ld age %lu ms | sent %ld rcv %ld pulses %ld "
-	          "correct %ld gated %ld",
-	          st, ui0, ui1, (unsigned long)g_menu_my_seq, g_peer_menu_state, g_peer_menu_ui0, g_peer_menu_ui1,
-	          g_peer_menu_seq, (unsigned long)(g_peer_menu_at ? GetTickCount() - g_peer_menu_at : 0),
-	          g_menu_sent, g_menu_rcv, g_menu_pulses, g_menu_corrections, g_menu_gated);
+	          "menu local st %d ui %d/%d tab %d cur %d/%d seq %lu | peer st %ld ui %ld/%ld tab %ld cur %ld/%ld seq %ld age %lu ms | "
+	          "sent %ld rcv %ld pulses %ld correct %ld gated %ld | cursor writes p1 %ld p2 %ld, binding fixes %ld",
+	          st, ui0, ui1, tab, c0, c1, (unsigned long)g_menu_my_seq, g_peer_menu_state, g_peer_menu_ui0,
+	          g_peer_menu_ui1, g_peer_menu_tab, g_peer_menu_cur0, g_peer_menu_cur1, g_peer_menu_seq,
+	          (unsigned long)(g_peer_menu_at ? GetTickCount() - g_peer_menu_at : 0),
+	          g_menu_sent, g_menu_rcv, g_menu_pulses, g_menu_corrections, g_menu_gated,
+	          g_menu_cursor_w0, g_menu_cursor_w1, g_menu_bind_fixes);
 }
 
 // Network thread: the peer's menu state (a convergence signal, not the data the menu is drawn from).
@@ -6936,6 +6962,15 @@ static void menu_tick(void)
 	g_menu_ui1 = ui1;
 	if (!g_peer_ok)
 		return;
+	// TASK 52: the inventory's two cursors - patch the pad-2 D-pad parameters once per built array and
+	// publish/mirror the cursors; in every other state there are no cursors to publish.
+	if (st == 2)
+		menu_inventory_tick(prev != 2);
+	else {
+		g_menu_tab = (DWORD)-1;
+		g_menu_cur0 = -1;
+		g_menu_cur1 = -1;
+	}
 	DWORD now = GetTickCount();
 	// TASK 38: player 2's START while a shared menu is up: make it a START press on player 1's pad on this
 	// copy, the same edge the host's network pulse makes there. It is an EDGE, and only while the menu
@@ -6950,7 +6985,9 @@ static void menu_tick(void)
 	// TASK 37: while EITHER copy is in a menu, both keep publishing (a menu session). That is what makes
 	// the freshness rule below possible: the copy that is back in normal play still says so every 250 ms.
 	int active = menu_world_menu(st) || ui0 >= 3 || ui1 >= 3 || menu_world_menu((int)g_peer_menu_state);
-	int changed = st != g_menu_sent_state || (DWORD)ui0 != g_menu_sent_ui0 || (DWORD)ui1 != g_menu_sent_ui1;
+	int changed = st != g_menu_sent_state || (DWORD)ui0 != g_menu_sent_ui0 || (DWORD)ui1 != g_menu_sent_ui1 ||
+	              (DWORD)g_menu_tab != g_menu_sent_tab || (DWORD)g_menu_cur0 != g_menu_sent_cur0 ||
+	              (DWORD)g_menu_cur1 != g_menu_sent_cur1;
 	if (st != prev) {   // a LOCAL change: it becomes the newest state of the pair (see g_menu_my_seq)
 		g_menu_my_seq = (g_menu_my_seq > g_menu_seen_seq ? g_menu_my_seq : g_menu_seen_seq) + 1;
 		g_menu_local_changed_at = now;
@@ -6965,12 +7002,18 @@ static void menu_tick(void)
 		p.ui1 = (DWORD)ui1;
 		p.seq = g_menu_my_seq;
 		p.owner = (DWORD)(ui0 != (int)g_menu_sent_ui0 ? 0 : (ui1 != (int)g_menu_sent_ui1 ? 1 : -1));
+		p.tab = g_menu_tab;
+		p.cur0 = (DWORD)g_menu_cur0;
+		p.cur1 = (DWORD)g_menu_cur1;
 		net_send(PKT_MENU, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
 		InterlockedIncrement(&g_menu_sent);
 		g_menu_sent_at = now;
 		g_menu_sent_state = st;
 		g_menu_sent_ui0 = (DWORD)ui0;
 		g_menu_sent_ui1 = (DWORD)ui1;
+		g_menu_sent_tab = g_menu_tab;
+		g_menu_sent_cur0 = (DWORD)g_menu_cur0;
+		g_menu_sent_cur1 = (DWORD)g_menu_cur1;
 		if (st != prev && (menu_world_menu(st) || menu_world_menu(prev)))
 			logf("%s: menu state %d -> %d (ui %d/%d, level %08lx, seq %lu)", g_role == 2 ? "guest" : "host", prev, st,
 			     ui0, ui1, (unsigned long)(w ? rd32(w + 4) : 0), (unsigned long)g_menu_my_seq);
