@@ -4579,6 +4579,7 @@ static DWORD g_scene_guard_level;
 #define SCENE_PEND_MS 10000          // how long a received leave stays armed here
 #define SCENE_SKIP_TRIES 3           // skip ladders per received leave
 #define SCENE_SKIP_GAP_MS 1200       // pause between two ladders
+#define SCENE_PAD_PULSE_MS 160       // TASK 48: one short A press (the game polls the pad every frame)
 
 typedef struct { DWORD t_ms, level, state, scene, flags, a, b, d, name4, cine; DWORD tick; } scene_info;
 
@@ -4587,9 +4588,14 @@ typedef struct { DWORD t_ms, level, state, scene, flags, a, b, d, name4, cine; D
 // TASK 34: a level load leaves world+0x12c holding the previous scene kind while world+0x11c is 0/4, so a
 // loading copy used to count as "in a cutscene". Only a level state of 6 (cinematic presentation) or a
 // scene kind inside a normal level (state 1) is a real cutscene; anything else is logged but never skipped.
+// TASK 48: state 8 is the game's own "found scene" presentation of a picked-up item (a noe scene:
+// world+0x140 holds its name, "fs_MEDI" for a medikit - OBSERVED). The level script starts it on BOTH
+// copies when an item is collected, it stops the world (the local pad no longer moves the character and a
+// frozen picture), and a player leaves it with A on a pad (OBSERVED: host pad A 8 -> 1, guest pad A
+// 8 -> 1). It is a shared presentation like a cutscene, so it is mirrored and left together.
 static int scene_cinematic(unsigned state, unsigned scene)
 {
-	if (state == 6)
+	if (state == 6 || state == 8)
 		return 1;
 	return state == 1 && scene != 0;
 }
@@ -4822,7 +4828,13 @@ static void scene_skip_begin(const char *why)
 	}
 	g_skip_step = 1;
 	g_skip_t0 = now;
-	scene_key(1);   // ESCAPE down
+	if (s.state == 8)
+		// TASK 48: the found-scene presentation of a pickup ends with A on a pad (OBSERVED), not with the
+		// cinematic's ESCAPE. A short pad pulse is the same path the menu corrections already use; it also
+		// leaves the keyboard state alone, so it can never open the pause menu.
+		menu_pulse_start(0, 0x1000, 0, SCENE_PAD_PULSE_MS);
+	else
+		scene_key(1);   // ESCAPE down
 	InterlockedIncrement(&g_scene_skips);
 }
 

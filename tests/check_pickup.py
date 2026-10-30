@@ -288,6 +288,40 @@ def runs(seq):
     return ' '.join('%s x%d' % ('%x' % v if v is not None else '-', n) for v, n in r)
 
 
+def world_state(m):
+    w = world(m)
+    return u32(m, w + 0x11c) if w else 0
+
+
+def close_found_scene(pipe, m, om, who, other_name, pl):
+    """TASK 48: a collected world item makes the game present its own "found scene" (a noe scene:
+    world+0x11c == 8, world+0x140 == "fs_<class>"), which stops that copy's world. A player closes it with
+    A on their pad (OBSERVED on both copies). The mod mirrors that press to the other copy, so ONE press
+    must leave both copies in world state 1; the check fails if they do not get there (a partner left
+    behind is frozen)."""
+    t0 = time.time()
+    while time.time() - t0 < 3 and world_state(m) != 8:
+        time.sleep(0.1)   # the peer's copy sees the same scene a few frames later
+    st, ost = world_state(m), world_state(om)
+    if st != 8 and ost != 8:
+        return True
+    print('   the game\'s found scene is up: %s state %d, %s state %d -> A on %s player %d\'s pad '
+          '(the way a player closes it)' % (who, st, other_name, ost, who, pl + 1))
+    for attempt in (1, 2, 3):
+        press(pipe, 0, 'A', 0.2)
+        t1 = time.time()
+        while time.time() - t1 < 3:
+            st, ost = world_state(m), world_state(om)
+            if st == 1 and ost == 1:
+                print('   both copies back in normal play after %.1f s' % (time.time() - t0))
+                return True
+            time.sleep(0.25)
+        print('   A attempt %d: %s state %d, %s state %d' % (attempt, who, st, other_name, ost))
+    print('   the found scene did not close on both copies (a request on the collecting copy must close it '
+          'on the peer too)')
+    return False
+
+
 def collect(phase, who, pipe, m, pl, item, other_pipe, om, other_name, hold=(), force=True):
     """Teleport `who`'s player `pl` onto `item`, press A, wait for the local collect, then the peer.
 
@@ -370,6 +404,9 @@ def collect(phase, who, pipe, m, pl, item, other_pipe, om, other_name, hold=(), 
         inv_diff('guest', raw0[1], inv_raw(mg))
     print('inventory tags host: %s' % ' '.join(inv_tags(mh)))
     print('inventory tags guest: %s' % ' '.join(inv_tags(mg)))
+    # TASK 48: the pickup's own "found scene" stops the world on both copies; close it like a player would
+    # (A on the collecting player's pad) before anything else runs, and require the peer to come back too.
+    closed = close_found_scene(pipe, m, om, who, other_name, pl)
     print('%s sync:  %s' % (who, pipe.cmd('sync')))
     print('%s sync: %s' % (other_name, other_pipe.cmd('sync')))
     a, b = pickup_stat(pipe), pickup_stat(other_pipe)
@@ -385,7 +422,7 @@ def collect(phase, who, pipe, m, pl, item, other_pipe, om, other_name, hold=(), 
     # copy may have collected it before the packet arrives -> its apply path reports 'already' instead of
     # 'applied'. Both mean the item is gone on the peer (peer_ok above reads +0xa8 there).
     r = (got and peer_ok and inventory(mh) == inventory(mg) and sent >= 1 and rcv >= 1
-         and (applied + already) >= 1 and echo == 0)
+         and (applied + already) >= 1 and echo == 0 and closed)
     results.append((phase, r))
     print('phase %s: %s' % (phase, 'OK' if r else 'FAILED'))
     ok = ok and r
