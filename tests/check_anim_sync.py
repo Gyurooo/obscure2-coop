@@ -21,6 +21,12 @@ characters on both copies every 100 ms and compares, owner vs puppet:
   * the upper clip tag and the lower clip tag (with a one-sample transition allowance),
   * that each layer's playback clock advances (not frozen) on the puppet while it advances on the owner.
 
+TASK 47: a phase that moves the owner less than MOVE_MIN units proves nothing (FINDINGS_47: the owner's
+own character stood against a wall inside the house three chained phases had walked it into - 0 units
+forward, 242 units backwards at that spot - and the FAIL said "the owner did not move", not "the clips
+disagree"). Every movement phase therefore starts on that character's open spot (open_spot: the owner's
+teleport rule from tests/tp_to_items.py) and is replayed once with the stick reversed if that way is walled.
+
 Usage: python -I check_anim_sync.py <host pid> <guest pid>
 Exit 0 = PASS, 1 = FAIL.
 """
@@ -32,15 +38,17 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bot import Pipe
 from peek import Proc
+from tp_to_items import open_spot
 
 GAME = 0x6c3068
-H_TAG, H_STATE, H_IDX_UP, H_IDX_LO, H_TAB = 0x14, 0x2dc, 0x220, 0x224, 0x210
+H_TAG, H_STATE, H_IDX_UP, H_IDX_LO, H_TAB, H_POS = 0x14, 0x2dc, 0x220, 0x224, 0x210, 0x23c
 LB, RB, A = 0x0100, 0x0200, 0x1000
 DT = 0.1
 SKEW = 1               # samples a transition may arrive late on the puppet (0.1 s + the playback delay)
 UP_OK = 0.80           # fraction of samples the upper clip tag must agree (a transition sample may miss)
 LO_OK = 0.60           # ... the lower-body clip tag (driven by the movement machine's gait direction)
 ADV_OK = 0.80          # ... of the puppet's samples where a clip's clock must have advanced
+MOVE_MIN = 20.0        # units a phase with a stick must carry the owner (a phase that moves nothing proves nothing)
 
 
 def tag4(v):
@@ -97,6 +105,9 @@ class View:
         return dict(state=self.p.u32(ch + H_STATE), up=up, upt=upt, lo=lo, lot=lot,
                     pos=struct.unpack('<2f', self.p.read(ch + 0x23c, 8)))
 
+    def position(self, ch):
+        return struct.unpack('<3f', self.p.read(ch + H_POS, 12)) if ch else None
+
 
 def main():
     host_pid, guest_pid = int(sys.argv[1]), int(sys.argv[2])
@@ -117,27 +128,64 @@ def main():
         return 2
     print('the host plays %s, the guest plays %s' % (own_h, own_g))
 
+    # TASK 47: each character's movement phases start from its own open spot (see open_spot); a phase in
+    # which the owner still does not move is replayed once with the stick reversed (walking away from the
+    # wall) - the owner's character, driven by its own pad, was standing against a wall, which says nothing
+    # about what the puppet plays.
+    SPOT = {}
+    for which, view, pipe, tag, pl in ((0, H, HP, own_h, 0), (1, G, GP, own_g, 1)):
+        pos = view.position(view.humans().get(tag, 0))
+        if not pos:
+            continue
+        spot, why = open_spot(view, pipe, pl, pos)
+        SPOT[tag] = (pl, spot)
+        print('open spot of %s (%s copy, its player %d): (%.1f, %.1f, %.1f) - %s'
+              % (tag, 'host' if which == 0 else 'guest', pl + 1, spot[0], spot[1], spot[2], why))
+
     rows = []       # (label, samples[(owner_tag, owner sample, puppet sample)])
+
+    def travel(samples):
+        """The verdict's "owner moved N units": the widest displacement of the OWNER's samples."""
+        if not samples:
+            return 0.0
+        p0 = samples[0][1]['pos']
+        return max(abs(s[1]['pos'][0] - p0[0]) + abs(s[1]['pos'][1] - p0[1]) for s in samples)
 
     def run(label, which, buttons, lx=0, ly=0, n=20):
         pipe, owner_view, peer_view = (HP, H, G) if which == 0 else (GP, G, H)
         owner_tag = own_h if which == 0 else own_g
         peer_tag = own_h if which == 0 else own_g
-        # each copy's OWN pad is XInput user 0 on its own process (src/obscoop2.c g_local_pad)
-        pipe.cmd('pad 0 %x %d %d 0 0' % (buttons, lx, ly))
-        samples = []
-        for _ in range(n):
-            time.sleep(DT)
-            o = owner_view.sample(owner_view.humans().get(owner_tag, 0))
-            p = peer_view.sample(peer_view.humans().get(peer_tag, 0))
-            samples.append((owner_tag, o, p))
-        pipe.cmd('pad 0 0 0 0 0 0')
-        rows.append((label, samples, lx != 0 or ly != 0))
-        print('-- %s (%s pad %s lx %d ly %d)' % (label, 'host' if which == 0 else 'guest', hex(buttons), lx, ly))
-        for tag, o, p in samples[:6] + samples[-2:]:
-            print('   %s owner st %-4s up %-4s t %-6s lo %-4s t %-6s | puppet st %-4s up %-4s t %-6s lo %-4s t %-6s'
-                  % (tag, o['state'], tag4(o['up']), o['upt'], tag4(o['lo']), o['lot'],
-                     p['state'], tag4(p['up']), p['upt'], tag4(p['lo']), p['lot']))
+        moving = lx != 0 or ly != 0
+        for attempt in (1, 2):
+            if moving and owner_tag in SPOT:
+                pl, spot = SPOT[owner_tag]
+                reply = pipe.cmd('tp %d %.2f %.2f %.2f' % (pl, spot[0], spot[1], spot[2]))
+                if not reply.startswith('ok'):
+                    print('   %s: could not stand on the open spot (%s), the phase starts where it is'
+                          % (label, reply))
+            print('-- %s (%s pad %s lx %d ly %d)%s'
+                  % (label, 'host' if which == 0 else 'guest', hex(buttons), lx, ly,
+                     '' if attempt == 1 else ' [replayed: the way out of the spot was walled]'))
+            # each copy's OWN pad is XInput user 0 on its own process (src/obscoop2.c g_local_pad)
+            pipe.cmd('pad 0 %x %d %d 0 0' % (buttons, lx, ly))
+            samples = []
+            for _ in range(n):
+                time.sleep(DT)
+                o = owner_view.sample(owner_view.humans().get(owner_tag, 0))
+                p = peer_view.sample(peer_view.humans().get(peer_tag, 0))
+                samples.append((owner_tag, o, p))
+            pipe.cmd('pad 0 0 0 0 0 0')
+            for tag, o, p in samples[:6] + samples[-2:]:
+                print('   %s owner st %-4s up %-4s t %-6s lo %-4s t %-6s | puppet st %-4s up %-4s t %-6s lo %-4s t %-6s'
+                      % (tag, o['state'], tag4(o['up']), o['upt'], tag4(o['lo']), o['lot'],
+                         p['state'], tag4(p['up']), p['upt'], tag4(p['lo']), p['lot']))
+            moved = travel(samples)
+            if not moving or moved >= MOVE_MIN or attempt == 2:
+                break
+            print('   the owner moved only %.1f units this way: walled, walking the other way' % moved)
+            lx, ly = -lx, -ly
+            time.sleep(0.4)
+        rows.append((label, samples, moving))
         time.sleep(0.4)   # back to rest between phases
 
     run('walk', 0, 0, 0, 24000)
@@ -208,7 +256,7 @@ def main():
         # a phase in which the owner did not actually move proves nothing (a character stuck in a combat
         # state stands in the same clip on both copies and would "agree" perfectly) - measured: the
         # check_controls run right after a stuck swing phase saw BOY1 travel 0.0 units
-        ok = up >= UP_OK and lo >= LO_OK and upd >= ADV_OK and lod >= ADV_OK and seen and (moved >= 20.0 or not moving)
+        ok = up >= UP_OK and lo >= LO_OK and upd >= ADV_OK and lod >= ADV_OK and seen and (moved >= MOVE_MIN or not moving)
         if not ok:
             rc = 1
         print('%-10s upper clip %3.0f%%  lower clip %3.0f%%  upper plays %3.0f%%  lower plays %3.0f%%  '

@@ -291,6 +291,44 @@ def gate_teleport(pid, pl, x, y, z=None, radius=DEFAULT_RADIUS, verbose=True, st
                 room=room, tp_reply=reply, standing=held, worst=worst)
 
 
+def open_spot(m, pipe, pl, here=None):
+    """A place this player's character can be put before a pad/movement test (TASK 47).
+
+    The spot is the character's own position when that passes room_verdict (one live item, no enemy, no
+    spawner within DEFAULT_RADIUS - the same rule gate_teleport applies), else the nearest live item that
+    passes; the character is put there with the mod's own safe `tp`. Returns (spot, why).
+
+    Why a test needs it: a character the previous phase left against a wall stood still while its pad read
+    `ly 24000` (FINDINGS_47: 0.0 units forward, 242.2 units backwards at that spot, the same aim stance
+    moving 100 units sideways), which reads as "the pad does not drive the character" but is the level."""
+    m = getattr(m, 'p', m)                     # a peek.Proc, or a check's View wrapping one
+    here = tuple(here or player_pos(m, pl) or (0, 0, 0))
+    room = scan_room(m, here, DEFAULT_RADIUS, verbose=False)
+    ok, why = room_verdict(room)
+    if not ok and not room['enemies'] and not room['spawners']:
+        # the ITEM part of the rule is for teleporting INTO a room to loot it; a movement phase only needs
+        # room and no enemy, and the character's own spot is reachable by definition (measured: save 01 in
+        # I100 has no live collectable item within 400 units of the spawn, room_verdict's only objection)
+        ok = True
+        why = ('no enemy and no spawner within %.0f (no live item here: that part of the rule is for loot '
+               'rooms)' % DEFAULT_RADIUS)
+    spot = here
+    if not ok:
+        cands = sorted(scan_room(m, here, 1e9, verbose=False)['near_items'], key=lambda r: r['d3'])
+        for c in cands[:6]:
+            good, why2 = room_verdict(scan_room(m, c['pos'], DEFAULT_RADIUS, verbose=False))
+            if good:
+                spot = tuple(c['pos'])
+                why = 'the current spot fails (%s); the nearest live item passes (%s)' % (why, why2)
+                break
+        else:
+            why = 'no spot passes the rule (%s); keeping the current position' % why
+    reply = pipe.cmd('tp %d %.2f %.2f %.2f' % (pl, spot[0], spot[1], spot[2]))
+    why += ' | safe tp: %s' % reply
+    time.sleep(0.4)
+    return spot, why
+
+
 def main(argv):
     if len(argv) < 4:
         print(__doc__)

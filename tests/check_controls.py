@@ -22,7 +22,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bot import Pipe
 from peek import Proc
-from tp_to_items import level, player_human, player_pos, tag, u32, world
+from tp_to_items import level, open_spot, player_human, player_pos, tag, u32, world
 
 GAME = 0x6c3068
 MOVE_MIN = 20.0
@@ -97,8 +97,21 @@ def positions(m):
     return {0: player_pos(m, 0), 1: player_pos(m, 1)}
 
 
-def move(pipe, user, secs):
-    pipe.cmd('pad %d 0 0 30000' % user)
+def move(pipe, user, pl, secs, ly=30000):
+    # TASK 47: start on the character's open spot (tests/tp_to_items.py open_spot, the owner's teleport
+    # rule). A character the previous phase left against a wall does not move for its pad at all
+    # (FINDINGS_47: 0.0 units forward, 242.2 backwards at the same spot), which would read as a wiring bug.
+    # `ly` is signed: the second attempt walks the other way when the way forward is walled (run 47 proof 2
+    # read 0.8 units twice for the guest at (-520.8, -79.0)).
+    spot = SPOT.get(pl)
+    if spot:
+        try:
+            r = pipe.cmd('tp %d %.2f %.2f %.2f' % (pl, spot[0], spot[1], spot[2]))
+            if not r.startswith('ok'):
+                print('   could not stand on the open spot (%s), the phase starts where it is' % r)
+        except OSError as e:
+            print('   open spot teleport: %s' % e)
+    pipe.cmd('pad %d 0 0 %d' % (user, ly))
     time.sleep(secs / 2.0)
     # what each side sees while the stick is held: the pad this PC reads, and what the other copy feeds
     for name, p, u in (('host', HP, 0), ('guest', GP, 1)):
@@ -159,6 +172,15 @@ if wh[0][0] == wh[1][0] or wg[0][0] == wg[1][0]:
     sys.exit(1)
 
 ok = []
+SPOT = {}
+for by, pl, m, pipe in (('host', 0, H, HP), ('guest', 1, G, GP)):
+    try:
+        spot, why = open_spot(m, pipe, pl)
+        SPOT[pl] = spot
+        print('open spot of %s player %d: (%.1f, %.1f, %.1f) - %s'
+              % (by, pl + 1, spot[0], spot[1], spot[2], why))
+    except OSError as e:
+        print('open spot of %s player %d: %s (the phases start where the character is)' % (by, pl + 1, e))
 for by, pl in (('host', 0), ('guest', 1)):
     pipe = HP if by == 'host' else GP
     other = 1 - pl
@@ -169,10 +191,11 @@ for by, pl in (('host', 0), ('guest', 1)):
     for attempt in (1, 2):
         t = None if attempt == 1 else wait_normal(25)
         if attempt == 2:
-            print('   the world was not in normal play (or nothing moved): waited %s s, driving again' % (
-                ('%.1f' % t) if t is not None else 'NO'))
+            print('   the world was not in normal play (or nothing moved): waited %s s, driving the other '
+                  'way (the forward direction from the open spot is walled)' % (
+                      ('%.1f' % t) if t is not None else 'NO'))
         b0, b1 = positions(H), positions(G)
-        move(pipe, 0, STICK_MS / 1000.0)
+        move(pipe, 0, pl, STICK_MS / 1000.0, 30000 if attempt == 1 else -30000)
         a0, a1 = positions(H), positions(G)
         dh = [dist(b0[i], a0[i]) for i in (0, 1)]
         dg = [dist(b1[i], a1[i]) for i in (0, 1)]
