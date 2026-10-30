@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 25   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 26   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -78,6 +78,10 @@
                         //     feeds hands into every character (the host's stale view overwrote the guest's
                         //     own GIR1 86 times in the 2.0 playtest). The receiver applies them to its puppet
                         //     only, through the game's equip path (FINDINGS_50).
+                        // 26: TASK 51, the inventory's TWO CURSORS: PKT_MENU also carries the inventory tab and
+                        //     the two player cursors (tab panel +0x138/+0x13c). Each copy keeps its own player's
+                        //     cursor authoritative (host: cursor 0, guest: cursor 1) and mirrors the peer's
+                        //     other one, so both screens show both cursors at the same items (FINDINGS_51).
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,
@@ -195,7 +199,12 @@ typedef struct { pkt_hdr h; DWORD kind; DWORD level, entry, flag; } pkt_levelask
 // the player whose UI state changed last (0/1, or -1 when only the world state did). The pads normally carry a
 // menu open/close on both copies by themselves; this packet repairs the case where one copy did not see the
 // input (a lost pad packet, a load in between), by pulsing the same button on the other copy.
-typedef struct { pkt_hdr h; DWORD level; DWORD state, ui0, ui1; DWORD owner; DWORD seq; } pkt_menu;
+// TASK 51: tab/cur0/cur1 are the inventory's current tab (game+0x46c, +0x98) and the two player cursors
+// (tab panel +0x138 / +0x13c). Each cursor belongs to the copy that owns that player (host: cursor 0,
+// guest: cursor 1); the receiver copies the peer's OWN cursor, so both screens show the same two cursors
+// even when the remote pad's jitter makes the two copies count a held direction differently.
+typedef struct { pkt_hdr h; DWORD level; DWORD state, ui0, ui1; DWORD owner; DWORD seq;
+                 DWORD tab, cur0, cur1; } pkt_menu;
 #pragma pack(pop)
 
 static void guest_on_state(const char *buf, int n);

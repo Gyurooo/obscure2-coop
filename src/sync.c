@@ -6757,15 +6757,121 @@ static int menu_world_menu(int st)
 	return st == 2 || st == 5;
 }
 
-// Called from XInputGetState (obscoop2.c) on every poll: is a menu up, so the two pads must be merged?
-// Only the two SHARED menus (inventory 2, pause 5) merge the pads: the wheel and the item menu are one
-// player's own (and last a button hold), so merging there could hand one player's A to the other player's
-// character during normal play.
+// ---- TASK 51: the inventory's two cursors --------------------------------------------------------------
+// The inventory (state 2) is CMenuInventory at game+0x46c. Its tab index is +0x98 and the five tab panels are
+// at +0x84..+0x94; the ACTIVE panel keeps one cursor per player at panel+0x138 (player 1, red) and
+// panel+0x13c (player 2, blue) - measured live and in the decompile (FINDINGS_51 §1).
+// Two per-copy jobs while it is up:
+//  1. the pad-2 D-pad bindings of the panel's own binding array carry player 1's dispatch parameter in the
+//     shipped table (actions 0x1b..0x1e, pad base 0x28, param 0: measured), so either D-pad moved the red
+//     cursor; the stick directions in the same table DO carry param 0 / param 1, so the table is meant to be
+//     per player. Give the pad-2 D-pad bindings their own parameter (4 dwords, re-applied because the game
+//     rebuilds the array when the menu opens: repeat 500 -> 600, measured).
+//  2. each cursor belongs to the copy that owns that player (host: player 1, guest: player 2). The peer's pad
+//     arrives with network jitter, so a held direction can repeat a different number of times on the two
+//     copies (measured: 0/3 -> 0/7 on the host, 0/11 on the guest for one guest DOWN). Copy the peer's OWN
+//     cursor here, so both screens show the same two cursors.
+static volatile LONG g_menu_cursors_rcv, g_menu_cursor_fixes;
+static volatile LONG g_peer_menu_tab = -1, g_peer_menu_cur0 = -1, g_peer_menu_cur1 = -1;
+static volatile DWORD g_menu_tab = (DWORD)-1;
+static volatile LONG g_menu_cur0 = -1, g_menu_cur1 = -1;
+
+// The active inventory tab and its two cursors (all -1 when the inventory is not open).
+static void menu_read_cursors(int *tab, int *c0, int *c1)
+{
+	int t = -1, a = -1, b = -1;
+	unsigned g = game_obj();
+	unsigned inv = g ? rd32(g + 0x46c) : 0;
+	if (inv) {
+		unsigned ti = rd32(inv + 0x98);
+		if (ti < 5) {
+			unsigned p = rd32(inv + 0x84 + 4 * ti);
+			if (p && mem_ok((const void *)(uintptr_t)p, 0x160)) {
+				t = (int)ti;
+				a = (int)rd32(p + 0x138);
+				b = (int)rd32(p + 0x13c);
+			}
+		}
+	}
+	*tab = t;
+	*c0 = a;
+	*c1 = b;
+}
+
+// A cursor is a grid cell index (0..0x2f seen live) or -1 when that player is not in the game.
+static int menu_cursor_ok(int c)
+{
+	return c == -1 || (c >= 0 && c < 0x40);
+}
+
+static void menu_inventory_tick(void)
+{
+	unsigned g = game_obj();
+	unsigned inv = g ? rd32(g + 0x46c) : 0;
+	if (!inv)
+		return;
+	// 1. player 2's D-pad carries its own parameter (see above).
+	unsigned n = rd32(inv + 0x48), arr = rd32(inv + 0x50);
+	if (arr && n >= 8 && n <= 0x80 && mem_ok((const void *)(uintptr_t)arr, n * 0x20)) {
+		LONG fixed = 0;
+		for (unsigned i = 0; i < n; i++) {
+			unsigned *bd = (unsigned *)(uintptr_t)(arr + i * 0x20);
+			if (bd[6] == 0x28 && bd[0] >= 0x1b && bd[0] <= 0x1e && bd[7] == 0) {
+				bd[7] = 1;
+				fixed++;
+			}
+		}
+		if (fixed && fixed != g_menu_cursor_fixes) {
+			g_menu_cursor_fixes = fixed;
+			logf("%s: inventory: player 2's D-pad bindings now carry their own cursor parameter (%ld bindings)",
+			     g_role == 2 ? "guest" : "host", (long)fixed);
+		}
+	}
+	// 2. mirror the peer's own cursor (the peer owns the player this copy does not drive).
+	int tab, c0, c1;
+	menu_read_cursors(&tab, &c0, &c1);
+	if (tab < 0 || (int)g_peer_menu_tab != tab || (int)g_peer_menu_state != 2)
+		return;
+	if (!g_peer_menu_at || GetTickCount() - g_peer_menu_at > MENU_FRESH_MS)
+		return;
+	unsigned p = rd32(inv + 0x84 + 4 * tab);
+	if (!p || !mem_ok((const void *)(uintptr_t)p, 0x160))
+		return;
+	if (g_role == 1) {   // the guest owns player 2's cursor
+		int want = (int)g_peer_menu_cur1;
+		if (menu_cursor_ok(want) && want != c1) {
+			*(int *)(uintptr_t)(p + 0x13c) = want;
+			InterlockedIncrement(&g_menu_cursors_rcv);
+		}
+	} else if (g_role == 2) {   // the host owns player 1's cursor
+		int want = (int)g_peer_menu_cur0;
+		if (menu_cursor_ok(want) && want != c0) {
+			*(int *)(uintptr_t)(p + 0x138) = want;
+			InterlockedIncrement(&g_menu_cursors_rcv);
+		}
+	}
+}
+
+// Called from XInputGetState (obscoop2.c) on every poll: is a menu up, so both pads must reach the game?
+// Only the two SHARED menus (inventory 2, pause 5) feed the pads while they are up: the wheel and the item
+// menu are one player's own (and last a button hold), so feeding there could hand one player's A to the
+// other player's character during normal play.
 int menu_input_active(void)
 {
 	if (g_role == 0 || !g_peer_ok)
 		return 0;   // solo / no link: each pad stays its own
 	return menu_world_menu((int)g_menu_state);
+}
+
+// TASK 51: the inventory menu (world state 2) draws ONE cursor per player and keeps them apart itself:
+// CMenuInventory's own binding array (read live from game+0x46c, FINDINGS_51) holds actions 1..4 (directions),
+// 9 and 10 (A/B) twice - once with pad base 0 and cursor parameter 0, once with pad base 0x28 and cursor
+// parameter 1 - and its tab panels keep the two cursors at +0x138 (player 1) and +0x13c (player 2). So while
+// it is up each pad must reach the game as its own pad; merging them (TASK 36) is what makes either pad move
+// BOTH cursors (the owner's bug). The pause menu keeps the merged pad: it has a single cursor.
+int menu_pads_separate(void)
+{
+	return (int)g_menu_state == 2;
 }
 
 // Called from XInputGetState: may the merged pad also move the CHARACTER? Only in the paused menu states;
@@ -6799,6 +6905,9 @@ static void peer_on_menu(const char *buf, int n)
 	g_peer_menu_ui1 = (LONG)p->ui1;
 	g_peer_menu_level = (LONG)p->level;
 	g_peer_menu_seq = (LONG)p->seq;
+	g_peer_menu_tab = (LONG)p->tab;
+	g_peer_menu_cur0 = (LONG)p->cur0;
+	g_peer_menu_cur1 = (LONG)p->cur1;
 	g_peer_menu_at = GetTickCount();
 	InterlockedIncrement(&g_menu_rcv);
 }

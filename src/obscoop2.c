@@ -641,7 +641,8 @@ static void net_rx_drop_set(DWORD ms);   // net.c: test-only receive-only drop (
 static void sync_status(char *reply, size_t replysz);
 static void scene_status(char *reply, size_t replysz);   // sync.c, TASK 30
 static void props_dump(char *reply, size_t replysz);
-static int menu_input_active(void);                    // sync.c, TASK 36: a shared menu is up (merge both pads)
+static int menu_input_active(void);                    // sync.c, TASK 36: a shared menu is up (feed both pads)
+static int menu_pads_separate(void);                   // sync.c, TASK 51: the inventory has one cursor per pad
 static int menu_paused(void);                          // sync.c, TASK 36: the menu stops the characters
 static void menu_status(char *reply, size_t replysz);  // sync.c, TASK 36: the menu state (pipe `menu`)
 static void screen_cmd(const char *args, char *reply, size_t replysz);  // window.c, TASK 44: pipe `screen`
@@ -833,8 +834,8 @@ static void menu_pulse_apply(DWORD user, xstate *s)
 
 static void menu_merge(DWORD user, xstate *s)
 {
-	if (user > 1 || !menu_input_active())
-		return;
+	if (user > 1 || !menu_input_active() || menu_pads_separate())
+		return;   // TASK 51: while the inventory is up each pad drives only its OWN cursor (see sync.c)
 	int other = 1 - (int)user;
 	DWORD at = g_last_ret_at[other];
 	if (!at || GetTickCount() - at > 250)
