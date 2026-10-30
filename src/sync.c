@@ -2548,7 +2548,7 @@ static volatile LONG g_rx_state_new;
 #define PUP_DELAY_MAX 220.0f
 #define PUP_EXTRAP_MAX 120  // ms of dead reckoning past the newest sample
 typedef struct { DWORD t; float pos[3], dir[3], vel[3]; DWORD speed, anim, ui, wsel;
-                 float intent[3]; DWORD wanted, ev_seq, ev_val[4], gait; } psample;
+                 float intent[3]; DWORD wanted, ev_seq, ev_val[4], gait, up; } psample;   // up: the owner's upper clip tag (TASK 49)
 
 static CRITICAL_SECTION g_pb_cs;
 static psample g_pb[PBUF];        // sorted by t, oldest first
@@ -2604,6 +2604,7 @@ static void peer_on_char(const char *buf, int n)
 	s->ev_seq = p->ev_seq;
 	memcpy(s->ev_val, p->ev_val, sizeof s->ev_val);
 	s->gait = p->gait;
+	s->up = p->up;
 	g_pb_n = i + 1;
 	while (i > 0 && (LONG)(g_pb[i - 1].t - g_pb[i].t) > 0) {   // out of order (jitter)
 		psample tmp = g_pb[i - 1];
@@ -2678,6 +2679,7 @@ static int puppet_pose(psample *out)
 				out->ev_seq = b->ev_seq;                              // ... and the state changes then
 				memcpy(out->ev_val, b->ev_val, sizeof out->ev_val);
 				out->gait = b->gait;
+				out->up = b->up;   // TASK 49: ... and the clip being played then
 				for (int c = 0; c < 3; c++) {
 					out->pos[c] = b->pos[c] + (a->pos[c] - b->pos[c]) * k;
 					out->vel[c] = b->vel[c] + (a->vel[c] - b->vel[c]) * k;
@@ -2951,6 +2953,60 @@ static void puppet_gait(unsigned ch, const psample *s)
 		((char_gait_t)set)((void *)(uintptr_t)ch, NULL, s->gait);
 }
 
+// ---- TASK 49: the OWNER'S CLIP on the puppet, and the attack that must not run here ----------------
+// The state id does not name the clip: for a hit the game (FUN_004e2fa0 = CCharacterHuman vtable slot
+// 0x50) applies the damage and then plays HIT1/HIT2 (state 1), HIT7/HIT8 (state 300), HIT5 (0x259),
+// HI20 (0x12d) or LJBA (0x12e) by the hit kind and the direction the hit came from, and a thrown
+// weapon's attack clip comes from the weapon object. This copy has neither the hit kind nor the throw,
+// so the state alone leaves the puppet on the setter's generic clip. TASK 49 streams the clip the
+// owner is playing (pkt_char.up) and plays it here through the game's own clip call (vtable slot 0x68 =
+// FUN_004c74e0: find the tag in the character's animation table, start it, return the index the setter
+// then stores in +0x220). Only called when the tag differs from the last one played for this character,
+// so the game's own animation clock keeps running (FINDINGS_49 section 5).
+typedef int(__fastcall *char_clip_t)(void *, void *, DWORD, int, int, float);
+static DWORD g_pb_clip_tag, g_pb_clip_val;
+static volatile LONG g_pb_clips;
+
+// loop: the setter's own argument for this clip (-1 idle/walk/run/aim/stance, 1 the one-shot reaction and
+// death clips - decompile 138xxx case 0/1/2/4/5/700 pass exactly that).
+static void puppet_clip(unsigned ch, DWORD tag, int once)
+{
+	if (!tag || IsBadReadPtr((const void *)(uintptr_t)ch, 0x230))
+		return;
+	DWORD who = rd32(ch + H_TAG);
+	if (who != g_pb_clip_tag) {   // another character: start from now
+		g_pb_clip_tag = who;
+		g_pb_clip_val = 0;
+	}
+	if (tag == g_pb_clip_val)
+		return;
+	unsigned vt = rd32(ch), fn = vt ? rd32(vt + 0x68) : 0;
+	if (!fn || !code_in_exe(fn))
+		return;
+	int idx = ((char_clip_t)fn)((void *)(uintptr_t)ch, NULL, tag, once ? 1 : -1, 0, 1.0f);
+	g_pb_clip_val = tag;
+	if (idx >= 0 && !IsBadWritePtr((void *)(uintptr_t)(ch + 0x220), 4)) {
+		*(DWORD *)(uintptr_t)(ch + 0x220) = (DWORD)idx;   // what the setter does with the index
+		InterlockedIncrement(&g_pb_clips);
+	}
+}
+
+// The reaction states: the game plays their clip ONCE (decompile case 5 passes 1, case 700 passes 1).
+static int puppet_react(DWORD st)
+{
+	return st == 5 || st == 700;
+}
+
+// The attack states. Their setter path (case 200, decompile 138421..138512) is what made the guest's copy
+// FIGHT: in the TASK 49 test run the puppet's DYNA attack on the guest exploded a real dynamite there and
+// took 93.8 life off BOY1 and 99.2 off GIR1, while the host's copy lost 29.7 / 18.0 - the same blast,
+// simulated twice, and (the 2.0 playtest) the guest's game died in it. The authority is the owner's copy;
+// here the puppet only shows the clip the owner played.
+static int puppet_attack(DWORD st)
+{
+	return st == 200 || st == 300;
+}
+
 // ---- TASK 46: the owner's state changes as EVENTS (Obscure 1 `host_record_wanted`) -----------------
 // A swing, an item use or a climb start can last less than one 16 ms stream interval, so streaming the
 // current state alone loses it and the receiver never plays that clip. Each copy records every CHANGE of
@@ -3069,11 +3125,17 @@ static int puppet_prepare(unsigned ch)
 		// state setter here too would race the machine's own transition.
 		if (!IsBadWritePtr((void *)(uintptr_t)(ch + 0x2e8), 4))
 			*(DWORD *)(uintptr_t)(ch + 0x2e8) = want;
+	} else if (puppet_attack(want)) {
+		// TASK 49: the attack states show the owner's clip but must not RUN the attack on this copy (its
+		// setter path launched a real dynamite here - see puppet_attack). The state id stays, so every
+		// other reader of +0x2dc sees what the owner is doing; the clip is the owner's own.
+		// EXPERIMENT chk49c: nothing at all (state and clip untouched)
 	} else {
 		// an action state (the aim stance included - its machine path is the one TASK 42 gated), or the
 		// way back from one: the game's own state setter
 		puppet_anim(ch, want);
 		puppet_gait(ch, &s);   // ... and its lower-body layer follows the owner's gait
+		puppet_clip(ch, s.up, puppet_react(want));   // TASK 49: ... and the clip the owner plays
 	}
 	puppet_write(ch, &s, 1);   // TASK 45: through SetPosition, so the collision body follows
 	puppet_ui(ch, &s);
@@ -3272,6 +3334,15 @@ static void char_send_local(void)
 	memcpy(p.intent, (const void *)(uintptr_t)(me + 0x288), sizeof p.intent);
 	p.wanted = rd32(me + 0x2dc);
 	p.gait = rd32(me + 0x2e0);
+	// TASK 49: the CLIP the owner's upper layer is playing (animtable[+0x220]+0xc), the tag the game's
+	// own clip call takes. The receiver plays it on the puppet in the states where the id alone does not
+	// name the clip (a hit reaction, a throw) - see puppet_clip.
+	{
+		unsigned tab = rd32(me + 0x210);
+		LONG idx = (LONG)rd32(me + 0x220);
+		p.up = (tab && idx >= 0 && idx < 0x1000 && mem_ok((const void *)(uintptr_t)(tab + idx * 0x28), 0x28))
+			? rd32(tab + idx * 0x28 + 0xc) : 0;
+	}
 	p.ev_seq = (DWORD)g_ev_host.seq;
 	for (int i = 0; i < EV_KEEP; i++)
 		p.ev_val[i] = g_ev_host.val[i];
@@ -3588,6 +3659,46 @@ static unsigned g_wep_seen[MAX_CH][4], g_wep_seen_cur[MAX_CH];   // guest: what 
 static DWORD g_wep_at[MAX_CH][4];                                // guest: and when, to retry a failure later
 
 // Makes one character's four live slots and the selected slot match the host's.
+// TASK 49: a THROWABLE weapon object is a LIVE EXPLOSIVE. The class the entity factory builds for a
+// dynamite tag (FUN_0048d830, 0x248 bytes, factory branch 0x44594e41 in FUN_0045cdd0) is updated by
+// FUN_0048e3f0, which ticks its fuse (+0x244) and calls the BLAST FUN_0048df50 once +0x240 (the fuse
+// state) is 1 and the timer passes 5000 ms (decompile 139xxx: `if ((5000 < in_ECX[0x91]) ...)
+// FUN_0048df50();`). FUN_0048df50 hits every human within radius with
+// `slot 0x50(pos, 300, damage, 10)` - the measured guest hit `kind 300 damage 101.8 ... from +0x8e237`.
+// On the guest the object the mod put in the PUPPET's hand came up armed and blew up in the hand ~5 s
+// after the equip, killing both characters on this copy while the host's copy had taken 34.7 / 21.9
+// (FINDINGS_49 4.1) and then hanging the game thread. The hand only has to SHOW the host's weapon here,
+// so the fuse of the puppet's throwable is kept clear; the guest's OWN character is left alone (its game
+// owns its throws).
+static int throwable_tag(unsigned t)
+{
+	return t == 0x44594e41u || t == 0x464c4247u;   // DYNA and FLBG: the two tags FUN_004b0300 fills from
+	                                               // the inventory count (decompile 106621/106623)
+}
+static volatile LONG g_fuse_cleared;
+
+static void puppet_disarm(unsigned h)
+{
+	if (!puppet_active(h))
+		return;
+	unsigned sel = rd32(h + 0x714);
+	if (sel >= 4)
+		return;
+	unsigned wp = rd32(h + 0x704 + 4 * sel);
+	if (!wp || IsBadReadPtr((const void *)(uintptr_t)wp, 0x248) || !throwable_tag(rd32(wp + 0x10)))
+		return;
+	unsigned st = rd32(wp + 0x240), ms = rd32(wp + 0x244);
+	if (!st && !ms)
+		return;
+	*(DWORD *)(uintptr_t)(wp + 0x240) = 0;   // the fuse state (1 = lit)
+	*(DWORD *)(uintptr_t)(wp + 0x244) = 0;   // the fuse timer
+	if (InterlockedIncrement(&g_fuse_cleared) <= 5) {
+		char t[5];
+		logf("guest: cleared the fuse of the puppet's %s (state %u, %u ms): the hand only shows the weapon",
+			tag4(rd32(wp + 0x10), t), st, ms);
+	}
+}
+
 static void weapons_for(int k, unsigned h, const ch_state *c)
 {
 	static const BYTE p_equip[6] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x0c };
@@ -3595,6 +3706,7 @@ static void weapons_for(int k, unsigned h, const ch_state *c)
 	int same = 1;
 	if (IsBadReadPtr((const void *)(uintptr_t)h, 0x718))
 		return;
+	puppet_disarm(h);   // TASK 49: never let a throwable detonate in the puppet's hand on this copy
 	for (int s = 0; s < 4; s++) {
 		unsigned wp = rd32(h + 0x704 + 4 * s);
 		got[s] = wp ? rd32(wp + 0x10) : 0;
@@ -3744,7 +3856,25 @@ static void guest_apply_state(void)
 					}
 				}
 			}
-			*(DWORD *)(uintptr_t)(hs[k] + 0x320) = st.ch[i].life;   // health stays host-owned (damage is applied there)
+			// TASK 49: the host's life goes through the character's OWN life method (vtable slot 9 =
+			// FUN_004da180: adds the delta, clamps at the maximum, and enters state 5 when the life runs
+			// out - the death the raw write never played). Obscure 1 `sync_life` applies hp through the
+			// same kind of entry (AddLife, slot 6) "so hit reactions and deaths play". The raw write stays
+			// as the fallback for what the game refuses (a character already in state 5 gets nothing).
+			{
+				float local, incoming;
+				memcpy(&local, (const void *)(uintptr_t)(hs[k] + 0x320), 4);
+				memcpy(&incoming, &st.ch[i].life, 4);
+				if (incoming - local > 0.01f || incoming - local < -0.01f) {
+					unsigned vt = rd32(hs[k]), fn = vt ? rd32(vt + 0x24) : 0;
+					if (fn && code_in_exe(fn))
+						((void(__thiscall *)(void *, float))fn)((void *)(uintptr_t)hs[k], incoming - local);
+					float now_life;
+					memcpy(&now_life, (const void *)(uintptr_t)(hs[k] + 0x320), 4);
+					if (now_life - incoming > 0.5f || incoming - now_life > 0.5f)
+						*(DWORD *)(uintptr_t)(hs[k] + 0x320) = st.ch[i].life;
+				}
+			}
 			// TASK 42: no position, facing or animation correction here any more. Each copy owns its own
 			// character and the peer's character is a puppet driven by PKT_CHAR (see the puppet block
 			// above); a snapshot is one link delay old, and pulling a character towards it is exactly the

@@ -18,6 +18,20 @@ static volatile LONG g_logring_n;
 static volatile LONG g_crash_reported;
 static DWORD g_crash_code, g_crash_addr;
 
+// TASK 49: the report is written by this thread, not by the faulting one, and the MINIMAL line is
+// written before anything is formatted. A stack overflow (0xc00000fd) leaves the faulting thread without
+// room for crash_report's ~1 KB of locals, and a second fault inside the handler used to end the process
+// with no line at all - the owner's 2.0 playtest guest log ends with no report. The context is copied to
+// these statics (a CONTEXT is ~700 bytes, too big for a stack-overflowed thread's leftovers), the minimal
+// line goes straight to the log from a preformatted static buffer, and the rest runs on g_crash_thread
+// with its own 256 KB stack.
+static CONTEXT g_crash_ctx;
+static DWORD g_crash_info0, g_crash_info1;
+static const char *g_crash_how;
+static HANDLE g_crash_go, g_crash_done, g_crash_thread;
+static char g_crash_min[192];
+static int g_crash_min_code, g_crash_min_addr;
+
 static const char *crash_name(DWORD code)
 {
 	switch (code) {
@@ -53,6 +67,8 @@ static int crash_fatal(DWORD code)
 	case 0xc0000005: case 0xc0000006: case 0xc0000008: case 0xc000001d:
 	case 0xc0000025: case 0xc0000026: case 0xc000008c: case 0xc000008e:
 	case 0xc0000090: case 0xc0000094: case 0xc0000096: case 0xc00000fd:
+	case 0xc0000374:   // TASK 49: heap corruption - a code the process cannot continue from
+	case 0xc0000409:   // TASK 49: stack buffer overrun (/GS) - when it is raised instead of a __fastfail
 		return 1;
 	}
 	return 0;
@@ -94,12 +110,12 @@ static void crash_where(DWORD addr, char *out, size_t outsz)
 	out[outsz - 1] = 0;
 }
 
-static void crash_report(CONTEXT *c, DWORD code, DWORD addr, const char *how, DWORD info0, DWORD info1)
+static void crash_report_body(void)
 {
-	if (InterlockedExchange(&g_crash_reported, 1))
-		return;
-	g_crash_code = code;
-	g_crash_addr = addr;
+	CONTEXT *c = &g_crash_ctx;
+	DWORD code = g_crash_code, addr = g_crash_addr;
+	const char *how = g_crash_how;
+	DWORD info0 = g_crash_info0, info1 = g_crash_info1;
 	char line[512], where[300];
 	_snprintf(line, sizeof line, "\r\n*** obscoop: FATAL EXCEPTION %s (0x%08lx) on the %s path\r\n",
 		crash_name(code), (unsigned long)code, how);
@@ -162,6 +178,63 @@ static void crash_report(CONTEXT *c, DWORD code, DWORD addr, const char *how, DW
 	FlushFileBuffers(g_log);
 }
 
+// The writer thread: waits for a report request and writes the full one on its own stack, so a fault on
+// the faulting thread's stack (or in here) still leaves the minimal line already on disk.
+static DWORD WINAPI crash_thread_main(LPVOID unused)
+{
+	(void)unused;
+	WaitForSingleObject(g_crash_go, INFINITE);
+	crash_report_body();
+	if (g_crash_done)
+		SetEvent(g_crash_done);
+	return 0;
+}
+
+// Writes the two 8-digit hex fields of the preformatted minimal line in place: no formatting, no stack.
+static void crash_patch_hex(char *p, DWORD v)
+{
+	static const char hexd[] = "0123456789abcdef";
+	for (int i = 7; i >= 0; i--) {
+		p[i] = hexd[v & 0xf];
+		v >>= 4;
+	}
+}
+
+// Entry point of the handlers: the MINIMAL line first (already on disk and flushed before anything else
+// can fail), then the full report on the writer thread. If the thread could not be created, the rest runs
+// here as before (TASK 34 behaviour).
+static void crash_report(CONTEXT *c, DWORD code, DWORD addr, const char *how, DWORD info0, DWORD info1)
+{
+	if (InterlockedExchange(&g_crash_reported, 1))
+		return;
+	g_crash_code = code;
+	g_crash_addr = addr;
+	g_crash_how = how;
+	g_crash_info0 = info0;
+	g_crash_info1 = info1;
+	if (g_log != INVALID_HANDLE_VALUE) {
+		DWORD w;
+		if (g_crash_min[0]) {
+			crash_patch_hex(g_crash_min + g_crash_min_code, code);
+			crash_patch_hex(g_crash_min + g_crash_min_addr, addr);
+			WriteFile(g_log, g_crash_min, (DWORD)strlen(g_crash_min), &w, NULL);
+			FlushFileBuffers(g_log);
+		} else {
+			static const char fallback[] = "\r\n*** obscoop: FATAL EXCEPTION (minimal line, full report follows)\r\n";
+			WriteFile(g_log, fallback, (DWORD)(sizeof fallback - 1), &w, NULL);
+			FlushFileBuffers(g_log);
+		}
+	}
+	if (c && c != &g_crash_ctx)
+		g_crash_ctx = *c;
+	if (g_crash_thread && g_crash_go && g_crash_done) {
+		SetEvent(g_crash_go);
+		WaitForSingleObject(g_crash_done, 5000);
+	} else {
+		crash_report_body();
+	}
+}
+
 // 1 when the address lies in KERNEL32/KERNELBASE. IsBadReadPtr/IsBadWritePtr probe memory under SEH: every
 // probe of an invalid page raises a first-chance access violation inside KERNEL32 that the API itself
 // swallows. Those are not crashes (the mod probes pointers constantly), so the vectored handler ignores
@@ -214,5 +287,22 @@ static void crash_install(void)
 	if (!g_crash_veh_handle)
 		g_crash_veh_handle = AddVectoredExceptionHandler(1, crash_veh);
 	SetUnhandledExceptionFilter(crash_filter);
-	logf("crash handler installed (vectored first chance + unhandled filter, %d log lines kept)", CRASH_LOG_RING);
+	// TASK 49: the minimal line is formatted ONCE here (no formatting at crash time); the writer thread
+	// gets its own 256 KB stack so a stack overflow still produces the full report.
+	if (g_log != INVALID_HANDLE_VALUE) {
+		int n = _snprintf(g_crash_min, sizeof g_crash_min,
+			"\r\n*** obscoop: FATAL EXCEPTION code 0x00000000 at 0x00000000 (minimal line; full report follows)\r\n");
+		if (n > 0) {
+			char *pc = strstr(g_crash_min, "code 0x"), *pa = strstr(g_crash_min, "at 0x");
+			if (pc && pa) {
+				g_crash_min_code = (int)(pc - g_crash_min) + 7;
+				g_crash_min_addr = (int)(pa - g_crash_min) + 5;
+			}
+		}
+	}
+	g_crash_go = CreateEventA(NULL, TRUE, FALSE, NULL);
+	g_crash_done = CreateEventA(NULL, TRUE, FALSE, NULL);
+	g_crash_thread = CreateThread(NULL, 256 * 1024, crash_thread_main, NULL, 0, NULL);
+	logf("crash handler installed (vectored first chance + unhandled filter, %d log lines kept, report thread %s)",
+		CRASH_LOG_RING, g_crash_thread ? "ready" : "UNAVAILABLE");
 }

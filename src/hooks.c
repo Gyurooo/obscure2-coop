@@ -464,8 +464,34 @@ static void __fastcall hk_char_collect(void *ch, void *edx)
 		g_char_collect(ch, edx);
 }
 
+// TASK 49: the local dynamite BLAST (FUN_0048df50). On the guest it is a SECOND simulation of the same
+// explosive: the host's copy applies the damage and streams it, and the guest's copy detonated its own
+// object 5-6 s after the mod put the throwable in the puppet's hand - measured with a hook on the hit
+// entry: `hit-entry BOY1 kind 300 damage 101.8 ... from +0x8e237` (0x48e237 is inside FUN_0048df50, the
+// human loop that calls slot 0x50 on every character in the radius, decompile 73906..74000). The guest's
+// characters then died on the guest only (host -34.7/-21.9, guest -99.1/-85.4) and the game thread hung
+// in the death path (steam.dll; the owner's playtest guest log ends the same way, with no report).
+// Suppressing the guest's local blast leaves the damage to the one authority; the guest's thrower keeps the
+// true explosion from the host's own copy in view. The hand's own fuse is cleared too
+// (sync.c puppet_disarm), so the object does not sit armed.
+typedef void(__fastcall *blast_t)(void *, void *);
+static blast_t g_blast;
+static volatile LONG g_blast_skipped;
+static void __fastcall hk_blast(void *self, void *edx)
+{
+	if (g_role == 2) {
+		if (InterlockedIncrement(&g_blast_skipped) <= 3)
+			logf("guest: local dynamite blast at %p suppressed (the host owns the damage)", self);
+		return;
+	}
+	if (g_blast)
+		g_blast(self, edx);
+}
+
 static void install_request_hooks(void)
 {
+	static const BYTE p_blast[6] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x28 };
+	g_blast = (blast_t)hook_entry((BYTE *)0x48df50, p_blast, 6, (void *)hk_blast, "dynamite blast (0x48df50)");
 	static const BYTE p_change[6] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08 };
 	static const BYTE p_prog[9] = { 0x55, 0x8b, 0xec, 0x8b, 0x81, 0x1c, 0x03, 0x00, 0x00 };
 	static const BYTE p_name[6] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08 };

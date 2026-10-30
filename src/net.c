@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 23   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 24   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -67,6 +67,12 @@
                         //     changes with a sequence number. The receiver writes the intent into the puppet
                         //     and lets the game's own movement state machine run in the locomotion states,
                         //     so the game picks the gait and the lower-body animation layer (FINDINGS_46).
+                        // 24: TASK 49, the PLAYED CLIP: pkt_char also carries the tag of the owner's upper
+                        //     animation layer (animtable[index+0x220]+0xc). The STATE ID alone does not name
+                        //     the clip (FUN_004e2fa0 plays HIT1/2, HIT5, HIT7/8, HI20, LJBA for state 700 by
+                        //     hit kind and direction; the throw plays by weapon), so the receiver plays the
+                        //     owner's clip through the game's own clip call (vtable slot 0x68) instead of
+                        //     hoping the setter picks the same one (FINDINGS_49 section 5).
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,
@@ -104,7 +110,13 @@ typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; ch_state me; float vel[3]; 
                  // gait: the owner's lower-body gait index (character+0x2e0: 0 pause, 1 forward, 2 back,
                  // 3 right, 4 left - what FUN_004da570 computes from the intent and the aim target and
                  // what FUN_004e7420 (vtable slot 0x4c) turns into the lower-body clip +0x224).
-                 DWORD gait; } pkt_char;
+                 DWORD gait;
+                 // up: the CLIP the owner's upper (state) layer is playing - animtable[character+0x220]+0xc,
+                 // the tag the game's own clip call (vtable slot 0x68) takes. The reaction clips (hit,
+                 // knockdown, thrown by a blast, death) are chosen by the game from the hit kind and the
+                 // source direction (FUN_004e2fa0), not by the state id, so the receiver needs the tag to
+                 // play the SAME clip on the puppet (FINDINGS_49 section 5).
+                 DWORD up; } pkt_char;
 typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; DWORD seq; } pkt_req;
 // life = character+0x320 (float bits), state = character+0x2dc (the NPC's AI/animation/death state; the
 // same field the humans stream as `anim`). TASK 21: the host owns enemy life and death, the guest applies

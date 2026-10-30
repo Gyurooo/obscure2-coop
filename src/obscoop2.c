@@ -1315,6 +1315,18 @@ static int item_use_forward(int player, unsigned tag, char *reply, size_t replys
 static int aptitude_done_request(int player, char *reply, size_t replysz);   // sync.c: pipe `aptdone` (TEST ONLY)
 static int door_use_request(int player, char *reply, size_t replysz);        // sync.c: pipe `usedoor` (TEST ONLY)
 
+// TEST-ONLY (TASK 49, pipe `crashso`): reach a stack overflow through a call the compiler cannot turn
+// into a loop (the function pointer is only set from the pipe command), so the crash handler can be
+// proved on that kind of death.
+static int (*volatile g_crashso_rec)(void);
+static int crashso_dig(void)
+{
+	volatile char pad[512];
+	pad[0] = 1;
+	pad[sizeof pad - 1] = 2;
+	return g_crashso_rec() + pad[0] + pad[sizeof pad - 1];
+}
+
 static volatile float g_view[16];            // window.c: the last view matrix
 static volatile LONG g_view_sets, g_xf_sets;
 static volatile float g_view_first[16];
@@ -1398,6 +1410,13 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		InterlockedExchangeAdd(&g_mdy, ly);
 		g_mbuttons = (BYTE)buttons;
 		_snprintf(reply, replysz, "ok reads %ld%s", g_mouse_reads, g_mouse ? "" : " (no mouse device)");
+	} else if (!strncmp(line, "crashso", 7)) {
+		// TEST-ONLY (TASK 49): die of a STACK OVERFLOW - the death kind that leaves no report when the
+		// handler runs on the dying stack (the 2.0 playtest guest log). The report must still appear.
+		_snprintf(reply, replysz, "ok exhausting the stack");
+		FlushFileBuffers(g_log);
+		g_crashso_rec = crashso_dig;
+		crashso_dig();
 	} else if (!strncmp(line, "crash", 5)) {
 		// TEST-ONLY (TASK 34): trigger a fatal fault so a check can prove the crash handler writes the
 		// report (code, module+offset, registers, stack, last log lines). "crash" faults on a null write;
