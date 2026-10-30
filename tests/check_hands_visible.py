@@ -11,7 +11,7 @@ slot human+0x714) and each weapon object wp:
 The host draws its weapon, so its values are the reference: the check fails when the guest's selected
 weapon differs in one of these fields.
 """
-import sys, os, struct
+import sys, os, struct, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from peek import Proc
 h, g = int(sys.argv[1]), int(sys.argv[2])
@@ -67,7 +67,14 @@ def fmt(d):
 
 
 mh, mg = Proc(h), Proc(g)
-hh, hg = humans(mh), humans(mg)
+# TASK 50: the puppet's hands arrive in the owner's stream; give the pair a moment to converge before the
+# render comparison (the old model wrote them from the snapshot, which is exactly what is gone).
+for _ in range(40):
+    hh, hg = humans(mh), humans(mg)
+    if sorted((x['tag'], x['cur'], [s['tag'] for s in x['slots']]) for x in hh) == \
+       sorted((x['tag'], x['cur'], [s['tag'] for s in x['slots']]) for x in hg):
+        break
+    time.sleep(0.05)
 for name, hs in (('host', hh), ('guest', hg)):
     print('%s humans:' % name)
     for x in hs:

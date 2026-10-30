@@ -88,6 +88,53 @@ def ctl_human(m, pl):
     return u32(m, ctl + 4 + 0x764 * pl) if ctl else 0
 
 
+def humans(m):
+    """Every live human of this copy as (tag, pointer)."""
+    w = world(m)
+    mgr = u32(m, w + 0x175c) if w else 0
+    out = []
+    if not mgr:
+        return out
+    n, arr = u32(m, mgr + 4) or 0, u32(m, mgr + 0xc)
+    for i in range(min(n, 8)):
+        hp = u32(m, arr + 4 * i) if arr else 0
+        if hp:
+            out.append((tag(u32(m, hp + 0x14)), hp))
+    return out
+
+
+def human_by_tag(m, t):
+    for ht, hp in humans(m):
+        if ht == t:
+            return hp
+    return 0
+
+
+def clip_of(m, ch, off):
+    """The clip tag an animation layer of `ch` is playing (animtable[+0x210][index+0xc])."""
+    tab = u32(m, ch + 0x210)
+    idx = u32(m, ch + off)
+    if not tab or idx >= 0x1000:
+        return 0
+    return u32(m, tab + idx * 0x28 + 0xc)
+
+
+def anim_of(m, ch):
+    """State + upper-body clip (+0x220) + lower-body clip (+0x224)."""
+    return (u32(m, ch + 0x2dc), clip_of(m, ch, 0x220), clip_of(m, ch, 0x224))
+
+
+def mesh_of(m, e):
+    """The carried prop's mesh transform, as the game's carried transform writes it (FUN_00412720):
+    mesh+0x1c8 (3 floats) and mesh+0x1e0 (4 floats). None when the entity has no mesh."""
+    mesh = u32(m, e + 0x34) if e else 0
+    if not mesh:
+        return None
+    pos = tuple(f32(m, mesh + 0x1c8 + 4 * i) for i in range(3))
+    quat = tuple(f32(m, mesh + 0x1e0 + 4 * i) for i in range(4))
+    return pos + quat
+
+
 def hpos(m, h):
     return (f32(m, h + 0x23c), f32(m, h + 0x240), f32(m, h + 0x244))
 
@@ -315,6 +362,40 @@ def main():
               ('yes' if okc else 'NO', secs2, describe(m_oth, eo)))
         if not okc:
             fails.append('%s: the other copy does not show the carried chair' % label)
+        # ---- TASK 50: the PUPPET carries it too - the owner's carry pose and the prop in its hand.
+        # The carry state and both animation layers of the character streamed from its owner (here the
+        # owner is `me` on its own copy; the partner's copy of the same tag is the puppet), and the carried
+        # prop's mesh follows the puppet's hand: FUN_00412720 writes the mesh transform (mesh+0x1c8 /
+        # +0x1e0) from the carrier, driven by the mod on the copy that did not perform the pickup.
+        own_tag = tag(u32(m_own, me + 0x14))
+        pe = human_by_tag(m_oth, own_tag)
+        if not pe:
+            print('  carry pose: the other copy has no character %s (FAIL)' % own_tag)
+            fails.append('%s: the other copy has no %s for the carry pose' % (label, own_tag))
+        else:
+            okp, secsp = wait_for(lambda: anim_of(m_own, me) == anim_of(m_oth, pe), 1.5)
+            a1, a2 = anim_of(m_own, me), anim_of(m_oth, pe)
+            print('  carry pose: own state %d clips %s/%s | other state %d clips %s/%s (%s after %.2f s)' % (
+                a1[0], tag(a1[1]), tag(a1[2]), a2[0], tag(a2[1]), tag(a2[2]),
+                'equal' if okp else 'DIFFERENT', secsp))
+            if not okp:
+                fails.append('%s: the partner copy does not play the carry pose (%r vs %r)' % (label, a1, a2))
+            eo = other_chair() or eo
+
+            def mesh_diff():
+                a, b = mesh_of(m_own, e), mesh_of(m_oth, eo)
+                if not a or not b:
+                    return None
+                return max(abs(a[i] - b[i]) for i in range(7))
+
+            okm, secsm = wait_for(lambda: (mesh_diff() is not None and mesh_diff() <= 2.0), 2.0)
+            d = mesh_diff()
+            print('  carried prop mesh: own %s | other %s -> max difference %s (%s)' % (
+                'n/a' if d is None else 'set', 'n/a' if d is None else 'set',
+                'n/a' if d is None else '%.2f units' % d, 'follows' if okm else 'DOES NOT follow'))
+            if not okm:
+                fails.append('%s: the carried prop does not follow the puppet\'s hand (%s)' % (
+                    label, 'no mesh' if d is None else 'max difference %.2f' % d))
         # --- swing -> break
         broke = False
         for i in range(4):

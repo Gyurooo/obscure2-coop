@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 24   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 25   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -73,6 +73,11 @@
                         //     hit kind and direction; the throw plays by weapon), so the receiver plays the
                         //     owner's clip through the game's own clip call (vtable slot 0x68) instead of
                         //     hoping the setter picks the same one (FINDINGS_49 section 5).
+                        // 25: TASK 50, the HANDS FOLLOW THEIR OWNER: pkt_char.me.wep carries the four live
+                        //     weapon tags of the character THIS copy drives (was zero) and pkt_state no longer
+                        //     feeds hands into every character (the host's stale view overwrote the guest's
+                        //     own GIR1 86 times in the 2.0 playtest). The receiver applies them to its puppet
+                        //     only, through the game's equip path (FINDINGS_50).
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,

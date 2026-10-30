@@ -305,7 +305,6 @@ static int __fastcall hk_party_table(void *game, void *edx, int flag, unsigned l
 // player keeps control of their own character; the character update recomputes them every frame.
 typedef void(__fastcall *input_update_t)(void *, void *, int);
 static input_update_t g_input_update;
-static void guest_weapons_frame(void);   // sync.c: the guest's held weapons, applied in the game's own update
 static volatile LONG g_puppet_gated, g_puppet_frames, g_puppet_move_gated, g_puppet_move_run;   // TASK 42/46 gating counters
 static int puppet_is(unsigned ch);       // sync.c (TASK 42): is this character the peer's puppet?
 static int puppet_move_ok(unsigned ch);  // sync.c (TASK 46): may the movement machine run for it?
@@ -313,6 +312,7 @@ static int own_char(unsigned ch);        // sync.c (TASK 46): is this the charac
 static void host_record_state(DWORD tag, DWORD st);   // sync.c (TASK 46): record a state change
 static int puppet_prepare(unsigned ch);  // sync.c (TASK 42): the owner's pose/state before the game's update
 static void puppet_finish(unsigned ch);  // sync.c (TASK 42): the owner's pose after it
+static void prop_game_break_tick(void);  // sync.c (TASK 50): a peer break played by the prop's own class
 
 static void __fastcall hk_input_update(void *self, void *edx, int dt)
 {
@@ -326,7 +326,6 @@ static void __fastcall hk_input_update(void *self, void *edx, int dt)
 		*(unsigned *)(uintptr_t)(ch + 0x880) = 0;
 		*(unsigned *)(uintptr_t)(ch + 0x884) = 0;
 	}
-	guest_weapons_frame();
 	// TASK 42: the peer's character is a puppet - its controller must not run at all in normal play, or
 	// the local game would drive it from a pad (the old model) or from the teammate AI and fight the
 	// streamed pose and state. In a menu / a load / a scripted event the game's own code needs the
@@ -419,6 +418,9 @@ static game_update_t g_game_update;
 static void __fastcall hk_game_update(void *game, void *edx, int dt)
 {
 	game_load_tick((unsigned)(uintptr_t)game);
+	// TASK 50: a peer's break of a window/crate is played with the object's own class entry (vtable slot
+	// 25) here, in the game's own update, never in Present (sync.c: prop_game_break_tick).
+	prop_game_break_tick();
 	// TASK 38: the game's own code reads the teammate controller's character in the scripted-event skip
 	// (state 7) and in the enter-normal-play attach; the unlink (TASK 35) is only valid in normal play.
 	teammate_game_guard((unsigned)(uintptr_t)game, 1);

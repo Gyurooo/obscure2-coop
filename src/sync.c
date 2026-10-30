@@ -1588,6 +1588,83 @@ static int prop_break_state(unsigned ent)
 	return 1;
 }
 
+// ---- TASK 50: the break of the window/crate family, played by the game's own entry ------------------
+// The classes CToeBreakable* (and CToeHeavyCase) override vtable slot 25 with their break entry: for
+// CToeBreakableTwoStates that is 0x40ef20 (OBSERVED, objdump: it checks +0xa4, hides the whole mesh at
+// +0x34 through its slot 0x48(0), walks the child objects at +0x108/+0x118 and shows the broken ones,
+// calls 0x591230 with the entity position, and ends with +0x14 = 1, +0x18 = 0, +0xa4 = 1). The raw state
+// write prop_break_state below is the CHAIR's shape (hide the mesh, clear +0x24/+0x12c, set +0xa4) and is
+// what leaves a window looking whole on the copy that only applied the packet (owner's 2.0 report: "windows
+// do not break on the other screen"). The chair's own break (0x412140) must not be called from the mod
+// (TASK 26: it hung the host), so the chair keeps prop_break_state; every other prop class is broken with
+// its own entry, on the game's own update thread (prop_game_break_tick, called from hk_game_update), never
+// in Present.
+typedef struct { unsigned ent; DWORD cls, id, vt, fn, at, dcls, did; float dpos[3]; int host_word; } gbreak_req;
+static gbreak_req g_gb[4];
+static int g_gb_n;
+
+static int prop_game_break_queue(unsigned ent, DWORD dcls, DWORD did, const float *dpos, int host_word)
+{
+	if (!ent || IsBadReadPtr((void *)(uintptr_t)ent, 0x120))
+		return 0;
+	unsigned vt = rd32(ent), fn = vt ? rd32(vt + 0x64) : 0;   // slot 25: the class's break entry
+	if (!fn || !code_in_exe(fn) || fn == 0x412140u)
+		return 0;   // no entry, or the chair: prop_break_state is the chair's own shape (TASK 26)
+	for (int i = 0; i < g_gb_n; i++)
+		if (g_gb[i].ent == ent)
+			return 1;   // a repeat of the same break: already queued
+	if (g_gb_n >= 4)
+		return 0;   // the caller falls back to the state write rather than dropping the break
+	gbreak_req *r = &g_gb[g_gb_n++];
+	memset(r, 0, sizeof *r);
+	r->ent = ent;
+	r->cls = rd32(ent + 0x10);
+	r->id = rd32(ent + 4);
+	r->vt = vt;
+	r->fn = fn;
+	r->at = GetTickCount();
+	r->dcls = dcls;
+	r->did = did;
+	r->host_word = host_word;
+	if (dpos)
+		memcpy(r->dpos, dpos, sizeof r->dpos);
+	return 1;
+}
+
+// Runs on the game's own update thread (hk_game_update, before the game's update). One break per call is
+// enough: a break is a rare event and the queue holds at most four.
+static void prop_game_break_tick(void)
+{
+	if (!g_gb_n)
+		return;
+	unsigned g = game_obj(), w = world_obj();
+	if (!g || !w || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0 || !world_ready())
+		return;
+	DWORD now = GetTickCount();
+	int i = 0;
+	gbreak_req r = g_gb[i];
+	if (now - r.at > 5000) {
+		logf("%s: prop break: the queued break of %x expired (the world never settled)", g_role == 2 ? "guest" : "host", r.ent);
+		g_gb[0] = g_gb[--g_gb_n];
+		return;
+	}
+	if (!prop_alive(r.ent, r.cls, r.vt) || (r.id && rd32(r.ent + 4) != r.id)) {
+		logf("%s: prop break: the entity is gone (the world was rebuilt): not applied", g_role == 2 ? "guest" : "host");
+		g_gb[0] = g_gb[--g_gb_n];
+		return;
+	}
+	if (!rd32(r.ent + 0xa4)) {
+		char c[5], id[5];
+		((void(__fastcall *)(void *, void *, int))r.fn)((void *)(uintptr_t)r.ent, NULL, 0);
+		prop_mark_applied(r.ent);
+		InterlockedIncrement(&g_prop_broken);
+		logf("%s: prop break applied by its class: %s id %s ent %x (entry %08x) -> broken %u",
+			g_role == 2 ? "guest" : "host", tag4(r.cls, c), tag4(r.id, id), r.ent, r.fn, rd32(r.ent + 0xa4));
+	}
+	prop_align_drop(r.ent, r.dcls, r.did, r.dpos, r.host_word);
+	g_gb[0] = g_gb[--g_gb_n];
+}
+
 static void prop_apply_break(unsigned ent, DWORD dcls, DWORD did, const float *dpos, int host_word)
 {
 	// TASK 40: never touch an entity that is not one of this world's live entities (or in a hand)
@@ -1598,6 +1675,10 @@ static void prop_apply_break(unsigned ent, DWORD dcls, DWORD did, const float *d
 			g_role == 2 ? "guest" : "host", ent);
 		return;
 	}
+	// TASK 50: a whole prop of the window/crate family is broken with its own class entry, on the game's
+	// update thread (see prop_game_break_tick). The chair keeps the state write below.
+	if (!rd32(ent + 0xa4) && prop_game_break_queue(ent, dcls, did, dpos, host_word))
+		return;
 	// A prop the other copy broke and this one also broke (the normal case) is already flagged: nothing to
 	// do, and no log line - the host repeats its state once a second.
 	if (!rd32(ent + 0xa4)) {
@@ -2503,11 +2584,9 @@ static void host_send_state(void)
 				logf("host: life %s is %.1f (sent in the snapshot)", tag4(c->tag, t), v);
 			}
 		}
-		for (int s = 0; s < 4; s++) {
-			unsigned wp = rd32(hs[i] + 0x704 + 4 * s);   // the live weapon object in slot s
-			c->wep[s] = wp ? rd32(wp + 0x10) : 0;        // its tag, 0 = empty slot
-		}
-		c->wcur = rd32(hs[i] + 0x714);                   // the slot in the hand
+		// TASK 50: the hands are NOT in the snapshot any more. Each copy streams the hands of the character
+		// its own pad drives (pkt_char.me.wep + wsel) and applies them to the puppet only; the snapshot's
+		// per-human hand fields (ch_state.wep/wcur) stay unused for layout compatibility.
 	}
 	// TASK 30: the battery/energy a story event sets (Cslh_EnergySet -> inventory+0xc88) is host-owned.
 	unsigned inv = rd32(world_obj() + 0x1790);
@@ -2548,7 +2627,9 @@ static volatile LONG g_rx_state_new;
 #define PUP_DELAY_MAX 220.0f
 #define PUP_EXTRAP_MAX 120  // ms of dead reckoning past the newest sample
 typedef struct { DWORD t; float pos[3], dir[3], vel[3]; DWORD speed, anim, ui, wsel;
-                 float intent[3]; DWORD wanted, ev_seq, ev_val[4], gait, up; } psample;   // up: the owner's upper clip tag (TASK 49)
+                 float intent[3]; DWORD wanted, ev_seq, ev_val[4], gait, up;
+                 DWORD wep[4]; } psample;   // up: the owner's upper clip tag (TASK 49); wep: the tags in
+                                            // the owner's four live weapon slots (TASK 50, its OWN character)
 
 static CRITICAL_SECTION g_pb_cs;
 static psample g_pb[PBUF];        // sorted by t, oldest first
@@ -2605,6 +2686,7 @@ static void peer_on_char(const char *buf, int n)
 	memcpy(s->ev_val, p->ev_val, sizeof s->ev_val);
 	s->gait = p->gait;
 	s->up = p->up;
+	memcpy(s->wep, p->me.wep, sizeof s->wep);   // TASK 50: the hands of the character this stream belongs to
 	g_pb_n = i + 1;
 	while (i > 0 && (LONG)(g_pb[i - 1].t - g_pb[i].t) > 0) {   // out of order (jitter)
 		psample tmp = g_pb[i - 1];
@@ -2630,6 +2712,24 @@ static void peer_on_char(const char *buf, int n)
 	}
 	LeaveCriticalSection(&g_pb_cs);
 	InterlockedIncrement(&g_char_rcv);
+}
+
+// TASK 50: the NEWEST stream sample, not the interpolated pose. The held weapon and the slot in the hand are
+// a discrete choice of the owner, not a pose: taking them from the playback instant would show a switch one
+// playback delay late (55..220 ms) - the "previous item still in my hand" of the 2.0 playtest.
+static int puppet_latest(psample *out)
+{
+	if (!g_pb_tag)
+		return 0;
+	EnterCriticalSection(&g_pb_cs);
+	int n = g_pb_n;
+	if (n < 1) {
+		LeaveCriticalSection(&g_pb_cs);
+		return 0;
+	}
+	*out = g_pb[n - 1];
+	LeaveCriticalSection(&g_pb_cs);
+	return 1;
 }
 
 // The pose to show now: the buffer interpolated at (now - delay). 0 = no sample yet.
@@ -2680,6 +2780,7 @@ static int puppet_pose(psample *out)
 				memcpy(out->ev_val, b->ev_val, sizeof out->ev_val);
 				out->gait = b->gait;
 				out->up = b->up;   // TASK 49: ... and the clip being played then
+				memcpy(out->wep, b->wep, sizeof out->wep);   // TASK 50: ... and the hands then
 				for (int c = 0; c < 3; c++) {
 					out->pos[c] = b->pos[c] + (a->pos[c] - b->pos[c]) * k;
 					out->vel[c] = b->vel[c] + (a->vel[c] - b->vel[c]) * k;
@@ -3049,6 +3150,10 @@ static int puppet_state_ok(DWORD st)
 	case 200: case 300:                          // swing, charged/special attack
 	case 500: case 600: case 700:                // the combat/stance family of the setter
 	case 0x12d: case 0x12e: case 0x12f:          // use/interaction family (FINDINGS_29 section 2)
+	case 0xa8c: case 0xa8d:                      // TASK 50: carrying a prop / swinging it. The setter's
+	                                             // cases (decompile 138552, 138559) only play the carry clip
+	                                             // (0x4a4d5041) and the swing clip (0x4a4d4355); the chair's
+	                                             // own update (FUN_00411420) blends them on the carrier
 		return 1;
 	}
 	static DWORD logged[32];
@@ -3104,6 +3209,8 @@ static DWORD puppet_wanted(unsigned ch, const psample *s)
 	return want;
 }
 
+// TASK 50: the hands of the puppet, from its owner (pkt_char.me.wep + wsel).
+static void puppet_weapons(unsigned ch, const psample *s);
 // Called before the game's own character update for every human: is this the puppet, and if so put it in
 // the pose/state the owner has. Returns 1 when the update must be completed by puppet_finish.
 static void puppet_ui(unsigned ch, const psample *s);
@@ -3137,8 +3244,15 @@ static int puppet_prepare(unsigned ch)
 		puppet_gait(ch, &s);   // ... and its lower-body layer follows the owner's gait
 		puppet_clip(ch, s.up, puppet_react(want));   // TASK 49: ... and the clip the owner plays
 	}
+	// TASK 50: the hands come from the character's OWNER, through the same stream (pkt_char.me.wep + wsel).
+	// Before this task the host streamed every human's slots in pkt_state and the guest wrote them into
+	// EVERY character - its own included (the 86 GIR1 flip-flops of the 2.0 playtest, FINDINGS_50).
 	puppet_write(ch, &s, 1);   // TASK 45: through SetPosition, so the collision body follows
 	puppet_ui(ch, &s);
+	{
+		psample hand;
+		puppet_weapons(ch, puppet_latest(&hand) ? &hand : &s);   // TASK 50: the newest hands, not the pose's
+	}
 	return 1;
 }
 
@@ -3150,7 +3264,8 @@ static int puppet_prepare(unsigned ch)
 // (decompile 126846/126847). The puppet's controller does not run any more (TASK 42), so the owner
 // streams the state and this copy makes the same two game calls for the puppet's character: the wheel
 // panel is per player (HUD+0x88 / +0x8c) and the game itself arbitrates the shared item panel (HUD+0x90).
-// The selected weapon slot (character+0x714, the wheel's selection) is mirrored as the plain int it is.
+// TASK 50: the selected slot (character+0x714, the wheel's selection) is no longer written raw here; the
+// hands are applied with the game's equip/show calls in puppet_weapons, from the owner's stream.
 typedef void(__fastcall *hud_wheel_t)(void *, void *, void *, int);
 typedef void(__fastcall *hud_items_t)(void *, void *, void *, unsigned, int);
 static DWORD g_puppet_ui_done_tag, g_puppet_ui_done;
@@ -3162,8 +3277,6 @@ static void puppet_ui(unsigned ch, const psample *s)
 	if (!ctl || IsBadWritePtr((void *)(uintptr_t)(ctl + 0xa4), 4))
 		return;
 	unsigned want = s->ui & 7;
-	if (!IsBadWritePtr((void *)(uintptr_t)(ch + 0x714), 4) && s->wsel < 8)
-		*(DWORD *)(uintptr_t)(ch + 0x714) = s->wsel;   // the wheel's selection (a plain int)
 	if (rd32(ctl + 0xa4) != want)
 		*(DWORD *)(uintptr_t)(ctl + 0xa4) = want;
 	// The two HUD calls, only when the state changes (the panel keeps its state between frames). ECX is the
@@ -3246,6 +3359,24 @@ static void puppet_finish(unsigned ch)
 	if (err > 0.05f)
 		InterlockedIncrement(&g_char_snaps);
 	puppet_write(ch, &s, 0);
+	// TASK 50: the prop the puppet carries follows its hand. The carried transform (the chair's vtable slot
+	// 27 = FUN_00412720) is what puts the prop's mesh in the hand (mesh+0x1c8 / +0x1e0); the copy that only
+	// APPLIED the carry never runs it, so the chair stayed where it was picked up (2.0 playtest). It runs
+	// here, in the game's own character update after the game's own, never in Present: the frame-hook call
+	// hung the guest's game thread on a prop whose carrier had just been detached (FINDINGS_50 section 4).
+	// The carrier is read LIVE from the prop (+0xc4), not from the prop table, and only while it still
+	// points back at this character.
+	{
+		unsigned held = rd32(ch + 0x2bc);
+		if (held && !IsBadReadPtr((const void *)(uintptr_t)held, 0x120) &&
+		    !IsBadReadPtr((const void *)(uintptr_t)(held + 0xc4), 4) && rd32(held + 0xc4) == ch &&
+		    !rd32(held + 0xa4)) {
+			unsigned vt = rd32(held), fn = vt ? rd32(vt + 0x6c) : 0;
+			if (fn && code_in_exe(fn))
+				((void(__fastcall *)(void *, void *, void *))fn)((void *)(uintptr_t)held, NULL,
+				                                                  (void *)(uintptr_t)ch);
+		}
+	}
 	if (!IsBadWritePtr((void *)(uintptr_t)(ch + 0x2dc), 4)) {
 		if (puppet_locomotion(s.anim)) {
 			// TASK 46: the movement machine owns the locomotion states on the puppet (it picks the gait
@@ -3328,6 +3459,14 @@ static void char_send_local(void)
 	p.speed = rd32(me + 0x278);
 	p.me.anim = rd32(me + 0x2dc);
 	p.me.life = rd32(me + 0x320);
+	// TASK 50: the hands of THIS copy's own character: the tag in each of the four live slots
+	// (character+0x704 + i*4 -> weapon+0x10, 0 = empty) and the slot in the hand (s->wsel, +0x714).
+	// The receiver applies them to its PUPPET only, through the game's equip path (puppet_weapons).
+	for (int s = 0; s < 4; s++) {
+		unsigned wp = rd32(me + 0x704 + 4 * s);
+		p.me.wep[s] = wp ? rd32(wp + 0x10) : 0;
+	}
+	p.me.wcur = rd32(me + 0x714);
 	// TASK 46: the move intent (character+0x288, written by the owner's input controller through vtable
 	// slot 0x60) and the owner's state-change events. The receiver writes the intent into the puppet and
 	// lets the game's own movement machine run, so the gait and the lower-body layer follow the owner.
@@ -3655,10 +3794,17 @@ static unsigned weapon_object(unsigned tag)
 	return obj;
 }
 
-static unsigned g_wep_seen[MAX_CH][4], g_wep_seen_cur[MAX_CH];   // guest: what the last apply reported
-static DWORD g_wep_at[MAX_CH][4];                                // guest: and when, to retry a failure later
+static unsigned g_wep_seen[4];   // the last slot tag this copy tried to fill ...
+static DWORD g_wep_at[4];        // ... and when, so a failure is retried later, not every frame
+static volatile LONG g_hand_sets;
 
-// Makes one character's four live slots and the selected slot match the host's.
+// TASK 50: the hands of the PUPPET, from its owner. Each copy streams the hands of the character its own
+// pad drives (pkt_char.me.wep[4] + pkt_char.wsel, read from character+0x704 / +0x714 in char_send_local)
+// and the receiver applies them to the PEER's character only. Applying means exactly what the game's own
+// equip does: FUN_004dc870(weapon, slot) for a slot whose tag changed and, for the slot in the hand, +0x714
+// plus the weapon's show call (vtable+0xcc), the pair the game runs after restoring a save (FUN_004f1b80).
+// The old model wrote the host's view into EVERY character, its own included: that is the
+// GIR1-flip-flop loop of the 2.0 playtest (FINDINGS_50).
 // TASK 49: a THROWABLE weapon object is a LIVE EXPLOSIVE. The class the entity factory builds for a
 // dynamite tag (FUN_0048d830, 0x248 bytes, factory branch 0x44594e41 in FUN_0045cdd0) is updated by
 // FUN_0048e3f0, which ticks its fuse (+0x244) and calls the BLAST FUN_0048df50 once +0x240 (the fuse
@@ -3699,85 +3845,60 @@ static void puppet_disarm(unsigned h)
 	}
 }
 
-static void weapons_for(int k, unsigned h, const ch_state *c)
+static void puppet_weapons(unsigned ch, const psample *s)
 {
 	static const BYTE p_equip[6] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x0c };
 	unsigned got[4];
 	int same = 1;
-	if (IsBadReadPtr((const void *)(uintptr_t)h, 0x718))
+	if (IsBadReadPtr((const void *)(uintptr_t)ch, 0x718))
 		return;
-	puppet_disarm(h);   // TASK 49: never let a throwable detonate in the puppet's hand on this copy
-	for (int s = 0; s < 4; s++) {
-		unsigned wp = rd32(h + 0x704 + 4 * s);
-		got[s] = wp ? rd32(wp + 0x10) : 0;
-		if (got[s] != c->wep[s])
+	puppet_disarm(ch);   // TASK 49: never let a throwable detonate in the puppet's hand on this copy
+	for (int i = 0; i < 4; i++) {
+		unsigned wp = rd32(ch + 0x704 + 4 * i);
+		got[i] = wp ? rd32(wp + 0x10) : 0;
+		if (got[i] != s->wep[i])
 			same = 0;
 	}
-	if (same && (c->wcur >= 4 || rd32(h + 0x714) == c->wcur))
-		return;   // already like the host
+	if (same && (s->wsel >= 4 || rd32(ch + 0x714) == s->wsel))
+		return;   // already what its owner holds
 	char t1[5], t2[5];
 	DWORD now = GetTickCount();
-	for (int s = 0; s < 4; s++) {
-		unsigned want = c->wep[s];
-		if (!want || want == got[s])
-			continue;   // only fill a gap; a slot the host has empty is left alone
-		if (g_wep_seen[k][s] == want && (LONG)(now - g_wep_at[k][s]) < 5000)
+	for (int i = 0; i < 4; i++) {
+		unsigned want = s->wep[i];
+		if (!want || want == got[i])
+			continue;   // only fill a gap; a slot the owner has empty is left alone
+		if (g_wep_seen[i] == want && (LONG)(now - g_wep_at[i]) < 5000)
 			continue;   // tried this one just now
-		g_wep_seen[k][s] = want;
-		g_wep_at[k][s] = now;
+		g_wep_seen[i] = want;
+		g_wep_at[i] = now;
 		unsigned obj = weapon_object(want);
 		if (!obj) {
-			logf("guest: %s slot %d needs weapon %s, none in this world", tag4(rd32(h + H_TAG), t1), s, tag4(want, t2));
+			logf("%s: puppet %s slot %d needs weapon %s, none in this world", g_role == 2 ? "guest" : "host",
+				tag4(rd32(ch + H_TAG), t1), i, tag4(want, t2));
 			continue;
 		}
 		if (!code_ok(0x4dc870, p_equip, 6))
 			return;
-		if (!((equip_weapon_t)0x4dc870)((void *)(uintptr_t)h, NULL, (void *)(uintptr_t)obj, s)) {
-			logf("guest: %s slot %d weapon %s refused by the game (object %p)", tag4(rd32(h + H_TAG), t1), s,
-				tag4(want, t2), (void *)(uintptr_t)obj);
+		if (!((equip_weapon_t)0x4dc870)((void *)(uintptr_t)ch, NULL, (void *)(uintptr_t)obj, i)) {
+			logf("%s: puppet %s slot %d weapon %s refused by the game (object %p)",
+				g_role == 2 ? "guest" : "host", tag4(rd32(ch + H_TAG), t1), i, tag4(want, t2),
+				(void *)(uintptr_t)obj);
 			continue;
 		}
-		logf("guest: %s slot %d = weapon %s (object %p)", tag4(rd32(h + H_TAG), t1), s, tag4(want, t2),
-			(void *)(uintptr_t)obj);
+		logf("%s: puppet %s slot %d = weapon %s (object %p)", g_role == 2 ? "guest" : "host",
+			tag4(rd32(ch + H_TAG), t1), i, tag4(want, t2), (void *)(uintptr_t)obj);
 	}
-	// Put the host's weapon in the hand and show it, exactly as the game does after restoring a save
-	// (FUN_004f1b80: +0x714 = record+0x24, then the weapon's vtable+0xcc).
-	if (c->wcur < 4 && rd32(h + 0x714) != c->wcur) {
-		unsigned wp = rd32(h + 0x704 + 4 * c->wcur);
+	// The slot in the hand: +0x714 as the game's save restore writes it (+0x714 = record+0x24), then the
+	// weapon's own show call (vtable+0xcc). Only when it really changed, so no clip/counter restarts.
+	if (s->wsel < 4 && rd32(ch + 0x714) != s->wsel) {
+		unsigned wp = rd32(ch + 0x704 + 4 * s->wsel);
 		unsigned vt = wp ? rd32(wp) : 0, show = vt ? rd32(vt + 0xcc) : 0;
 		if (wp && vt && image_ptr(vt) && show && !IsBadReadPtr((const void *)(uintptr_t)show, 1) && code_in_exe(show)) {
-			*(DWORD *)(uintptr_t)(h + 0x714) = c->wcur;
-			if (g_wep_seen_cur[k] != c->wcur) {
-				g_wep_seen_cur[k] = c->wcur;
-				logf("guest: %s holds weapon %s (slot %d)", tag4(rd32(h + H_TAG), t1), tag4(c->wep[c->wcur], t2), c->wcur);
-			}
+			*(DWORD *)(uintptr_t)(ch + 0x714) = s->wsel;
+			logf("%s: puppet %s holds weapon %s (slot %d)", g_role == 2 ? "guest" : "host",
+				tag4(rd32(ch + H_TAG), t1), tag4(s->wep[s->wsel], t2), s->wsel);
+			InterlockedIncrement(&g_hand_sets);
 			((void(__fastcall *)(void *, void *))show)((void *)(uintptr_t)wp, NULL);   // draw it
-		}
-	}
-}
-
-// guest: the snapshot loop asks for a hands sync; the input-update hook (the game's own update) does it.
-static LONG g_weap_pending;
-static ch_state g_weap_want[MAX_CH];
-static int g_weap_want_n;
-static int g_weap_said;
-
-static void guest_weapons_frame(void)
-{
-	if (g_role != 2 || !g_weap_pending)
-		return;
-	g_weap_pending = 0;
-	unsigned g = game_obj();
-	if (!g || rd32(g + 0x310) != 1 || rd32(g + 0x320) != 0)
-		return;   // not in game or a request is pending
-	unsigned hs[MAX_CH];
-	int n = world_humans(hs, MAX_CH), wn = g_weap_want_n > MAX_CH ? MAX_CH : g_weap_want_n;
-	for (int i = 0; i < wn; i++) {
-		for (int k = 0; k < n; k++) {
-			if (rd32(hs[k] + H_TAG) != g_weap_want[i].tag)
-				continue;
-			weapons_for(k, hs[k], &g_weap_want[i]);
-			break;
 		}
 	}
 }
@@ -3883,14 +4004,9 @@ static void guest_apply_state(void)
 			break;
 		}
 	}
-	// The hands are synced in the game's own input update, not here in Present (see weapons_for).
-	{
-		int wn = (int)st.n > MAX_CH ? MAX_CH : (int)st.n;
-		for (int i = 0; i < wn; i++)
-			g_weap_want[i] = st.ch[i];
-		g_weap_want_n = wn;
-		g_weap_pending = 1;
-	}
+	// TASK 50: the hands are no longer applied here (they used to be written into EVERY character from this
+	// snapshot, its own included). Each copy streams its own character's hands in PKT_CHAR and the
+	// receiver applies them to its puppet in puppet_weapons.
 }
 
 // ---- NPCs and enemies (the NPC manager at world + 0x1760: same container layout as the humans, same position
