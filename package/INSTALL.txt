@@ -8,39 +8,63 @@ What it is
   No game files are included. You need Obscure II from Steam (app 254480).
 
 Before you start
-  - BOTH players must install the SAME version (the number in this zip's name, also the first line of
-    README.txt). A host and a guest on different versions refuse each other.
+  - BOTH players must install the SAME version (the number in this zip's name and in the setup file's
+    name, also the first line of README.txt). A host and a guest on different versions refuse each
+    other.
   - Close the game before installing.
   - Steam must be running and both players must be Steam friends.
+  - Obscure II's Steam Cloud setting does not matter: the mod keeps its own copy of the saves (see
+    "Where your saves are" below). With Steam Cloud on, Steam may put an older save back into Steam's
+    own folder - that folder is not the one the mod reads, so the mod's saves are unaffected.
 
 Install
-  1. Unpack the whole zip into a folder of its own (the Desktop is fine). Do NOT unpack it into the
-     game folder: the installer keeps a backup of the file it replaces.
-  2. Right-click install.ps1 -> "Run with PowerShell".
-     Type the folder that has Obscure2.exe, usually
-       C:\Program Files (x86)\Steam\steamapps\common\Obscure II
-     If Windows refuses to run the script, open PowerShell in the unpacked folder and run
-       powershell -ExecutionPolicy Bypass -File .\install.ps1 "C:\...\Obscure II"
-  3. The installer says what it does, line by line:
+  1. Run obscoop2-<version>-setup.exe and follow the wizard. It finds the game through Steam's own
+     library folders; if it shows the wrong folder, use Browse and pick the one with Obscure2.exe.
+  2. It then says what it does:
        - it checks Obscure2.exe and REFUSES to install on anything but the Steam build 215294
          (a widescreen patch, a crack or a repack changes the exe and the mod would not work);
        - it backs up an xinput1_3.dll that is already there (xinput1_3.dll.bak) and never overwrites
          an existing backup;
-       - it warns if d3d9.dll is next to the exe (DXVK / ReShade): the mod is untested with those;
+       - it warns if d3d9.dll (DXVK / ReShade) is next to the exe: the mod is untested with those;
        - it copies the mod files into the game folder;
-       - it switches the campaign saves to real two-player (each patched save gets a .1p.bak copy);
+       - it copies YOUR Steam saves into the folder the mod reads them from (if more than one Steam
+         account on this PC has Obscure II saves, it asks which one). The saves in Steam are only
+         read: never moved, never changed. A file that is already in the mod's save folder and differs
+         is only replaced if you say yes;
+       - it switches those saves to real two-player (each patched save gets a .1p.bak copy);
        - it writes obscoop_install.txt, the list of everything it touched.
-  Do the same on the other PC.
+  3. Do the same on the other PC.
+  The same files are in the zip as a manual route (install.ps1, right-click -> Run with PowerShell).
+  The setup does everything that script does and also copies your Steam saves in; with the manual
+  route the saves have to be copied into the mod's save folder yourself (see below).
+
+Where your saves are
+  The mod does not read Steam's save folder; it keeps its own, and that is where the installer copied
+  your saves to. It is one of:
+    - game folder under Program Files (the usual Steam install):
+        %LOCALAPPDATA%\obscoop\coop_profile\remote
+      (paste that into Explorer's address bar; %LOCALAPPDATA% is normally
+       C:\Users\<you>\AppData\Local)
+    - game folder anywhere else:
+        <game folder>\coop_profile\remote
+  Steam's own copies stay where they were:
+        <Steam>\userdata\<your account number>\254480\remote
+  To start over with a clean profile, close the game and delete the mod's coop_profile folder; the next
+  start copies your Steam saves in again only if you run the setup again.
 
 Start the game
-  Use the .bat files in the game folder (they are described in README.txt):
+  Use the .bat files in the game folder, or the shortcuts the setup put in the Start menu
+  ("Obscure II Online Co-op"):
     host           start_host_steam.bat      guest           start_guest_steam.bat
     (no relay)     start_host_direct.bat      (no relay)      start_guest_direct.bat
   Both players start at the MAIN MENU. The host loads a save; the guest follows automatically.
 
 Uninstall
-  Right-click uninstall.ps1 -> "Run with PowerShell" and give the game folder. It restores the backups
-  and removes only the files the installer added (it reads obscoop_install.txt). Your saves go back to
-  the state they were in before the install.
+  Settings -> Apps -> "Obscure II Online Co-op" -> Uninstall (or the uninstall entry in the Start-menu
+  group). It restores the backups and removes only what the setup added (it reads obscoop_install.txt):
+  your xinput1_3.dll comes back, the patched saves go back to their state before the install, and the
+  saves the installer copied in from Steam are removed again while you have not played them.
+  Your Steam saves are not touched by any of this.
   The mod's own obscoop.log, obscoop_levels.txt and coop_profile\ folder are left in place; delete them
   if you want the folder perfectly clean.
+  Manual route: uninstall.ps1 "C:\...\Obscure II" does the same from the unpacked zip.

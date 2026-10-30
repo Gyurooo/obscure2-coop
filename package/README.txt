@@ -87,5 +87,5 @@ Reporting a bug
   Say what you were doing, what you expected, what happened, and the version (line 1 of this file).
   obscoop.log is plain text and the tail of it after the problem is the part that matters.
 
-Uninstall: see INSTALL.txt (uninstall.ps1).
+Uninstall: see INSTALL.txt (Settings -> Apps -> "Obscure II Online Co-op", or uninstall.ps1).
 No game files are shipped. MIT license.

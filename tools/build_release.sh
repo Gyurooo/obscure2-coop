@@ -3,7 +3,8 @@
 #
 # Builds xinput1_3.dll (the proxy mod) and obscoop-relay.exe from source, assembles the player package,
 # writes build/obscoop2-<version>.zip and - when OBSCOOP_ISCC is set - the installer
-# build/Obscoop2-Setup-<version>.exe. Prints the package file list and the SHA-256 of both.
+# build/obscoop2-<version>-setup.exe (next to the zip). Prints the package file list and the
+# SHA-256 of both.
 #
 # The zip is written with sorted entries and a fixed entry timestamp, so the same sources always give
 # the same file list and the same unpacked files. (The two .exe/.dll binaries themselves are not
@@ -20,7 +21,8 @@
 # Usage:  OBSCOOP_LLVM_MINGW=... OBSCOOP_STEAM_API=... OBSCOOP_ISCC=... sh tools/build_release.sh 1.7
 #
 # The zip stays what it was: unpack it and run install.ps1 by hand. The setup exe is the normal way in
-# for players (wizard, licence, game folder found by itself, save patch, registered uninstaller).
+# for players (wizard, licence, game folder found by itself, Steam save import, save patch,
+# registered uninstaller).
 
 set -eu
 
@@ -138,7 +140,7 @@ PY
 # package/obscoop2.iss packs the files above into the wizard. Only the version comes from here; the
 # payload is $PKG, so the setup installs exactly what is in the zip (plus obscoop.ini, and with the
 # same "never replace the player's settings" rule install.ps1 uses).
-SETUP=$OUT/Obscoop2-Setup-$VERSION.exe
+SETUP=$OUT/obscoop2-$VERSION-setup.exe
 if [ -n "${OBSCOOP_ISCC:-}" ]; then
 	if [ ! -f "$OBSCOOP_ISCC" ]; then
 		echo "OBSCOOP_ISCC is set but there is no such file: $OBSCOOP_ISCC (point it at ISCC.exe)" >&2
@@ -172,7 +174,7 @@ if [ -n "${OBSCOOP_ISCC:-}" ]; then
 		echo "ISCC did not produce $SETUP" >&2
 		exit 1
 	fi
-	echo "  setup  : Obscoop2-Setup-$VERSION.exe"
+	echo "  setup  : obscoop2-$VERSION-setup.exe"
 else
 	echo ""
 	echo "OBSCOOP_ISCC is not set: the setup exe was not built (the zip installs by hand with install.ps1)"
