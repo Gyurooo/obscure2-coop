@@ -588,8 +588,11 @@ static void drop_remote_look(xstate *s)
 // the guest's pause menu used to stay open until the convergence pulsed it (a race that failed in the
 // TASK 37 reviewer run). Every rising edge of player 2's START is counted here; menu_tick turns it into a
 // START pulse on player 1's pad on this copy as well.
-static volatile LONG g_p2_start_edges;
-static int g_p2_start_down;
+// TASK 57: the same for BACK, which the game reads only on player 1's pad: the guest's BACK has to open
+// the inventory on BOTH copies, so menu_tick runs the game's own state request on the copy that saw the
+// edge. (Player 2's buttons still reach the game on its own pad; only their MENU meaning is handled here.)
+static volatile LONG g_p2_start_edges, g_p2_back_edges;
+static int g_p2_start_down, g_p2_back_down;
 // TASK 45: the owner's NATIVE drop-in. A world loaded from a ONE-player save has player 2 unattached and
 // the partner on the teammate AI; the game itself joins player 2 when START is pressed on the second pad.
 // The mod drops START from player 2's pad on purpose (with two players it pauses both copies or opens
@@ -612,6 +615,10 @@ static void drop_remote_start(xstate *s)
 	g_p2_start_down = down;
 	if (!allow_p2_start())
 		s->buttons &= ~0x0010;
+	int back = (s->buttons & 0x0020) != 0;   // TASK 57: counted, not dropped (see the comment above)
+	if (back && !g_p2_back_down)
+		InterlockedIncrement(&g_p2_back_edges);
+	g_p2_back_down = back;
 }
 
 static volatile DWORD g_pause_pulse_until;   // host: keep START on player 1 until this tick (guest asked to pause)
@@ -641,9 +648,8 @@ static void net_rx_drop_set(DWORD ms);   // net.c: test-only receive-only drop (
 static void sync_status(char *reply, size_t replysz);
 static void scene_status(char *reply, size_t replysz);   // sync.c, TASK 30
 static void props_dump(char *reply, size_t replysz);
-static int menu_input_active(void);                    // sync.c, TASK 36: a shared menu is up (feed both pads)
-static int menu_pads_separate(void);                   // sync.c, TASK 51: the inventory has one cursor per pad
-static int menu_paused(void);                          // sync.c, TASK 36: the menu stops the characters
+static int menu_input_active(void);                    // sync.c, TASK 36: a shared menu is up
+static int menu_remote_pad_ok(void);                   // sync.c, TASK 57: the peer's pad may reach this copy's menu
 static void menu_status(char *reply, size_t replysz);  // sync.c, TASK 36: the menu state (pipe `menu`)
 static void screen_cmd(const char *args, char *reply, size_t replysz);  // window.c, TASK 44: pipe `screen`
 static void vmat_cmd(const char *args, char *reply, size_t replysz);     // window.c, TASK 44: pipe `vmat`
@@ -803,16 +809,14 @@ static void merge_pad(xstate *dst, const xstate *src)
 }
 
 // ---- shared menus: the pad side (TASK 36) ------------------------------------------------------------
-// While a menu is up (sync.c menu_input_active) the game must see BOTH players' pads on BOTH copies: the
-// pause menu and the inventory read player 1's pad only, so otherwise player 2 cannot move the cursor at
-// all (measured, FINDINGS_36 §7). Every copy has both pads (its own and the streamed one), and each copy
-// computes the same OR of the two, so both games run the same menu input and stay in lockstep.
-// g_last_ret keeps the RAW state (before merging) so a merged pad cannot be merged back into itself.
-// The pulse is the convergence press from sync.c menu_tick (a short button press on one pad).
+// TASK 57: the pad MERGE is gone. Measured in the game's own 2-player mode (FINDINGS_57 §5, passive
+// copy): the pause panel's binding table carries its directions and A with pad base -1 = "either pad"
+// (b00..b08) and B once per pad (b09/b10), and the inventory keeps one cursor per pad (b00..b09 pad 1,
+// b10..b19 pad 2), so the game itself reads BOTH controllers in a shared menu once each pad reaches its
+// own controller - no OR-merge needed (and the merge put one press on both controllers). What is left
+// here is the pulse: the mod's own short press (the scene skip's A, and the guest-join accept pulse).
 static volatile DWORD g_menu_pulse_until;
 static volatile LONG g_menu_pulse_user = -1, g_menu_pulse_btn, g_menu_pulse_rt;
-static xstate g_last_ret[2];
-static volatile DWORD g_last_ret_at[2];
 
 static void menu_pulse_start(int user, unsigned buttons, int rt, DWORD ms)
 {
@@ -832,45 +836,24 @@ static void menu_pulse_apply(DWORD user, xstate *s)
 		s->rt = (BYTE)g_menu_pulse_rt;
 }
 
-static void menu_merge(DWORD user, xstate *s)
-{
-	if (user > 1 || !menu_input_active() || menu_pads_separate())
-		return;   // TASK 51: while the inventory is up each pad drives only its OWN cursor (see sync.c)
-	int other = 1 - (int)user;
-	DWORD at = g_last_ret_at[other];
-	if (!at || GetTickCount() - at > 250)
-		return;   // the other pad was not polled recently: nothing reliable to merge
-	xstate o;
-	EnterCriticalSection(&g_vpad_cs);
-	o = g_last_ret[other];
-	LeaveCriticalSection(&g_vpad_cs);
-	s->buttons |= (WORD)(o.buttons & (user == 1 ? ~0x0010u : 0xffffu));   // START stays player 1's:
-	                                                                     // on player 2 it is "leave the game"
-	if (o.lt > s->lt) s->lt = o.lt;
-	if (o.rt > s->rt) s->rt = o.rt;
-	if (menu_paused()) {
-		// the inventory and the pause menu stop the characters: merge the sticks too (either player moves)
-		int lx = (int)s->lx + (int)o.lx, ly = (int)s->ly + (int)o.ly;
-		if (lx > 32767) lx = 32767;
-		if (lx < -32768) lx = -32768;
-		if (ly > 32767) ly = 32767;
-		if (ly < -32768) ly = -32768;
-		s->lx = (SHORT)lx;
-		s->ly = (SHORT)ly;
-	}
-}
+// TASK 57: player 1's START is the game's own pause key. It OPENS the pause menu by itself, but its
+// CLOSE path needs the menu manager's "current action" record to be the pause action (decompile
+// 209305-209315: FUN_0059b3e0(0x23) active AND manager+0x94 -> +0x10 == "PAUS"), and a D-pad press in the
+// menu replaces that record - measured in run_s57_a2.log: the host's START 0.5 s after a D-pad press left
+// both copies in state 5. So the memory of the last poll with START down is kept here; menu_tick repeats
+// the game's own close request when START is held while the pause menu has been open for a while.
+static volatile DWORD g_p1_start_at;   // the last poll with START down on player 1's pad
 
-// Every user<2 return of XInputGetState goes through here: keep the raw pad, merge the other player's pad
-// while a menu is up, and inject the menu pulse.
+// Every user<2 return of XInputGetState goes through here: inject the mod's pulse and watch player 1's
+// START.
 static DWORD pad_finish(DWORD user, void *state)
 {
 	if (user < 2) {
-		EnterCriticalSection(&g_vpad_cs);
-		g_last_ret[user] = *(xstate *)state;
-		g_last_ret_at[user] = GetTickCount();
-		LeaveCriticalSection(&g_vpad_cs);
-		menu_merge(user, (xstate *)state);
 		menu_pulse_apply(user, (xstate *)state);
+		if (user == 0) {
+			if (((xstate *)state)->buttons & 0x0010)
+				g_p1_start_at = GetTickCount();
+		}
 	}
 	return ERROR_SUCCESS;
 }
@@ -889,12 +872,15 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		if (delayed_input_on()) {
 			DWORD t_apply = timeline_now() - (DWORD)g_delay_ms;
 			memset(state, 0, sizeof(xstate));
-			if (user == 0 && !menu_input_active())   // TASK 42: the host's character is a puppet here
+			if (user == 0 && !menu_remote_pad_ok())   // TASK 42: the host's character is a puppet here
 				return pad_finish(user, state);
 			ring_get(user == 0 ? &g_ring_p1 : &g_ring_p2, t_apply, (xstate *)state);
 			if (user == 0) {
 				remap_if_known((xstate *)state);   // the host's stick is in the host's camera frame
 				drop_remote_look((xstate *)state);
+				// TASK 57: see the non-delayed path below - a START that opened this copy's menu must not
+				// toggle it again the moment the menu starts reading player 1's pad.
+				((xstate *)state)->buttons &= ~0x0010;
 			} else {
 				drop_remote_start((xstate *)state);
 			}
@@ -904,13 +890,18 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			if (g_peer_ok && !in_level) {   // menus and loading screens: this PC's own pad, so the friend can start their game
 				memset(state, 0, sizeof(xstate));
 				pad_read((DWORD)g_local_pad, state);
-			} else if (g_peer_ok && menu_input_active() && GetTickCount() - g_netpad_tick < 500) {
+			} else if (g_peer_ok && menu_remote_pad_ok() && GetTickCount() - g_netpad_tick < 500) {
 				// TASK 42: in normal play the host's character is a PUPPET on this copy - its pad must not
 				// reach the game at all. The streamed pad is served only where a shared MENU needs it
 				// (TASK 36/38: both pads drive the pause menu and the inventory on both copies).
 				memcpy(state, &g_netpad, sizeof(xstate));
 				remap_if_known((xstate *)state);
 				drop_remote_look((xstate *)state);
+				// TASK 57: START opened this menu (the host's own pause press, or the guest's edge turned
+				// into a request here); while it is still held it must not toggle the menu again through
+				// player 1's pad - measured: the guest's pause opened and closed within 16 ms
+				// (run_s57_a1.log), and the copy that had opened it closed it again 460 ms later.
+				((xstate *)state)->buttons &= ~0x0010;
 			} else if (g_peer_ok) {
 				memset(state, 0, sizeof(xstate));   // connected, the host's pad is idle or the stream is late
 			} else if (g_ever_connected && in_level) {
@@ -947,7 +938,7 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 	if (g_role == 1 && delayed_input_on() && (user == 0 || (int)user == g_remote_pad_idx)) {
 		DWORD t_apply = timeline_now() - (DWORD)g_delay_ms;
 		int down = p1_down();
-		if (user != 0 && !menu_input_active()) {   // TASK 42: the guest's character is a puppet here
+		if (user != 0 && !menu_remote_pad_ok()) {   // TASK 42: the guest's character is a puppet here
 			memset(state, 0, sizeof(xstate));
 			return pad_finish(user, state);
 		}
@@ -980,7 +971,7 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			LeaveCriticalSection(&g_vpad_cs);
 			return pad_finish(user, state);
 		}
-		if (g_role == 1 && g_peer_ok && (int)user == g_remote_pad_idx && game_in_level() && !menu_input_active()) {
+		if (g_role == 1 && g_peer_ok && (int)user == g_remote_pad_idx && game_in_level() && !menu_remote_pad_ok()) {
 			memset(state, 0, sizeof(xstate));   // TASK 42: the guest's character is a puppet here, no pad
 		} else {
 			memcpy(state, &g_vpad[user], sizeof(xstate));
@@ -1002,6 +993,12 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 		return pad_finish(user, state);
 	}
 	DWORD r = (real_XInputGetState && !g_hide_real_pads) ? real_XInputGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
+	// TASK 57: a REAL controller takes this path, and it used to return the raw pad: the menu pulse lives
+	// in pad_finish (and TASK 36's pad merge did too), so on the owner's PC (a real pad on user 0) the
+	// shared menus never saw the merged pad and every convergence press was dropped. The harness hides the
+	// real pads (duo.py sets OBSCOOP_HIDE_REAL_PADS=1), which is why no loopback test ever saw it.
+	if (r == ERROR_SUCCESS && user < 2)
+		return pad_finish(user, state);
 	return r;
 }
 

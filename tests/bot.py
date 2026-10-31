@@ -92,7 +92,8 @@ def write_png(path, w, h, bgra):
     open(path, 'wb').write(png)
 
 
-def shot(pid, path, scale=2):
+def shot_pixels(pid, scale=2):
+    """The game window as (ok, width, height, RGBA bytes) - `shot` writes it, a check may compare it."""
     h = window_of(pid)
     if not h:
         raise SystemExit('no window for pid %d' % pid)
@@ -121,6 +122,11 @@ def shot(pid, path, scale=2):
             row = data[(y * scale) * w * 4:(y * scale + 1) * w * 4]
             rows.append(b''.join(row[x * scale * 4:x * scale * 4 + 4] for x in range(sw)))
         data, w, hh = b''.join(rows), sw, sh
+    return ok, w, hh, data
+
+
+def shot(pid, path, scale=2):
+    ok, w, hh, data = shot_pixels(pid, scale)
     write_png(path, w, hh, data)
     return ok, w, hh
 

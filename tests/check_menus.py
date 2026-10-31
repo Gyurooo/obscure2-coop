@@ -1,22 +1,28 @@
-"""TASK 36: a menu is a SHARED session state - both screens show it, both pads drive it, either closes it.
+"""TASK 36/57: a menu is a SHARED session state - both screens show it, either player opens and closes it,
+each pad moves what the game lets that player move, and a real link ends with both copies in the same
+state within 1 s (the mod runs the game's own menu request on the copy that is behind, FINDINGS_57 §4).
 
 Reads the game's own menu state on BOTH copies (`world+0x11c`: 1 = normal play, 5 = the pause menu, 2 = the
 live inventory CMenuInventoryLive; `controller+0xa4`: 3 = weapon wheel, 4 = item menu - FINDINGS_36 §2-§4)
 and drives the pads of each copy through the mod's pipe:
 
-  1. the host opens the pause menu -> state 5 on BOTH copies;
-  2. the guest navigates it (D-pad) and closes it with START -> state 1 on BOTH (the guest's START is the
-     mod's pause pulse path);
-  3. the host opens the inventory (BACK) -> state 2 on BOTH; the guest moves in it (D-pad) and closes it
-     with B -> state 1 on BOTH (B is a plain menu action, so this proves the guest's pad drove the menu
-     through the mod's merged input, not through the START special case);
-  4. the weapon wheel: the host's D-pad raises controller 1's UI state 3 on BOTH copies; the guest's D-pad
-     raises controller 2's on BOTH;
-  5. every step prints the `menu` pipe line of both copies (this copy's and the peer's state).
+  1. the HOST opens the pause menu (START) -> state 5 on BOTH within 1 s; both pads move the selection (the
+     pause panel's directions carry pad base -1 = either pad, FINDINGS_57 §5); the GUEST closes it (START);
+  2. the GUEST opens the pause menu -> state 5 on both within 1 s; the HOST closes it;
+  3. the HOST opens the inventory (BACK) -> state 2 on both; host D-pad moves only cursor 0 and guest D-pad
+     only cursor 1 on both copies; each side closes it;
+  4. the GUEST opens the inventory (BACK) -> state 2 on both within 1 s (the press the guest could never
+     make in 2.1: the game reads only player 1's BACK), the host closes it;
+  5. a selection by each player lands once on both copies (move a weapon into a hand slot);
+  6. screenshots of both windows with the inventory open and the two cursors on different cells;
+  7. in normal play the guest's D-pad (the weapon switch / wheel) moves NO inventory cursor on either copy;
+  8. the per-player UI (wheel, aim stance) shows on both copies from either pad.
 
-The map and the document panels are `CMenuPanel*` items of the same live-inventory menu (state 2), so they
-move under the same merged input; they are not separately reachable from a pad in the test save and are
-reported as "same code path, not tested live".
+The map is NOT reachable from a pad in these saves, and the check says so with the measurement: the live
+inventory has exactly THREE tabs (FUN_0054c0b0 / FUN_0054c110 cycle the index over 3), its map binding
+(action 0x16 -> target 28, pad base -1) has no case in the panel's action handler FUN_0054c170, and no pad
+button in the shipped input map raises action 0x16 (FINDINGS_57 §6). Its code path - a CMenuPanel child of
+the same menu system, opened by the same world state requests - is shared with the panels proved here.
 
 Usage: python -I check_menus.py <host pid> <guest pid> [--shots <dir>]
 """
@@ -25,7 +31,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bot import Pipe, press, shot
+from bot import Pipe, press, shot, shot_pixels
 from peek import Proc
 from tp_to_items import level, tag, u32, world
 
@@ -174,6 +180,18 @@ def in_level(m):
     return menu_state(m) == 1 and (level(m) or 0) != 0
 
 
+def scene_req(m):
+    """world+0x12c: the requested state. In normal play a non-zero value is a SCRIPTED EVENT
+    (FINDINGS_36 §2), and a scripted event drives world state 5 itself (the level script requests the
+    pause state; observed in run_s57_a1.log) - so a menu is only checked outside one."""
+    w = world(m)
+    return u32(m, w + 0x12c) if w else 0
+
+
+def playable(m):
+    return in_level(m) and not scene_req(m)
+
+
 def teammate_human(m):
     """TASK 38: the character the game's teammate controller (world+0x174c) is linked to. The mod's
     TASK 35 door fix unlinks player 2's character from it in normal play; TASK 38's guard puts it back
@@ -213,24 +231,36 @@ def check(ok, what):
     return ok
 
 
+def pause_region(pid):
+    """The pause menu's own entry box as sampled pixels. The live game background behind the box animates,
+    so a navigation check compares only the box (it fills the middle of the window at either size)."""
+    ok, w, h, data = shot_pixels(pid)
+    out = []
+    for y in range(int(h * 0.34), int(h * 0.75), 2):
+        for x in range(int(w * 0.20), int(w * 0.82), 2):
+            i = (y * w + x) * 4
+            out.append(data[i:i + 3])
+    return b''.join(out)
+
+
 t0 = time.time()
 while time.time() - t0 < 60:
-    if in_level(H) and in_level(G):
+    if playable(H) and playable(G):
         break
     time.sleep(0.3)
 if not (in_level(H) and in_level(G)):
     print('NOT IN A LEVEL on both copies (host %s guest %s): check skipped' % (menu_state(H), menu_state(G)))
     sys.exit(1)
 
-# TASK 52: the level load plays a scripted event (the scene code drives world state 1 <-> 5 for seconds
-# after the level appears - obscoop.log "scene: this copy entered a scripted event"). Opening a menu in
-# the middle of it gets the menu closed again by the game when the event ends, so start only after
-# NORMAL PLAY HAS BEEN STABLE for 6 s on both copies.
+# TASK 52/57: the level load plays a scripted event (the scene code drives world state 1 <-> 5 for seconds
+# after the level appears - obscoop.log "scene: this copy entered a scripted event"), and the event's own
+# script requests the pause state. Opening a menu in the middle of it is closed again by the game when the
+# event ends, so start only after NORMAL PLAY WITH NO SCENE has been stable for 6 s on both copies.
 STABLE = 6.0
 stable_since = None
 t0 = time.time()
 while time.time() - t0 < 60:
-    if in_level(H) and in_level(G):
+    if playable(H) and playable(G):
         if stable_since is None:
             stable_since = time.time()
         elif time.time() - stable_since >= STABLE:
@@ -239,8 +269,9 @@ while time.time() - t0 < 60:
         stable_since = None
     time.sleep(0.25)
 if stable_since is None or time.time() - stable_since < STABLE:
-    print('NOT STABLE: normal play did not last %.0f s on both copies (host st %s level %s, guest st %s level %s)'
-          % (STABLE, menu_state(H), tag(level(H)), menu_state(G), tag(level(G))))
+    print('NOT STABLE: normal play without a scene did not last %.0f s on both copies (host st %s scene %s level %s,'
+          ' guest st %s scene %s level %s)'
+          % (STABLE, menu_state(H), scene_req(H), tag(level(H)), menu_state(G), scene_req(G), tag(level(G))))
     sys.exit(1)
 
 lvl = tag(level(H))
@@ -251,41 +282,73 @@ print('   teammate controller: host %s | guest %s (TASK 38: 0 in normal play, re
 
 results = []
 
-print('\n== 1. the host opens the pause menu (START on the host pad)')
+print('\n== 1. the HOST opens the pause menu (START on the host pad) -> state 5 on both within 1 s')
 press(HP, 0, 'START', 0.2)
-t = wait_for(lambda: both(lambda m: menu_state(m) == 5), 5.0)
+t = wait_for(lambda: both(lambda m: menu_state(m) == 5), 1.0)
 show('after host START')
 print('   both copies show the pause menu after %s s' % ('%.2f' % t if t is not None else 'NO'))
-results.append(check(t is not None, 'pause menu shown on both'))
+results.append(check(t is not None, 'pause menu shown on both within 1 s'))
 tg = teammate_human(G)
 print('   guest teammate controller -> character %s' % tg)
 results.append(check(tg not in (None, 0), 'guest teammate restored while a menu is up (TASK 38 guard)'))
 print('   host  menu: %s' % pipe_menu(HP))
 print('   guest menu: %s' % pipe_menu(GP))
+shot(host_pid, os.path.join(shots, 'menus_pause_host.png'))
+shot(guest_pid, os.path.join(shots, 'menus_pause_guest.png'))
 
-print('\n== 2. the guest navigates it (D-pad on the guest pad) and closes it (START on the guest pad)')
-press(GP, 0, 'DOWN', 0.2)
-time.sleep(0.4)
-press(GP, 0, 'UP', 0.2)
-time.sleep(0.4)
-show('after guest D-pad')
-results.append(check(both(lambda m: menu_state(m) == 5), 'still open while the guest navigates'))
+print('\n== 2. both pads move the pause selection (its directions are bound with pad base -1 = either pad)')
+ok, w, h, _ = shot_pixels(host_pid)
+print('   host window %dx%d; comparing the menu box only' % (w, h))
+stable = pause_region(host_pid)
+time.sleep(0.6)
+stable = stable == pause_region(host_pid)
+results.append(check(stable, 'the pause menu picture is stable with no input (the comparison is usable)'))
+if stable:
+    b = pause_region(host_pid)
+    press(GP, 0, 'DOWN', 0.2)
+    time.sleep(0.7)
+    results.append(check(pause_region(host_pid) != b, "the guest's D-pad moves the pause selection (seen on the host)"))
+    results.append(check(both(lambda m: menu_state(m) == 5), 'still open while the guest navigates'))
+    b = pause_region(host_pid)
+    press(HP, 0, 'DOWN', 0.2)
+    time.sleep(0.7)
+    results.append(check(pause_region(host_pid) != b, "the host's D-pad moves the pause selection"))
+show('after the pause navigation')
+
+print('\n== 3. the GUEST closes the pause menu (START) -> state 1 on both within 1 s')
 press(GP, 0, 'START', 0.2)
-t = wait_for(lambda: both(lambda m: menu_state(m) == 1), 6.0)
+t = wait_for(lambda: both(lambda m: menu_state(m) == 1), 1.0)
 show('after guest START')
 print('   both copies left the pause menu after %s s' % ('%.2f' % t if t is not None else 'NO'))
-results.append(check(t is not None, 'guest closes the pause menu on both'))
+results.append(check(t is not None, 'the guest closes the pause menu on both within 1 s'))
 
-print('\n== 3. the host opens the inventory (BACK: CMenuInventoryLive, state 2)')
+print('\n== 4. the GUEST opens the pause menu (START) -> state 5 on both within 1 s; the HOST closes it')
+time.sleep(0.5)
+press(GP, 0, 'START', 0.2)
+t = wait_for(lambda: both(lambda m: menu_state(m) == 5), 1.0)
+show('after guest START (open)')
+print('   both copies show the pause menu after %s s' % ('%.2f' % t if t is not None else 'NO'))
+results.append(check(t is not None, 'the guest opens the pause menu on both within 1 s'))
+time.sleep(0.5)
+press(HP, 0, 'START', 0.2)
+t = wait_for(lambda: both(lambda m: menu_state(m) == 1), 1.0)
+show('after host START (close)')
+print('   both copies left the pause menu after %s s' % ('%.2f' % t if t is not None else 'NO'))
+results.append(check(t is not None, 'the host closes the pause menu on both within 1 s'))
+
+print('\n== 5. the HOST opens the inventory (BACK: CMenuInventoryLive, state 2) -> both within 1 s')
+time.sleep(0.5)
 press(HP, 0, 'BACK', 0.25)
-t = wait_for(lambda: both(lambda m: menu_state(m) == 2), 5.0)
+t = wait_for(lambda: both(lambda m: menu_state(m) == 2), 1.0)
 show('after host BACK')
 print('   both copies show the inventory after %s s' % ('%.2f' % t if t is not None else 'NO'))
-results.append(check(t is not None, 'inventory shown on both'))
+results.append(check(t is not None, 'inventory shown on both within 1 s'))
 print('   host  menu: %s' % pipe_menu(HP))
 print('   guest menu: %s' % pipe_menu(GP))
+shot(host_pid, os.path.join(shots, 'menus_inv_host.png'))
+shot(guest_pid, os.path.join(shots, 'menus_inv_guest.png'))
 
-print('\n== 4. two cursors: the host pad moves only cursor 0, the guest pad only cursor 1, on BOTH copies')
+print('\n== 6. two cursors: the host pad moves only cursor 0, the guest pad only cursor 1, on BOTH copies')
 start = (cursors(H), cursors(G))
 print('   start: host %s | guest %s' % start)
 results.append(check(start[0] == start[1] and start[0][0] >= 0,
@@ -328,7 +391,7 @@ results.append(check(hc is not None and gc is not None and hc[0] == 0 and gc[1] 
                      'each copy writes only the PEER cursor (own-cursor writes: host p1 %s, guest p2 %s)'
                      % (hc[0] if hc else '?', gc[1] if gc else '?')))
 
-print('\n== 5. a selection by each player lands once on both copies (move a weapon into a hand slot)')
+print('\n== 7. a selection by each player lands once on both copies (move a weapon into a hand slot)')
 # TASK 52: A on the weapon grid picks the item under the cursor up (panel+0x148), the next A drops it:
 # a swap with the cell under the cursor (FUN_0054b2c0 -> FUN_00549a10). Dropping into one of the
 # character's hand-slot cells (panel+0xc0 cells 16..19 = player 1, 20..23 = player 2) is the equip; the
@@ -391,7 +454,7 @@ press(HP, 0, 'BACK', 0.25)          # reopen for the screenshots and the close/o
 wait_for(lambda: both(lambda m: menu_state(m) == 2), 6.0)
 show('inventory open again')
 
-print('\n== 6. screenshots of both windows: the two cursors on different cells')
+print('\n== 8. screenshots of both windows: the two cursors on different cells')
 cells = grid(H)
 p1 = path_to(cells, cursors(H)[1], 3) if cells else None
 p2 = path_to(cells, cursors(H)[2], 6) if cells else None
@@ -410,23 +473,41 @@ shot(guest_pid, gp)
 print('   host shot: %s' % hp)
 print('   guest shot: %s' % gp)
 
-print('\n== 7. close and open from each side')
+print('\n== 9. close and open the inventory from each side (both copies within 1 s)')
 for who, pad, user in (('guest', GP, 0), ('host', HP, 0)):
     press(pad, user, 'BACK', 0.25)
-    t = wait_for(lambda: both(lambda m: menu_state(m) == 1), 6.0)
+    t = wait_for(lambda: both(lambda m: menu_state(m) == 1), 1.0)
+    print('   both copies left the inventory after %s s' % ('%.2f' % t if t is not None else 'NO'))
     show('after %s BACK (close)' % who)
-    results.append(check(t is not None, "the %s's BACK closes the inventory on both copies" % who))
+    results.append(check(t is not None, "the %s's BACK closes the inventory on both copies within 1 s" % who))
     time.sleep(0.5)
     press(pad, user, 'BACK', 0.25)
-    t = wait_for(lambda: both(lambda m: menu_state(m) == 2), 6.0)
+    t = wait_for(lambda: both(lambda m: menu_state(m) == 2), 1.0)
+    print('   both copies show the inventory after %s s' % ('%.2f' % t if t is not None else 'NO'))
     show('after %s BACK (open)' % who)
-    results.append(check(t is not None, "the %s's BACK opens the inventory on both copies" % who))
+    results.append(check(t is not None, "the %s's BACK opens the inventory on both copies within 1 s" % who))
     time.sleep(0.5)
 press(HP, 0, 'BACK', 0.25)
 t = wait_for(lambda: both(lambda m: menu_state(m) == 1), 6.0)
 results.append(check(t is not None, 'back to normal play for the per-player UI checks'))
 
-print('\n== 8. the per-player UI (controller+0xa4) shows on both copies from either pad')
+print('\n== 10. no cursor moves outside a menu: the guest D-pad (weapon switch) in normal play')
+c_before = (cursors(H), cursors(G))
+print('   cursors before: host %s | guest %s' % c_before)
+GP.cmd('pad 0 0x8')          # the guest's D-pad RIGHT: the weapon wheel (controller ui 3)
+time.sleep(0.6)
+ui = (ui_state(H), ui_state(G))
+GP.cmd('pad 0 0')
+time.sleep(0.6)
+c_after = (cursors(H), cursors(G))
+print('   weapon wheel on both copies: host ui %s guest ui %s' % (ui[0], ui[1]))
+print('   cursors after:  host %s | guest %s' % c_after)
+results.append(check(ui[0][1] == 3 and ui[1][1] == 3, "the guest's weapon switch still shows on both copies"))
+results.append(check(c_before == c_after, 'the guest D-pad in normal play moved NO inventory cursor on either copy'))
+results.append(check(both(lambda m: menu_state(m) == 1), 'still normal play on both'))
+time.sleep(0.4)
+
+print('\n== 11. the per-player UI (controller+0xa4) shows on both copies from either pad')
 # TASK 43: the wheel and the aim stance are the CHARACTER'S OWN controller state, and the puppet's
 # controller does not run on the other copy any more (TASK 42) - the owner now streams the state and the
 # other copy makes the game's own HUD calls for that player, so this works again by design.
@@ -468,7 +549,7 @@ time.sleep(0.4)
 show('after LB release')
 results.append(check(both(lambda m: menu_state(m) == 1), 'still normal play on both'))
 
-print('\n== 9. after the menus: the two copies are in the same state')
+print('\n== 12. after the menus: the two copies are in the same state')
 show('final')
 results.append(check(both(lambda m: menu_state(m) == 1) and tag(level(H)) == tag(level(G)), 'both normal, same level'))
 t = wait_for(lambda: teammate_human(G) == 0, 2.0)

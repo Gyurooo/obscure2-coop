@@ -7468,33 +7468,33 @@ static int item_use_forward(int player, unsigned tag, char *reply, size_t replys
 // the "guest START -> player-1 START pulse" has always worked. One pulse per correction, 400 ms apart.
 #define MENU_PERIOD_MS 250
 #define MENU_PEER_STALE_MS 1500
-#define MENU_FRESH_MS 600       // TASK 37: a peer packet older than this is not acted on
-#define MENU_SETTLE_MS 600      // TASK 37: no correction for this long after a LOCAL state change/pulse
-#define MENU_STABLE_MS 500      // TASK 37: the divergence must persist this long in fresh packets
-#define MENU_PULSE_MS 160
-#define MENU_PULSE_GAP_MS 420
+#define MENU_FRESH_MS 400       // TASK 37/57: a peer packet older than this is not acted on
+#define MENU_SETTLE_MS 300      // TASK 57: no correction for this long after a LOCAL state change
+#define MENU_STABLE_MS 150      // TASK 57: the divergence must persist this long in fresh packets
+#define MENU_REQ_GAP_MS 150     // TASK 57: two game requests are at least this far apart
 
 static volatile LONG g_menu_state = -1, g_menu_ui0, g_menu_ui1;        // this copy (game thread writes)
 static volatile LONG g_peer_menu_state = -1, g_peer_menu_ui0, g_peer_menu_ui1, g_peer_menu_level, g_peer_menu_seq;
 static volatile DWORD g_peer_menu_at;
 static DWORD g_menu_sent_at, g_menu_sent_ui0 = (DWORD)-1, g_menu_sent_ui1 = (DWORD)-1;
 static LONG g_menu_sent_state = -1;
-static DWORD g_menu_pulse_at;
-static volatile LONG g_menu_pulses, g_menu_sent, g_menu_rcv;
-// TASK 37: a convergence pulse is only pressed on a STABLE, CONFIRMED divergence. The reviewer's run lost
-// the inventory close to the opposite: both copies left the inventory within 9 ms, each then read the
-// peer's previous packet (still "in the inventory") and pressed BACK (the open button) on its own pad,
-// which re-opened it on both. So: never act within MENU_SETTLE_MS of this copy's own change, never act on a
+static DWORD g_menu_req_at;
+static volatile LONG g_menu_reqs, g_menu_sent, g_menu_rcv;
+// TASK 37: a correction is only made on a STABLE, CONFIRMED divergence. The reviewer's run lost the
+// inventory close to the opposite: both copies left the inventory within 9 ms, each then read the peer's
+// previous packet (still "in the inventory") and pressed BACK (the open button) on its own pad, which
+// re-opened it on both. So: never act within MENU_SETTLE_MS of this copy's own change, never act on a
 // peer packet older than MENU_FRESH_MS, and only after the mismatch has survived MENU_STABLE_MS.
-static DWORD g_menu_local_changed_at;   // this copy's own last menu change (or pulse)
+static DWORD g_menu_local_changed_at;   // this copy's own last menu change (or correction)
 static DWORD g_menu_div_since;          // when the current mismatch was first seen
 static LONG g_menu_div_pst = -1;        // ... and the peer state it was seen with
 static LONG g_menu_div_seq = -1;
-static volatile LONG g_menu_corrections, g_menu_gated;   // pulses issued for a confirmed divergence / corrections skipped as not yet stable
-// TASK 38: player 2's START edges (drop_remote_start in obscoop2.c). A START on player 2's pad cannot
-// close a shared menu by itself - the game reads player 1's pad for the pause menu, and the network pulse
-// only fires on the host - so menu_tick turns the edge into a START pulse on player 1's pad on THIS copy.
-static DWORD g_menu_p2_edges;
+static volatile LONG g_menu_corrections, g_menu_gated;   // requests issued for a confirmed divergence / corrections skipped as not yet stable
+// TASK 38/57: player 2's START and BACK edges (drop_remote_start in obscoop2.c). The game reads both
+// keys on PLAYER 1's pad only, so menu_tick gives them their menu meaning on the copy that saw the edge
+// (the peer then follows the streamed state): START opens/leaves the pause menu, BACK opens the inventory.
+static DWORD g_menu_p2_edges, g_menu_p2_back_edges;
+static DWORD g_menu_menu_since;   // TASK 57: when this copy entered the pause menu (5)
 // Menu changes are ordered by a sequence number, exactly like the scene sync's leave_seq (TASK 31): every
 // LOCAL change bumps g_menu_my_seq, and a copy only corrects a divergence for a state NEWER than the one it
 // has already applied. Without the order the two copies chase each other (measured: 2 -> 1 -> 2 ... every
@@ -7528,6 +7528,59 @@ static void menu_read(int *state, int *ui0, int *ui1)
 static int menu_world_menu(int st)
 {
 	return st == 2 || st == 5;
+}
+
+// ---- TASK 57: the game's OWN open/close requests ------------------------------------------------
+// The convergence used to PRESS a button on this copy and hope the game read it; on the owner's real
+// link the guest pulsed B 12 times over 20 s and its state never changed (SYNC_AUDIT §3.2). The game
+// has an explicit request path for every menu: the world keeps the CURRENT state in world+0x11c and the
+// REQUESTED one in world+0x12c (+0x130 entry), and the world update consumes it (FUN_004b4cb0,
+// decompile 110040-110200: the state-5 handler, 110130-110150; the state-2 handler, 110080-110095).
+// Calling the game's own request function is what the owner's Obscure 1 mod does too (host_open_pause,
+// coopdll\src\sync.c ~2042: it calls the menu manager's open function, it never presses a button):
+//   FUN_004b2730 (108501)  request state 5 = the pause menu (from state 1/3; stores the old state +0x180)
+//   FUN_004b2770 (108518)  leave the pause menu: request the state stored in +0x180
+//   FUN_004b2600 (108417)  request state 2 = the live inventory (mode in +0x134)
+//   FUN_004b25c0 (108395)  request state 1 = normal play (leaving 2 runs FUN_0054beb0(0,0), the commit)
+// Each is __thiscall with the world as this and returns 1 when the request was taken; 0 means a request
+// is already in flight, which the next tick retries. NOTE the argument count: FUN_004b2600 takes ONE
+// stack argument (the mode), the other three take NONE. GCC's __fastcall lets the CALLEE pop the stack
+// arguments, so calling a no-argument game function through a 3-argument pointer leaks the pushed mode
+// and the thread returns to a garbage address (measured: eip 0x1, the guest's game thread stuck in
+// menu_tick, run run_s57_a1.log) - hence two pointer types.
+typedef int(__fastcall *menu_req0_t)(void *world, void *edx);
+typedef int(__fastcall *menu_req1_t)(void *world, void *edx, unsigned mode);
+
+static unsigned menu_world(void)
+{
+	unsigned w = world_obj();
+	if (!w || !mem_ok((const void *)(uintptr_t)w, 0x1a0))
+		return 0;
+	return w;
+}
+
+static int menu_game_open(int st)
+{
+	unsigned w = menu_world();
+	if (!w)
+		return 0;
+	if (st == 5)
+		return ((menu_req0_t)0x004b2730)((void *)(uintptr_t)w, NULL);
+	if (st == 2)
+		return ((menu_req1_t)0x004b2600)((void *)(uintptr_t)w, NULL, 0);
+	return 0;
+}
+
+static int menu_game_close(int st)
+{
+	unsigned w = menu_world();
+	if (!w)
+		return 0;
+	if (st == 5)
+		return ((menu_req0_t)0x004b2770)((void *)(uintptr_t)w, NULL);
+	if (st == 2)
+		return ((menu_req0_t)0x004b25c0)((void *)(uintptr_t)w, NULL);
+	return 0;
 }
 
 // ---- TASK 51: the inventory's two cursors --------------------------------------------------------------
@@ -7659,22 +7712,23 @@ int menu_input_active(void)
 	return menu_world_menu((int)g_menu_state);
 }
 
-// TASK 51: the inventory menu (world state 2) draws ONE cursor per player and keeps them apart itself:
+// TASK 51/57: the inventory menu (world state 2) draws ONE cursor per player and keeps them apart itself:
 // CMenuInventory's own binding array (read live from game+0x46c, FINDINGS_51) holds actions 1..4 (directions),
 // 9 and 10 (A/B) twice - once with pad base 0 and cursor parameter 0, once with pad base 0x28 and cursor
-// parameter 1 - and its tab panels keep the two cursors at +0x138 (player 1) and +0x13c (player 2). So while
-// it is up each pad must reach the game as its own pad; merging them (TASK 36) is what makes either pad move
-// BOTH cursors (the owner's bug). The pause menu keeps the merged pad: it has a single cursor.
-int menu_pads_separate(void)
+// parameter 1 - and its tab panels keep the two cursors at +0x138 (player 1) and +0x13c (player 2). The
+// pause panel likewise reads "either pad" for its directions and A (pad base -1, FINDINGS_57 §5). So while
+// a shared menu is up each pad must reach the game as its OWN pad: no merge.
+//
+// TASK 57: may the peer's pad reach the game on THIS copy? Only while this copy shows a shared menu, and
+// for the inventory only while the PEER is in it too: the peer's D-pad in normal play is its weapon wheel,
+// and with this copy's inventory open it moved the peer's blue cursor there (owner issue 3 in 2.1).
+int menu_remote_pad_ok(void)
 {
-	return (int)g_menu_state == 2;
-}
-
-// Called from XInputGetState: may the merged pad also move the CHARACTER? Only in the paused menu states;
-// in the wheel / item menu the characters still walk, so only buttons and triggers are merged there.
-int menu_paused(void)
-{
-	return menu_world_menu((int)g_menu_state);
+	if (!menu_input_active())
+		return 0;
+	if ((int)g_menu_state == 2 && (int)g_peer_menu_state != 2)
+		return 0;
+	return 1;
 }
 
 // Pipe/status text (game thread values; the pipe thread reads them at its own risk, like the other dumps).
@@ -7685,11 +7739,11 @@ static void menu_status(char *reply, size_t replysz)
 	menu_read_cursors(&tab, &c0, &c1);
 	_snprintf(reply, replysz,
 	          "menu local st %d ui %d/%d tab %d cur %d/%d seq %lu | peer st %ld ui %ld/%ld tab %ld cur %ld/%ld seq %ld age %lu ms | "
-	          "sent %ld rcv %ld pulses %ld correct %ld gated %ld | cursor writes p1 %ld p2 %ld, binding fixes %ld",
+	          "sent %ld rcv %ld reqs %ld correct %ld gated %ld | cursor writes p1 %ld p2 %ld, binding fixes %ld",
 	          st, ui0, ui1, tab, c0, c1, (unsigned long)g_menu_my_seq, g_peer_menu_state, g_peer_menu_ui0,
 	          g_peer_menu_ui1, g_peer_menu_tab, g_peer_menu_cur0, g_peer_menu_cur1, g_peer_menu_seq,
 	          (unsigned long)(g_peer_menu_at ? GetTickCount() - g_peer_menu_at : 0),
-	          g_menu_sent, g_menu_rcv, g_menu_pulses, g_menu_corrections, g_menu_gated,
+	          g_menu_sent, g_menu_rcv, g_menu_reqs, g_menu_corrections, g_menu_gated,
 	          g_menu_cursor_w0, g_menu_cursor_w1, g_menu_bind_fixes);
 }
 
@@ -7711,17 +7765,6 @@ static void peer_on_menu(const char *buf, int n)
 	InterlockedIncrement(&g_menu_rcv);
 }
 
-// A short press of a button on one pad, through XInputGetState (obscoop2.c).
-static void menu_pulse(int user, unsigned buttons, int rt, char what)
-{
-	menu_pulse_start(user, buttons, rt, MENU_PULSE_MS);
-	g_menu_pulse_at = GetTickCount();
-	g_menu_local_changed_at = g_menu_pulse_at;   // TASK 37: do not correct again before the settle window is over
-	InterlockedIncrement(&g_menu_pulses);
-	logf("%s: sharing the menu: pulsing %c on player %d's pad (peer menu %ld, this copy %ld)", 
-	     g_role == 2 ? "guest" : "host", what, user + 1, g_peer_menu_state, g_menu_state);
-}
-
 // Game thread, once per frame: publish this copy's menu state and repair a divergence.
 static void menu_tick(void)
 {
@@ -7733,6 +7776,8 @@ static void menu_tick(void)
 	g_menu_state = st;
 	g_menu_ui0 = ui0;
 	g_menu_ui1 = ui1;
+	if (st != prev && st == 5)
+		g_menu_menu_since = GetTickCount();   // TASK 57: the pause menu just opened on this copy
 	if (!g_peer_ok)
 		return;
 	// TASK 52: the inventory's two cursors - patch the pad-2 D-pad parameters once per built array and
@@ -7745,15 +7790,42 @@ static void menu_tick(void)
 		g_menu_cur1 = -1;
 	}
 	DWORD now = GetTickCount();
-	// TASK 38: player 2's START while a shared menu is up: make it a START press on player 1's pad on this
-	// copy, the same edge the host's network pulse makes there. It is an EDGE, and only while the menu
-	// was ALREADY up at the previous tick (prev and st both a menu): the press that opened the menu can
-	// never close it again, whichever copy opened it or however the open pulse reached this copy.
-	DWORD edges = (DWORD)g_p2_start_edges;
-	if (edges != g_menu_p2_edges) {
-		g_menu_p2_edges = edges;
-		if (menu_world_menu(prev) && menu_world_menu(st))
-			menu_pulse(0, 0x0010, 0, 'S');
+	// TASK 38/57: player 2's START and BACK are menu keys the game reads on PLAYER 1's pad only. The copy
+	// whose own pad pressed runs the game's own request here; the peer follows the streamed state. START
+	// in normal play opens the pause menu and START in the pause menu leaves it; BACK in normal play opens
+	// the inventory (that is the press the guest could never make: owner issue 2). Both are EDGES, so the
+	// press that opened a menu can never close it again.
+	if (g_role == 2) {
+		DWORD edges = (DWORD)g_p2_start_edges;
+		if (edges != g_menu_p2_edges) {
+			g_menu_p2_edges = edges;
+			if (st == 1)
+				menu_game_open(5);
+			else if (st == 5)
+				menu_game_close(5);
+		}
+		DWORD bedges = (DWORD)g_p2_back_edges;
+		if (bedges != g_menu_p2_back_edges) {
+			g_menu_p2_back_edges = bedges;
+			if (st == 1)
+				menu_game_open(2);
+		}
+	}
+	// TASK 57: player 1's START is the game's own pause key and it OPENS the menu by itself; this only
+	// repeats the game's own CLOSE when START is held while the pause menu has been open for a while (the
+	// game's own close misses it once its current-action record is not the pause action any more, see
+	// obscoop2.c g_p1_start_at). The 500 ms window is what keeps the press that OPENED the menu - held
+	// for 200 ms - from closing it.
+	if (st == 5 && now - g_menu_menu_since >= 500 && g_p1_start_at && now - g_p1_start_at <= 120 &&
+	    now - g_menu_req_at >= MENU_REQ_GAP_MS) {
+		unsigned w = world_obj();
+		int ok = menu_game_close(5);
+		if (ok) {
+			InterlockedIncrement(&g_menu_reqs);
+			logf("%s: menu request: leaving the pause menu after player 1's START (request %lu, prev state %lu)",
+			     g_role == 2 ? "guest" : "host", (unsigned long)(w ? rd32(w + 0x12c) : 0),
+			     (unsigned long)(w ? rd32(w + 0x180) : 0));
+		}
 	}
 	// TASK 37: while EITHER copy is in a menu, both keep publishing (a menu session). That is what makes
 	// the freshness rule below possible: the copy that is back in normal play still says so every 250 ms.
@@ -7795,16 +7867,27 @@ static void menu_tick(void)
 		return;
 	int pst = (int)g_peer_menu_state;
 	int pseq = (int)g_peer_menu_seq;
-	// Is there a divergence at all, and which way? 1 = the peer is in a shared menu this copy is not in;
-	// 2 = this copy is in one the peer has left.
-	int diverge = menu_world_menu(pst) && st == 1 ? 1 : (pst == 1 && menu_world_menu(st) ? 2 : 0);
-	if (!diverge) {
+	// TASK 57: a plain state mismatch is the divergence, and it is repaired by the game's own request on
+	// THIS copy (no button press that can be lost). Only 1 (normal play) and the two shared menus (2
+	// inventory, 5 pause) are menu states on the wire; any other peer state (a load, a scripted event,
+	// the game-over screen) is not a menu and is never acted on. When the two copies are in DIFFERENT
+	// menus this copy leaves its own first (the next pass opens the peer's): one request per tick.
+	int want = 0;   // the state this copy has to reach: 1 = leave this copy's menu, 2/5 = open that menu
+	if (pst != 1 && pst != 2 && pst != 5)
+		want = 0;
+	else if (menu_world_menu(st) && st != pst)
+		want = 1;
+	else if (menu_world_menu(pst) && st == 1)
+		want = pst;
+	if (!want) {
 		g_menu_div_since = 0;
 		g_menu_div_pst = -1;
 		g_menu_div_seq = -1;
 		return;
 	}
-	// TASK 37: a correction is only pressed on a confirmed divergence (see the constants above).
+	// TASK 37/57: a correction needs this copy's own state quiet for MENU_SETTLE_MS, a FRESH peer packet
+	// and a mismatch confirmed by the next packet (MENU_STABLE_MS). A wrong correction is repaired by the
+	// following pass, so these windows are short enough to end in one state well inside 1 s.
 	if (now - g_menu_local_changed_at < MENU_SETTLE_MS)
 		return;   // this copy's own menu state just changed: the peer's packet about it may still be on the way
 	if (!g_peer_menu_at || now - g_peer_menu_at > MENU_FRESH_MS)
@@ -7828,31 +7911,34 @@ static void menu_tick(void)
 		if (g_role != 2)
 			return;                     // a tie: the host does not correct, so the two cannot chase each other
 	}
-	if (now - g_menu_pulse_at < MENU_PULSE_GAP_MS)
-		return;
-	unsigned w = world_obj();
-	DWORD lvl = w ? rd32(w + 4) : 0;
-	if ((DWORD)g_peer_menu_level != lvl)
-		return;   // the peer's menu state is from another level
-	if (diverge == 1) {
-		// the peer opened a menu this copy did not see: press the same button here
-		InterlockedIncrement(&g_menu_corrections);
-		if (pst == 5)
-			menu_pulse(0, 0x0010, 0, 'S');    // START: the pause menu (probe: opens on both)
-		else
-			menu_pulse(0, 0x0020, 0, 'B');    // BACK: the inventory menu (probe: st 2 on both)
-		return;
+	{
+		unsigned w = world_obj();
+		DWORD lvl = w ? rd32(w + 4) : 0;
+		if ((DWORD)g_peer_menu_level != lvl)
+			return;   // the peer's menu state is from another level
 	}
-	{   // the peer left the menu and this copy is still in it: press the same button to leave
-		InterlockedIncrement(&g_menu_corrections);
-		if (st == 5)
-			menu_pulse(0, 0x0010, 0, 'S');    // START leaves the pause menu (FUN_004b2770)
-		else
-			menu_pulse(0, 0x2000, 0, 'A');    // A leaves the inventory (B is 0x2000 on the pad; measured: st 1 on both)
+	// TASK 57: a menu THIS copy opened is only left when the peer's state is newer than that open.
+	// Otherwise the peer's packet from before it saw the open (still "normal play") shut this copy's own
+	// pause 460 ms after the player opened it (measured, run_s57_a1.log: 5 -> 1 at 13.261 while the peer
+	// had not followed yet; the same for the inventory at 19.683).
+	if (want == 1 && pseq < (int)g_menu_my_seq)
 		return;
+	if (now - g_menu_req_at < MENU_REQ_GAP_MS)
+		return;   // one request at a time
+	g_menu_req_at = now;
+	int did = want == 1 ? menu_game_close(st) : menu_game_open(want);
+	if (!did) {
+		InterlockedIncrement(&g_menu_gated);
+		return;   // a request is already in flight on this copy: retry on the next tick
 	}
+	InterlockedIncrement(&g_menu_reqs);
+	InterlockedIncrement(&g_menu_corrections);
+	g_menu_local_changed_at = now;
+	logf("%s: menu request: %s (peer menu %d, this copy %d)", g_role == 2 ? "guest" : "host",
+	     want == 1 ? "leaving this copy's menu" : (want == 5 ? "opening the pause menu" : "opening the inventory"),
+	     pst, st);
 	// The wheel (3) / item menu (4) are not repaired here: they are one player's own pad hold, already
-	// carried by the pad stream on both copies, and a pulse there would disturb normal play.
+	// carried by the pad stream on both copies.
 }
 
 // ---- frame tick (Present hook, main thread) --------------------------------------------------------
