@@ -104,6 +104,25 @@ static unsigned game_obj(void);                          // sync.c
 static int mem_ok(const void *p, size_t n);              // sync.c
 static void host_save_include(const char *name);          // sync.c: remember the loaded file, send it to the guest
 static void host_save_forget(void);                       // sync.c: the world no longer comes from a save file
+static int savept_local_use(unsigned sp, unsigned ch);    // sync.c (TASK 60): a save point used on this copy
+
+// TASK 60: CToeSavePoint::use (0x46e830) and CToeSimpleSavePoint::use (0x46ed80), the calls the
+// interaction scan makes on a save point (vtable slot 28). The host runs the game's own use; the guest
+// refuses it and asks the host to perform the save instead (savept_local_use returns 0).
+typedef void(__fastcall *sp_use_t)(void *sp, void *edx, void *ch);
+static sp_use_t g_sp_use_point, g_sp_use_simple;
+
+static void __fastcall hk_sp_use_point(void *sp, void *edx, void *ch)
+{
+	if (savept_local_use((unsigned)(uintptr_t)sp, (unsigned)(uintptr_t)ch) && g_sp_use_point)
+		g_sp_use_point(sp, edx, ch);
+}
+
+static void __fastcall hk_sp_use_simple(void *sp, void *edx, void *ch)
+{
+	if (savept_local_use((unsigned)(uintptr_t)sp, (unsigned)(uintptr_t)ch) && g_sp_use_simple)
+		g_sp_use_simple(sp, edx, ch);
+}
 
 // TASK 34: a level change this copy performed for the guest's ask (PKT_LEVELASK). The guest's own copy
 // of the same door calls ChangeLevel a moment later; that call is the same transition and must not
@@ -595,4 +614,12 @@ static void install_request_hooks(void)
 	static const BYTE p_collect[9] = { 0x56, 0x8b, 0xf1, 0x8b, 0x8e, 0x3c, 0x07, 0x00, 0x00 };
 	g_char_collect = (char_collect_t)hook_entry((BYTE *)0x4ddad0, p_collect, 9, (void *)hk_char_collect,
 		"character collect (0x4ddad0)");
+	// TASK 60: a save point's own use (vtable slot 28). On the host the game's use runs; on the guest it
+	// becomes a request to the host, which performs the save (sync.c savept_local_use).
+	static const BYTE p_sp1[6] = { 0x55, 0x8b, 0xec, 0x56, 0x8b, 0xf1 };
+	static const BYTE p_sp2[10] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x56, 0x50, 0x8b, 0xf1 };
+	g_sp_use_point = (sp_use_t)hook_entry((BYTE *)0x46e830, p_sp1, 6, (void *)hk_sp_use_point,
+		"CToeSavePoint::use (0x46e830)");
+	g_sp_use_simple = (sp_use_t)hook_entry((BYTE *)0x46ed80, p_sp2, 10, (void *)hk_sp_use_simple,
+		"CToeSimpleSavePoint::use (0x46ed80)");
 }

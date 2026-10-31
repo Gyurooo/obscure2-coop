@@ -592,11 +592,11 @@ static void save_path(char *out, size_t n, const char *name)
 // land there to be loadable, so the transfer reads/writes that copy and keeps <exe>\Save in step.
 static void save_game_path(char *out, size_t n, const char *name)
 {
-	char exe[MAX_PATH];
-	GetModuleFileNameA(NULL, exe, sizeof exe);
-	char *slash = strrchr(exe, '\\');
-	if (slash) *slash = 0;
-	_snprintf(out, n, "%s\\coop_profile\\remote\\%s", exe, name);
+	// TASK 60: the game's own save folder is the one obscoop2.c already chose for the remote-storage
+	// proxy: <exe>\coop_profile\remote, or %LOCALAPPDATA%\obscoop\coop_profile\remote when the game sits
+	// under Program Files (g_remote, set in DllMain). Using g_remote here keeps the transfer, the join
+	// transfer and the save mirror on exactly the folder the game reads on THIS copy.
+	_snprintf(out, n, "%s\\%s", g_remote, name);
 }
 
 // The copy of a save that exists (the game's own folder first, then the Save mirror); 0 if neither.
@@ -927,8 +927,698 @@ static void guest_on_save(const char *buf, int n)
 	net_send(PKT_SAVE_ACK, &a, (WORD)(sizeof a - sizeof(pkt_hdr)));
 }
 
-// ---- host: snapshots ---------------------------------------------------------------------------
+// ---- TASK 60: the same save on both copies, and save points ---------------------------------------
+// The game writes every save through ISteamRemoteStorage::FileWrite, which this DLL proxies
+// (obscoop2.c rs_FileWrite -> the profile's remote folder). So either copy's save is caught with its
+// name and exact bytes. The owner's rule is that the campaign is one shared game and either player must
+// be able to host the next session: a save made on ONE copy is pushed to the other as the same file
+// (same name, same bytes) and written to both folders the game may read (coop_profile\remote, the one
+// its save manager really uses, and the Save mirror). A save point used by the guest is a request to
+// the host (CToeSavePoint::use / CToeSimpleSavePoint::use are hooked in hooks.c), which performs that
+// save through the game's own save-point use.
+//
+// The push is chunked like the join transfer above but independent of it and works in both directions:
+// it sends the file, resends the chunks it has not seen acked, and stops on PKT_SAVEPUSH_ACK. A
+// received file is written with CreateFileA, never through rs_FileWrite, so the two copies cannot echo
+// each other's files.
+#define SAVEPUSH_MAX 3
+#define SAVEPUSH_BYTES 262144       // a save is ~40 KB; the ceiling stops a bad length from overflowing
+#define SAVEPUSH_PASS_MS 400        // one full pass, then wait this long for the ack
+#define SAVEPUSH_PASSES 8
+#define SAVEPUSH_PER_TICK 16        // chunks per frame (a 40 KB file is one pass of 5 frames)
+typedef struct {
+	char name[32];
+	DWORD total;
+	DWORD next;                     // the next chunk index to send in this pass
+	int pass;
+	int used, acked;
+	DWORD at;
+	BYTE data[SAVEPUSH_BYTES];
+} save_push;
+static CRITICAL_SECTION g_push_cs;
+static save_push g_push[SAVEPUSH_MAX];
+static volatile LONG g_savepush_sent, g_savepush_rcv, g_savepush_done, g_savepush_fail;
 
+typedef struct {
+	char name[32];
+	DWORD total;
+	DWORD have[SAVEPUSH_BYTES / SAVE_CHUNK / 32];
+	BYTE data[SAVEPUSH_BYTES];
+} save_recv;
+static save_recv g_recv;
+
+// The save files the game's save manager writes (the slots and the "last game" o2.sav). Any other name a
+// game may put in remote storage is forwarded but never mirrored.
+static int save_file_name(const char *name)
+{
+	if (!_stricmp(name, "o2.sav"))
+		return 1;
+	if (_strnicmp(name, "game", 4))
+		return 0;
+	const char *p = name + 4;
+	while (*p >= '0' && *p <= '9')
+		p++;
+	return p != name + 4 && !_stricmp(p, ".sav");
+}
+
+// Writes one received save to the folder the game reads and to the Save mirror. Returns 1 when the
+// game's own copy could be written.
+static int save60_store(const char *name, const BYTE *data, DWORD len)
+{
+	char paths[2][MAX_PATH];
+	int ok = 0;
+	save_game_path(paths[0], sizeof paths[0], name);
+	save_path(paths[1], sizeof paths[1], name);
+	for (int i = 0; i < 2; i++) {
+		char dir[MAX_PATH];
+		_snprintf(dir, sizeof dir, "%s", paths[i]);
+		char *slash = strrchr(dir, '\\');
+		if (slash) *slash = 0;
+		CreateDirectoryA(dir, NULL);
+		HANDLE f = CreateFileA(paths[i], GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+		DWORD wrote = 0;
+		int good = f != INVALID_HANDLE_VALUE && WriteFile(f, data, len, &wrote, NULL) && wrote == len;
+		if (f != INVALID_HANDLE_VALUE)
+			CloseHandle(f);
+		if (i == 0)
+			ok = good;
+	}
+	return ok;
+}
+
+// obscoop2.c (rs_FileWrite): this copy's game just wrote a save file. Queue it for the peer.
+static void save60_local_written(const char *name, const void *data, int len)
+{
+	if (!g_role || !save_name_ok(name) || !save_file_name(name) || len <= 0 || len > SAVEPUSH_BYTES)
+		return;
+	EnterCriticalSection(&g_push_cs);
+	int slot = -1;
+	for (int i = 0; i < SAVEPUSH_MAX; i++)   // the newest bytes of a file replace an older, unacked push
+		if (g_push[i].used && !g_push[i].acked && !_stricmp(g_push[i].name, name)) { slot = i; break; }
+	if (slot < 0)
+		for (int i = 0; i < SAVEPUSH_MAX; i++)
+			if (!g_push[i].used) { slot = i; break; }
+	if (slot >= 0) {
+		save_push *p = &g_push[slot];
+		_snprintf(p->name, sizeof p->name, "%s", name);
+		p->total = (DWORD)len;
+		p->next = 0;
+		p->pass = 0;
+		p->used = 1;
+		p->acked = 0;
+		p->at = GetTickCount();
+		memcpy(p->data, data, (size_t)len);
+		logf("%s: save file \"%s\" written here (%d bytes): pushed to the peer", g_role == 2 ? "guest" : "host",
+		     name, len);
+	}
+	LeaveCriticalSection(&g_push_cs);
+}
+
+// Both roles, game thread: send the queued save files.
+static void save_push_tick(void)
+{
+	if (!g_role || !g_peer_ok)
+		return;
+	EnterCriticalSection(&g_push_cs);
+	DWORD now = GetTickCount();
+	for (int i = 0; i < SAVEPUSH_MAX; i++) {
+		save_push *p = &g_push[i];
+		if (!p->used)
+			continue;
+		if (p->acked) {
+			p->used = 0;
+			p->acked = 0;
+			InterlockedIncrement(&g_savepush_done);
+			continue;
+		}
+		if (now - p->at < SAVEPUSH_PASS_MS)
+			continue;
+		DWORD chunks = (p->total + SAVE_CHUNK - 1) / SAVE_CHUNK;
+		if (p->next >= chunks) {   // a whole pass went out: wait for the ack before the next one
+			p->pass++;
+			p->next = 0;
+			if (p->pass >= SAVEPUSH_PASSES) {
+				logf("%s: the peer never acked save file \"%s\" (%u bytes); giving up", g_role == 2 ? "guest" : "host",
+				     p->name, (unsigned)p->total);
+				p->used = 0;
+				p->pass = 0;
+				p->next = 0;
+				InterlockedIncrement(&g_savepush_fail);
+				continue;
+			}
+		}
+		p->at = now;
+		for (int k = 0; k < SAVEPUSH_PER_TICK && p->next < chunks; k++) {
+			DWORD off = p->next * SAVE_CHUNK;
+			DWORD len = p->total - off < SAVE_CHUNK ? p->total - off : SAVE_CHUNK;
+			pkt_savepush sp;
+			memset(&sp, 0, sizeof sp);
+			_snprintf(sp.name, sizeof sp.name, "%s", p->name);
+			sp.total = p->total;
+			sp.off = off;
+			sp.len = len;
+			memcpy(sp.data, p->data + off, (size_t)len);
+			net_send(PKT_SAVEPUSH, &sp, (WORD)(sizeof sp - sizeof(pkt_hdr)));
+			p->next++;
+			InterlockedIncrement(&g_savepush_sent);
+		}
+	}
+	LeaveCriticalSection(&g_push_cs);
+}
+
+// Network thread: one chunk of a save file the peer's game wrote. When every chunk is in, write the file
+// to the game's folder and to the Save mirror and ack it.
+static void peer_on_savepush(const char *buf, int n)
+{
+	if (n != (int)sizeof(pkt_savepush))
+		return;
+	const pkt_savepush *p = (const pkt_savepush *)buf;
+	if (!memchr(p->name, 0, sizeof p->name) || !save_name_ok(p->name) || !save_file_name(p->name))
+		return;
+	if (p->total == 0 || p->total > SAVEPUSH_BYTES || p->len > SAVE_CHUNK || p->off % SAVE_CHUNK ||
+	    p->off + p->len > p->total)
+		return;
+	int complete = 0;
+	EnterCriticalSection(&g_push_cs);
+	if (_stricmp(p->name, g_recv.name) || p->total != g_recv.total) {   // a new file: start a fresh assembly
+		g_recv.name[0] = 0;
+		memset(g_recv.have, 0, sizeof g_recv.have);
+		_snprintf(g_recv.name, sizeof g_recv.name, "%s", p->name);
+		g_recv.total = p->total;
+	}
+	memcpy(g_recv.data + p->off, p->data, p->len);
+	DWORD first = p->off / SAVE_CHUNK, last = (p->off + p->len + SAVE_CHUNK - 1) / SAVE_CHUNK;
+	for (DWORD c = first; c < last; c++)
+		g_recv.have[c / 32] |= 1u << (c % 32);
+	DWORD chunks = (p->total + SAVE_CHUNK - 1) / SAVE_CHUNK, missing = 0;
+	for (DWORD c = 0; c < chunks; c++)
+		if (!(g_recv.have[c / 32] & (1u << (c % 32)))) { missing = 1; break; }
+	complete = !missing;
+	if (complete) {
+		if (save60_store(p->name, g_recv.data, p->total)) {
+			logf("%s: the peer's save file \"%s\" (%u bytes) is on this copy too",
+			     g_role == 2 ? "guest" : "host", p->name, (unsigned)p->total);
+			InterlockedIncrement(&g_savepush_rcv);
+		} else {
+			logf("%s: could not write the peer's save file \"%s\"", g_role == 2 ? "guest" : "host", p->name);
+		}
+		g_recv.name[0] = 0;   // the assembly is spent (a retransmitted chunk starts a new one)
+	}
+	LeaveCriticalSection(&g_push_cs);
+	if (complete) {
+		pkt_savepush_ack a;
+		memset(&a, 0, sizeof a);
+		_snprintf(a.name, sizeof a.name, "%s", p->name);
+		a.total = p->total;
+		net_send(PKT_SAVEPUSH_ACK, &a, (WORD)(sizeof a - sizeof(pkt_hdr)));
+	}
+}
+
+static void peer_on_savepush_ack(const char *buf, int n)
+{
+	if (n != (int)sizeof(pkt_savepush_ack))
+		return;
+	const pkt_savepush_ack *a = (const pkt_savepush_ack *)buf;
+	if (!memchr(a->name, 0, sizeof a->name))
+		return;
+	EnterCriticalSection(&g_push_cs);
+	for (int i = 0; i < SAVEPUSH_MAX; i++)
+		if (g_push[i].used && !_stricmp(g_push[i].name, a->name) && g_push[i].total == a->total)
+			g_push[i].acked = 1;
+	LeaveCriticalSection(&g_push_cs);
+}
+
+// ---- TASK 60: save point used by the guest -> the host performs the save --------------------------
+// Owner rule: the host is authoritative. hooks.c hooks CToeSavePoint::use (0x46e830) and
+// CToeSimpleSavePoint::use (0x46ed80). On the HOST they run the game's own use (which opens its save
+// flow). On the GUEST they are refused and become a request to the host, which finds its own copy of
+// that save point and runs the game's own use on it. The file the host's game then writes goes back
+// through save60_local_written. The guest's own save is never written, so the two copies cannot end up
+// with different save data.
+#define SAVEPT_CLS 0x53415645u     // "SAVE": the CToeSavePoint class tag (every level's save point)
+static volatile LONG g_savept_pending;
+static volatile LONG g_savept_again;   // guest: the last request, so the per-frame scan cannot flood
+static DWORD g_savept_cls, g_savept_id;
+static float g_savept_pos[3];
+static volatile LONG g_savept_applied, g_savept_asked;
+
+// hooks.c, game thread: a save point was used on this copy. Returns 1 when the game's own use must run.
+static int savept_local_use(unsigned sp, unsigned ch)
+{
+	if (!sp || !mem_ok((const void *)(uintptr_t)sp, 0x200))
+		return 1;
+	if (g_role != 2)
+		return 1;   // the host is the authority: its own use is the save
+	unsigned own = player_human(1);
+	if (ch && own && ch != own)
+		return 0;   // the guest's copy uses it for the host's puppet: not this player's save
+	DWORD now = GetTickCount();
+	if (now - (DWORD)InterlockedCompareExchange(&g_savept_again, 0, 0) < 3000)
+		return 0;   // the scan calls again every frame while the character is in range
+	InterlockedExchange(&g_savept_again, (LONG)now);
+	pkt_savept p;
+	memset(&p, 0, sizeof p);
+	unsigned w = world_obj();
+	p.level = w ? rd32(w + 4) : 0;
+	p.player = 1;   // the guest's own player is player 2 (index 1)
+	p.cls = rd32(sp + 0x10);
+	p.id = rd32(sp + 4);
+	memcpy(p.pos, (const void *)(uintptr_t)(sp + 0x6c), sizeof p.pos);
+	net_send(PKT_SAVEPT, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	InterlockedIncrement(&g_savept_asked);
+	char c[5], i4[5];
+	logf("guest: the save point %s id %s was used here: the host performs this save", tag4(p.cls, c), tag4(p.id, i4));
+	return 0;   // no local save: both copies must hold the host's file
+}
+
+// Network thread (host): the guest's save point request. The save itself runs on the game thread.
+static void host_on_savept(const char *buf, int n)
+{
+	if (n != (int)sizeof(pkt_savept))
+		return;
+	const pkt_savept *p = (const pkt_savept *)buf;
+	unsigned w = world_obj();
+	if (!w || p->level != rd32(w + 4))
+		return;
+	EnterCriticalSection(&g_push_cs);
+	g_savept_cls = p->cls;
+	g_savept_id = p->id;
+	memcpy(g_savept_pos, p->pos, sizeof g_savept_pos);
+	g_savept_pending = 1;
+	LeaveCriticalSection(&g_push_cs);
+	char c[5], i4[5];
+	logf("host: the guest used a save point (%s id %s): performing that save here", tag4(p->cls, c), tag4(p->id, i4));
+}
+
+// The save point's own use method (vtable slot 28 = byte +0x70, the call the interaction scan makes).
+typedef void(__thiscall *sp_use_call_t)(void *, void *);
+static sp_use_call_t savept_use_ptr(unsigned sp)
+{
+	void **vt = *(void ***)(uintptr_t)sp;
+	if (!vt || IsBadReadPtr(vt, 0x80))
+		return NULL;
+	return (sp_use_call_t)vt[28];
+}
+
+// Finds this level's save point named by a request (class tag + id + position); 0 when it is not here.
+static unsigned savept_find(DWORD cls, DWORD id, const float *pp)
+{
+	unsigned w = world_obj();
+	unsigned mgr = w ? rd32(w + 0x1768) : 0;
+	unsigned node = mgr ? rd32(mgr + 8) : 0;
+	int nseen = 0;
+	unsigned best = 0;
+	float bd = 1e30f;
+	while (node && nseen++ < 4000) {
+		unsigned e = rd32(node);
+		node = rd32(node + 4);
+		if (!e || !mem_ok((const void *)(uintptr_t)e, 0x200) || rd32(e + 0x10) != (cls ? cls : SAVEPT_CLS))
+			continue;
+		if (id && rd32(e + 4) != id)
+			continue;
+		float dx = *(const float *)(uintptr_t)(e + 0x6c) - pp[0];
+		float dy = *(const float *)(uintptr_t)(e + 0x70) - pp[1];
+		float dz = *(const float *)(uintptr_t)(e + 0x74) - pp[2];
+		float d = dx * dx + dy * dy + dz * dz;
+		if (d < bd) { bd = d; best = e; }
+	}
+	if (!best || bd > 400.0f * 400.0f)
+		return 0;
+	return best;
+}
+
+// Game thread (host): run the game's own save point use on the save point the guest named.
+static void savept_tick(void)
+{
+	if (g_role != 1 || !g_savept_pending)
+		return;
+	unsigned w = world_obj();
+	if (!w)
+		return;
+	g_savept_pending = 0;
+	unsigned sp = savept_find(g_savept_cls, g_savept_id, g_savept_pos);
+	if (!sp) {
+		logf("host: the guest's save point is not in this level: no save performed");
+		return;
+	}
+	sp_use_call_t use = savept_use_ptr(sp);
+	unsigned me = player_human(0);
+	if (!use || !me) {
+		logf("host: cannot perform the guest's save (use method %p, character %x)", (void *)use, me);
+		return;
+	}
+	use((void *)(uintptr_t)sp, (void *)(uintptr_t)me);
+	InterlockedIncrement(&g_savept_applied);
+	char c[5];
+	logf("host: performed the guest's save point save (%s), world sub-state %lu",
+	     tag4(rd32(sp + 0x10), c), (unsigned long)rd32(w + 0x12c));
+}
+
+// ---- TASK 60 TEST ONLY: use a level object the way the interaction scan does ----------------------
+// The scan calls vtable slot 28 on the entity a character is in range of (FINDINGS_19 section 1.3). The
+// bot cannot always reach a save point (the save-loaded worlds have no floor under some of them) and the
+// game's own can-use check refuses the save points in these saves (+0x14 = 3; FUN_0046e6c0 wants 0), so
+// `savepoint` / `useobj` make that same call directly, on the game thread, like `usedoor` does. It is a
+// test tool: the shipped paths are the hooked use functions above.
+#define SP_IDLE 0
+#define SP_QUEUED 1
+#define SP_DONE 2
+static CRITICAL_SECTION g_sp_cs;
+static volatile LONG g_sp_state, g_sp_verdict;
+static int g_sp_pl;
+static unsigned g_sp_target;     // 0 = this level's save point
+static char g_sp_msg[192];
+
+static void savept_frame(void)
+{
+	if (g_sp_state != SP_QUEUED)
+		return;
+	g_sp_verdict = 0;
+	unsigned w = world_obj();
+	unsigned me = player_human(g_sp_pl);
+	if (!w || !me) {
+		_snprintf(g_sp_msg, sizeof g_sp_msg, "error use: no world/character");
+		g_sp_state = SP_DONE;
+		return;
+	}
+	unsigned e = g_sp_target;
+	if (!e) {
+		float pos[3];
+		if (!mem_ok((const void *)(uintptr_t)(me + 0x23c), 12)) {
+			_snprintf(g_sp_msg, sizeof g_sp_msg, "error savepoint: no character position");
+			g_sp_state = SP_DONE;
+			return;
+		}
+		memcpy(pos, (const void *)(uintptr_t)(me + 0x23c), sizeof pos);
+		e = savept_find(SAVEPT_CLS, 0, pos);
+		if (!e) {
+			_snprintf(g_sp_msg, sizeof g_sp_msg, "error savepoint: this level has no save point");
+			g_sp_state = SP_DONE;
+			return;
+		}
+	}
+	sp_use_call_t use = savept_use_ptr(e);
+	if (!use) {
+		_snprintf(g_sp_msg, sizeof g_sp_msg, "error use: no vtable slot 28 at %x", e);
+		g_sp_state = SP_DONE;
+		return;
+	}
+	char c[5];
+	unsigned cls = rd32(e + 0x10);
+	use((void *)(uintptr_t)e, (void *)(uintptr_t)me);
+	_snprintf(g_sp_msg, sizeof g_sp_msg, "ok used %s at %.1f,%.1f,%.1f (world sub-state %lu)",
+	          tag4(cls, c), *(const float *)(uintptr_t)(e + 0x6c), *(const float *)(uintptr_t)(e + 0x70),
+	          *(const float *)(uintptr_t)(e + 0x74), (unsigned long)rd32(w + 0x12c));
+	g_sp_verdict = 1;
+	g_sp_state = SP_DONE;
+}
+
+static int savept_request(int pl, unsigned target, char *reply, size_t replysz)
+{
+	if (!g_role || !world_obj()) {
+		_snprintf(reply, replysz, "error %s: not in a level", target ? "useobj" : "savepoint");
+		return 0;
+	}
+	EnterCriticalSection(&g_sp_cs);
+	if (g_sp_state == SP_QUEUED) {
+		LeaveCriticalSection(&g_sp_cs);
+		_snprintf(reply, replysz, "error: another use is still in flight");
+		return 0;
+	}
+	g_sp_pl = pl;
+	g_sp_target = target;
+	g_sp_verdict = 0;
+	g_sp_msg[0] = 0;
+	g_sp_state = SP_QUEUED;
+	LeaveCriticalSection(&g_sp_cs);
+	DWORD t0 = GetTickCount();
+	while (g_sp_state != SP_DONE) {
+		if (GetTickCount() - t0 > 4000) {
+			g_sp_state = SP_IDLE;
+			_snprintf(reply, replysz, "error: the game did not run a frame");
+			return 0;
+		}
+		Sleep(10);
+	}
+	int ok = g_sp_verdict;
+	_snprintf(reply, replysz, "%s", g_sp_msg);
+	g_sp_state = SP_IDLE;
+	return ok;
+}
+
+// ---- TASK 60: the host's live world objects (items and containers) --------------------------------
+// A1-8/A1-9: the host decides which world items exist and in what state a container is. The level
+// builds the same entity instances on both copies from the same save, so "create/remove to match" is
+// the state the game's own interaction check reads on those instances: +0x20 active, +0xa4 broken/
+// opened, +0xa8 collected, +0xb0 and +0xc0 the other interaction gates, +0xc4 the using character. The
+// host streams the family (the CToeItem* classes and CToeContainer/CToeChest/CToeChestKey/
+// CToePedestal); the guest writes a field only where its own value still equals the sender's "before",
+// and never for an entity its own game changed in the last 1.5 s (its own pickup/use wins and travels
+// back through PKT_PICKUP). A forced resend every 2 s converges a guest that missed a packet.
+#define WORLD_MAX 48
+static const unsigned WORLD_OFF[WORLD_FIELDS] = { 0x20, 0xa4, 0xa8, 0xb0, 0xc0, 0xc4, 0x128 };
+#define WORLD_TOUCH_MS 1500
+typedef struct { unsigned ent; DWORD cls, id; float pos[3]; DWORD f[WORLD_FIELDS]; DWORD touch; } w_slot;
+static w_slot g_world[WORLD_MAX];
+static int g_world_n;
+static DWORD g_world_level, g_world_hash, g_world_at, g_world_send_at;
+static unsigned g_world_world;
+static DWORD g_wslot_gen;              // the world generation the table belongs to
+static w_slot g_world_prev[WORLD_MAX]; // what the guest was last told ("before" for the next send)
+static int g_world_prev_n;
+static volatile LONG g_world_sent, g_world_rcv, g_world_applied, g_world_missing;
+
+static int world_class(DWORD t)
+{
+	switch (t) {
+	case 0x434f4e54:   // CONT: CToeContainer, the class whose slot 28 releases its items
+	case 0x43484553:   // CHES: CToeChest
+	case 0x43484b45:   // CHKE: CToeChestKey
+	case 0x50454445:   // PEDE: CToePedestal
+		return 1;
+	}
+	// the CToeItem* classes (ITEMS_FINDINGS section 1: the class tags their constructors write)
+	switch (t) {
+	case 0x41434944: case 0x42415454: case 0x424b504b: case 0x424c4541: case 0x4341424f:
+	case 0x43524f57: case 0x454e4452: case 0x474c5943: case 0x4943414d: case 0x49434500:
+	case 0x4943524e: case 0x49445343: case 0x4a454d4d: case 0x4a455252: case 0x4a554241:
+	case 0x4b455900: case 0x4c564552: case 0x4d415000: case 0x4d454449: case 0x50415353:
+	case 0x53455255: case 0x534f4441: case 0x53544154: case 0x53545249: case 0x53595249:
+	case 0x57454c44:
+		return 1;
+	}
+	return 0;
+}
+
+// Rebuilds this copy's family table. A field that changed since the previous scan was changed by this
+// copy's own game (a local pickup/use): remember when, so a packet in flight cannot undo it.
+static void world_scan(unsigned w, DWORD level)
+{
+	DWORD now = GetTickCount();
+	int same = (g_world_n > 0 && g_world_world == w && g_world_level == level && g_wslot_gen == g_world_gen);
+	w_slot prev[WORLD_MAX];
+	memcpy(prev, g_world, sizeof(w_slot) * (size_t)g_world_n);
+	int prev_n = g_world_n;
+	int n = 0;
+	unsigned mgr = rd32(w + 0x1768);
+	unsigned node = mgr ? rd32(mgr + 8) : 0;
+	int nseen = 0;
+	while (node && nseen++ < 4000 && n < WORLD_MAX) {
+		unsigned e = rd32(node);
+		node = rd32(node + 4);
+		if (!e || !mem_ok((const void *)(uintptr_t)e, 0x200))
+			continue;
+		DWORD cls = rd32(e + 0x10);
+		if (!world_class(cls))
+			continue;
+		w_slot *s = &g_world[n];
+		memset(s, 0, sizeof *s);
+		s->ent = e;
+		s->cls = cls;
+		s->id = rd32(e + 4);
+		memcpy(s->pos, (const void *)(uintptr_t)(e + 0x6c), sizeof s->pos);
+		for (int f = 0; f < WORLD_FIELDS; f++)
+			s->f[f] = rd32(e + WORLD_OFF[f]);
+		if (same && g_role == 2)
+			for (int j = 0; j < prev_n; j++)
+				if (prev[j].ent == e) {
+					s->touch = prev[j].touch;
+					for (int f = 0; f < WORLD_FIELDS; f++)
+						if (prev[j].f[f] != s->f[f])
+							s->touch = now;
+					break;
+				}
+		n++;
+	}
+	g_world_n = n;
+	g_world_world = w;
+	g_world_level = level;
+	g_wslot_gen = g_world_gen;
+}
+
+// Host: send the family table when it changed, and again every 2 s (a guest that missed a packet).
+static void host_send_world(void)
+{
+	unsigned w = world_obj();
+	if (!w)
+		return;
+	DWORD level = rd32(w + 4);
+	DWORD now = GetTickCount();
+	if (now - g_world_at >= 200) {
+		g_world_at = now;
+		world_scan(w, level);
+	}
+	DWORD h = (DWORD)g_world_n * 2654435761u;
+	for (int i = 0; i < g_world_n; i++) {
+		h = h * 31 + g_world[i].cls;
+		h = h * 31 + g_world[i].id;
+		for (int f = 0; f < WORLD_FIELDS; f++)
+			h = h * 31 + g_world[i].f[f];
+	}
+	if (h == g_world_hash && now - g_world_send_at < 2000)
+		return;
+	int force = (h == g_world_hash);   // unchanged: an authoritative resend for a guest that missed one
+	g_world_hash = h;
+	g_world_send_at = now;
+	for (int off = 0; off < g_world_n; off += WORLD_CHUNK) {
+		pkt_world p;
+		memset(&p, 0, sizeof p);
+		p.level = level;
+		p.off = (DWORD)off;
+		p.count = (DWORD)(g_world_n - off < WORLD_CHUNK ? g_world_n - off : WORLD_CHUNK);
+		p.total = (DWORD)g_world_n;
+		p.force = force ? 1 : 0;
+		for (DWORD k = 0; k < p.count; k++) {
+			w_slot *s = &g_world[off + k];
+			p.e[k].cls = s->cls;
+			p.e[k].id = s->id;
+			memcpy(p.e[k].pos, s->pos, sizeof p.e[k].pos);
+			for (int f = 0; f < WORLD_FIELDS; f++) {
+				p.e[k].f[f] = s->f[f];
+				p.e[k].b[f] = s->f[f];
+			}
+			for (int j = 0; j < g_world_prev_n; j++)   // the value this copy last told the guest
+				if (g_world_prev[j].ent == s->ent) {
+					for (int f = 0; f < WORLD_FIELDS; f++)
+						p.e[k].b[f] = g_world_prev[j].f[f];
+					break;
+				}
+		}
+		net_send(PKT_WORLD, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+	}
+	memcpy(g_world_prev, g_world, sizeof(w_slot) * (size_t)g_world_n);
+	g_world_prev_n = g_world_n;
+	InterlockedIncrement(&g_world_sent);
+}
+
+static CRITICAL_SECTION g_worldq_cs;
+static pkt_world g_worldq[8];
+static int g_worldq_head, g_worldq_tail;
+
+static void guest_on_world(const char *buf, int n)
+{
+	if (n != (int)sizeof(pkt_world))
+		return;
+	EnterCriticalSection(&g_worldq_cs);
+	if (((g_worldq_tail + 1) & 7) != g_worldq_head) {
+		memcpy(&g_worldq[g_worldq_tail], buf, sizeof(pkt_world));
+		g_worldq_tail = (g_worldq_tail + 1) & 7;
+	}
+	LeaveCriticalSection(&g_worldq_cs);
+	InterlockedIncrement(&g_world_rcv);
+}
+
+// Game thread (guest): write the host's state where this copy has not moved on (see the section note).
+static void guest_apply_world(void)
+{
+	unsigned w = world_obj();
+	if (!w)
+		return;
+	DWORD level = rd32(w + 4);
+	DWORD now = GetTickCount();
+	for (;;) {
+		pkt_world p;
+		EnterCriticalSection(&g_worldq_cs);
+		if (g_worldq_head == g_worldq_tail) {
+			LeaveCriticalSection(&g_worldq_cs);
+			break;
+		}
+		p = g_worldq[g_worldq_head];
+		g_worldq_head = (g_worldq_head + 1) & 7;
+		LeaveCriticalSection(&g_worldq_cs);
+		if (p.level != level || p.count > WORLD_CHUNK || p.total > WORLD_MAX || p.off + p.count > p.total)
+			continue;
+		int wrote = 0;
+		for (DWORD k = 0; k < p.count; k++) {
+			world_entry *e = &p.e[k];
+			int slot = -1;
+			for (int i = 0; i < g_world_n; i++) {
+				w_slot *s = &g_world[i];
+				if (s->cls != e->cls || (e->id && s->id && s->id != e->id))
+					continue;
+				float dx = s->pos[0] - e->pos[0], dy = s->pos[1] - e->pos[1], dz = s->pos[2] - e->pos[2];
+				if (dx * dx + dy * dy + dz * dz > 16.0f)
+					continue;
+				slot = i;
+				break;
+			}
+			if (slot < 0) {
+				InterlockedIncrement(&g_world_missing);
+				continue;
+			}
+			w_slot *s = &g_world[slot];
+			if (now - s->touch < WORLD_TOUCH_MS)
+				continue;   // this copy changed it itself just now: its own action wins
+			if (rd32(s->ent) == 0 || rd32(s->ent + 0x10) != s->cls || IsBadWritePtr((void *)(uintptr_t)s->ent, 0x200))
+				continue;
+			for (int f = 0; f < WORLD_FIELDS; f++) {
+				DWORD local = rd32(s->ent + WORLD_OFF[f]);
+				if (local == e->f[f])
+					continue;
+				if (!p.force && local != e->b[f])
+					continue;   // this copy's value is its own new one, not the sender's "before"
+				*(DWORD *)(uintptr_t)(s->ent + WORLD_OFF[f]) = e->f[f];
+				s->f[f] = e->f[f];
+				wrote++;
+			}
+		}
+		if (wrote)
+			InterlockedIncrement(&g_world_applied);
+	}
+}
+
+// Pipe `worlds` (diagnostic): this copy's family table with the live flag the checks use.
+static void worlds_dump(char *reply, size_t replysz)
+{
+	size_t l = 0;
+	l += (size_t)_snprintf(reply + l, replysz - l, "worlds %d in level %08lx:", g_world_n, (unsigned long)g_world_level);
+	for (int i = 0; i < g_world_n && i < WORLD_MAX && l + 130 < replysz; i++) {
+		w_slot *s = &g_world[i];
+		char c[5];
+		int live = s->f[1] == 0 && s->f[0] != 0 && s->f[4] == 0 && s->f[3] == 0 && s->f[2] == 0;
+		l += (size_t)_snprintf(reply + l, replysz - l, " #%d %x %s %s (%.1f,%.1f,%.1f) %lx/%lx/%lx/%lx/%lx/%lx t%lu",
+			i, s->ent, tag4(s->cls, c), live ? "LIVE" : "off", s->pos[0], s->pos[1], s->pos[2],
+			(unsigned long)s->f[0], (unsigned long)s->f[1], (unsigned long)s->f[2], (unsigned long)s->f[3],
+			(unsigned long)s->f[4], (unsigned long)s->f[5], (unsigned long)s->touch);
+	}
+}
+
+// Both roles, game thread: the host publishes its family table; the guest keeps its own table current so
+// its local changes are known, then applies what arrived.
+static void world60_tick(void)
+{
+	unsigned w = world_obj();
+	if (!w)
+		return;
+	if (g_role == 1) {
+		host_send_world();
+		return;
+	}
+	world_scan(w, rd32(w + 4));
+	guest_apply_world();
+}
+
+// ---- host: snapshots ---------------------------------------------------------------------------
 // ---- host: inventory mirror -------------------------------------------------------------------
 // The save's inventory object (world+0x1790, vtable 0x665844) holds a count at +4 and 32-byte entries
 // at +8 (entry = obj + 8 + i*0x20; FUN_004b04a0 returns exactly that address). It is not part of the
@@ -8071,6 +8761,9 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_scene_cs);   // TASK 30 (rx thread / game thread / pipe thread)
 	InitializeCriticalSection(&g_door_cs);    // TASK 34 (rx thread / game thread)
 	InitializeCriticalSection(&g_pb_cs);      // TASK 42 (rx thread / game thread): the puppet buffer
+	InitializeCriticalSection(&g_push_cs);    // TASK 60: the save files both ways
+	InitializeCriticalSection(&g_worldq_cs); // TASK 60: the host's world objects
+	InitializeCriticalSection(&g_sp_cs);      // TASK 60 pipe `savepoint` / `useobj`
 }
 
 // Guest, game thread (TASK 37): the host is the only authority for the level. When this copy has been in
@@ -8176,6 +8869,8 @@ static void frame_tick(void)
 	}
 	hang_phase("in net_frame (status window title + packets)");
 	net_frame();
+	hang_phase("in savept_frame (TASK 60: a test save point use)");
+	savept_frame();   // before the peer check: a solo copy can use its save point too (test tool)
 	if (!g_peer_ok) {
 		hang_phase("game code after frame_tick (no peer)");
 		return;
@@ -8271,6 +8966,12 @@ static void frame_tick(void)
 		prop_tick();                // TASK 26: chairs/boxes: carry and break state
 		hang_phase("in apt_tick (host)");
 		apt_tick();                 // TASK 28: character abilities on level objects
+		hang_phase("in savept_tick (TASK 60: the guest's save point)");
+		savept_tick();
+		hang_phase("in save_push_tick (TASK 60: save files)");
+		save_push_tick();
+		hang_phase("in world60_tick (TASK 60: items and containers)");
+		world60_tick();
 	} else {
 		hang_phase("in attach_player2");
 		attach_player2();
@@ -8298,6 +8999,10 @@ static void frame_tick(void)
 		guest_follow_own_player();
 		hang_phase("in guest_debug_p1");
 		guest_debug_p1();
+		hang_phase("in save_push_tick (TASK 60: save files)");
+		save_push_tick();
+		hang_phase("in world60_tick (TASK 60: items and containers)");
+		world60_tick();
 	}
 	hang_phase("in the game's own code after frame_tick (update/render)");
 }
@@ -8354,6 +9059,14 @@ static void sync_status(char *reply, size_t replysz)
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | teammate restores %ld", g_teammate_restores);
+	l = strlen(reply);
+	if (l < replysz)
+		_snprintf(reply + l, replysz - l, " | saves sent %ld rcv %ld acked %ld failed %ld | savept asked %ld applied %ld",
+			g_savepush_sent, g_savepush_rcv, g_savepush_done, g_savepush_fail, g_savept_asked, g_savept_applied);
+	l = strlen(reply);
+	if (l < replysz)
+		_snprintf(reply + l, replysz - l, " | world %d sent %ld rcv %ld applied %ld missing %ld",
+			g_world_n, g_world_sent, g_world_rcv, g_world_applied, g_world_missing);
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | frames %ld", g_frames);

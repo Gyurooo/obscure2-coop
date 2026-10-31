@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 30   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 31   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -113,11 +113,18 @@
                         //     the A3/A4 pair, 2.96 = A1/A2, 1.41 = B2/B3). The receiver still calls slot 27
                         //     (that is what binds the mesh to RHand) and then writes the owner's seven
                         //     values.
+                        // 31: TASK 60, the shared world. PKT_SAVEPUSH carries a save file the game wrote on
+                        //     either copy to the other one (same name, same bytes), so both save folders end
+                        //     up identical and either player can host the next session. PKT_SAVEPT: the guest
+                        //     used a save point and asks the host to perform that save (owner rule: the host
+                        //     is authoritative). PKT_WORLD: the host's live world objects (items and
+                        //     containers) with the fields the game's own interaction checks read, so the
+                        //     guest's copy shows exactly the host's items and the same opened/used state.
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,
 	PKT_APT = 21, PKT_SCENE = 22, PKT_DOOR = 23, PKT_LEVELASK = 24, PKT_MENU = 25, PKT_FX = 26,
-	PKT_PROPMOVE = 27 };
+	PKT_PROPMOVE = 27, PKT_SAVEPUSH = 28, PKT_SAVEPUSH_ACK = 29, PKT_SAVEPT = 30, PKT_WORLD = 31 };
 enum { REQ_LEVEL = 1, REQ_LOAD_PROGRESS = 2, REQ_LOAD_NAME = 3, REQ_TO_MENU = 9 };
 
 #pragma pack(push, 1)
@@ -263,6 +270,23 @@ typedef struct { pkt_hdr h; DWORD n; fx_ev e[FX_MAX]; } pkt_fx;
 // raw_move_test: REVERTED on both copies), and so is the body's own +0xcc. A non-finite transform is
 // never sent or applied.
 typedef struct { pkt_hdr h; DWORD level; DWORD cls, id; DWORD moving; float pos[3]; float dir[3]; } pkt_propmove;
+// TASK 60: a save file the game wrote on one copy, pushed to the other (same name, same bytes). total =
+// the whole file's length; a receiver writes it to both folders the game may read (coop_profile\remote
+// and Save\) once every chunk is in, and acks it so the sender stops.
+typedef struct { pkt_hdr h; char name[32]; DWORD total; DWORD off; DWORD len; BYTE data[SAVE_CHUNK]; } pkt_savepush;
+typedef struct { pkt_hdr h; char name[32]; DWORD total; } pkt_savepush_ack;
+// TASK 60: the guest's own player used a save point - the host performs that save through the game's own
+// CLevel::Request_SaveGame with the same save point (class tag + id + position).
+typedef struct { pkt_hdr h; DWORD level; DWORD player; DWORD cls, id; float pos[3]; } pkt_savept;
+// TASK 60: one live world object (a CToeItem* entity or a container-family entity). f = the fields the
+// game's own interaction/use checks read: +0x20 active, +0xa4 broken/opened, +0xa8 collected, +0xb0 and
+// +0xc0 interaction gates, +0xc4 the character that used it, +0x128 a pedestal's placed item. b = the same
+// fields as this copy had them
+// before its last change, so the receiver writes only where its own value still equals the sender's.
+#define WORLD_FIELDS 7
+#define WORLD_CHUNK 12     // entries per packet: 12 * (2*4 + 3*4 + 7*4 + 7*4) + 24 = 936 bytes
+typedef struct { DWORD cls, id; float pos[3]; DWORD f[WORLD_FIELDS]; DWORD b[WORLD_FIELDS]; } world_entry;
+typedef struct { pkt_hdr h; DWORD level; DWORD off; DWORD count; DWORD total; DWORD force; world_entry e[WORLD_CHUNK]; } pkt_world;
 #pragma pack(pop)
 
 static void guest_on_state(const char *buf, int n);
@@ -288,6 +312,10 @@ static void host_on_levelask(const char *buf, int n);   // TASK 34: the guest as
 static void peer_on_menu(const char *buf, int n);       // TASK 36: the peer's menu state (both roles)
 static void peer_on_fx(const char *buf, int n);         // TASK 53: the peer's effects (both roles)
 static void peer_on_propmove(const char *buf, int n);   // TASK 54: a prop the peer's character pushed
+static void peer_on_savepush(const char *buf, int n);  // TASK 60: a save file the peer's game wrote
+static void peer_on_savepush_ack(const char *buf, int n);
+static void host_on_savept(const char *buf, int n);    // TASK 60: the guest used a save point
+static void guest_on_world(const char *buf, int n);    // TASK 60: the host's live world objects
 static void fx_send_local(void);                        // TASK 53: this copy's effects (sync.c)
 static unsigned rd32(unsigned addr);      // sync.c
 static unsigned world_obj(void);          // sync.c
@@ -567,6 +595,15 @@ static void net_handle(const char *buf, int n, sid_t from)
 		case PKT_SAVE_ACK:
 			host_on_save_ack(buf, n);
 			break;
+		case PKT_SAVEPUSH:
+			peer_on_savepush(buf, n);   // TASK 60: a save file the guest's game wrote
+			break;
+		case PKT_SAVEPUSH_ACK:
+			peer_on_savepush_ack(buf, n);
+			break;
+		case PKT_SAVEPT:
+			host_on_savept(buf, n);     // TASK 60: the guest used a save point
+			break;
 		case PKT_PICKUP:
 			peer_on_pickup(buf, n);
 			break;
@@ -634,6 +671,12 @@ static void net_handle(const char *buf, int n, sid_t from)
 		guest_on_save(buf, n);
 	} else if (h->type == PKT_SAVES_DONE) {
 		guest_on_saves_done(buf, n);
+	} else if (h->type == PKT_SAVEPUSH) {
+		peer_on_savepush(buf, n);        // TASK 60: a save file the host's game wrote
+	} else if (h->type == PKT_SAVEPUSH_ACK) {
+		peer_on_savepush_ack(buf, n);
+	} else if (h->type == PKT_WORLD) {
+		guest_on_world(buf, n);          // TASK 60: the host's live items and containers
 	} else if (h->type == PKT_ITEM) {
 		guest_on_item(buf, n);
 	} else if (h->type == PKT_PICKUP) {

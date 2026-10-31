@@ -30,6 +30,7 @@ static char g_dir[MAX_PATH];        // exe folder, no trailing slash
 static char g_data[MAX_PATH];       // where the log and co-op saves go (see choose_data_dir)
 static char g_profile[MAX_PATH];    // <data>\coop_profile
 static char g_remote[MAX_PATH];     // <dir>\coop_profile\remote
+static void save60_local_written(const char *name, const void *data, int len);   // sync.c (TASK 60)
 static HANDLE g_log = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_log_cs;
 static LONG g_redirects, g_blocked;
@@ -260,6 +261,9 @@ static bool __fastcall rs_FileWrite(void *self, void *edx, const char *name, con
 	if (h != INVALID_HANDLE_VALUE)
 		CloseHandle(h);
 	logf("remote FileWrite %s (%d bytes) -> local %s", name, size, ok ? "ok" : "FAIL");
+	// TASK 60: a save the game wrote here must exist on the peer too (same name, same bytes).
+	if (ok && size > 0)
+		save60_local_written(name, data, size);
 	return ok;
 }
 
@@ -1321,6 +1325,8 @@ static int item_use_request(int player, unsigned tag, char *reply, size_t replys
 static int item_use_forward(int player, unsigned tag, char *reply, size_t replysz);   // sync.c: pipe `useitem` (guest)
 static int aptitude_done_request(int player, char *reply, size_t replysz);   // sync.c: pipe `aptdone` (TEST ONLY)
 static int door_use_request(int player, char *reply, size_t replysz);        // sync.c: pipe `usedoor` (TEST ONLY)
+static int savept_request(int pl, unsigned target, char *reply, size_t replysz);   // sync.c: pipe `savepoint`/`useobj`
+static void worlds_dump(char *reply, size_t replysz);                             // sync.c: pipe `worlds`
 
 // TEST-ONLY (TASK 49, pipe `crashso`): reach a stack overflow through a call the compiler cannot turn
 // into a loop (the function pointer is only set from the pipe command), so the crash handler can be
@@ -1542,6 +1548,28 @@ static void handle_command(char *line, char *reply, size_t replysz)
 		// Test/diagnostic (TASK 27): this copy's breakable/carryable prop table, so a check can print what
 		// each copy thinks a chair is (entity, broken, carrier, position) when a break does not propagate.
 		props_dump(reply, replysz);
+	} else if (!strncmp(line, "savepoint", 9)) {
+		// TEST-ONLY (TASK 60): use this level's save point the way the interaction scan does (vtable slot
+		// 28) for player 0/1. On the guest that use is refused by the save point hook and becomes a
+		// request to the host; on the host the game's own save flow starts.
+		int pl = 0;
+		if (line[9] && (sscanf(line + 9, "%d", &pl) != 1 || pl < 0 || pl > 1))
+			_snprintf(reply, replysz, "error savepoint [0|1]");
+		else
+			savept_request(pl, 0, reply, replysz);
+	} else if (!strncmp(line, "useobj ", 7)) {
+		// TEST-ONLY (TASK 60): the same call on an explicitly named level entity, for the container family
+		// a check cannot always reach with the pad (like `swingobj`).
+		unsigned ent = 0;
+		int pl = 0;
+		if (sscanf(line + 7, "%x %d", &ent, &pl) < 1 || ent < 0x10000 || pl < 0 || pl > 1)
+			_snprintf(reply, replysz, "error useobj <hex entity> [0|1]");
+		else
+			savept_request(pl, ent, reply, replysz);
+	} else if (!strncmp(line, "worlds", 6)) {
+		// Diagnostic (TASK 60): this copy's item/container table with the live flag (the pipe form of
+		// what check_world.py reads from memory).
+		worlds_dump(reply, replysz);
 	} else if (!strncmp(line, "netpause", 8)) {
 		long ms = -1;
 		sscanf(line + 8, "%ld", &ms);
