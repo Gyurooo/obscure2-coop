@@ -6,8 +6,10 @@
 #   3. check_attack_anim.py  - the aim stance + attack animation on both copies, both players;
 #   4. check_controls.py     - each pad drives its own character on both copies;
 #   5. soak34.py            - 30 location changes back and forth + movement + attacks + door uses;
-#   6. check_doors.py --reset game3.sav - the door image and the transition in both directions;
-#   7. liveness and the logs: no crash report; then the guest is asked to fault (pipe `crash`) and the
+#   6. check_world.py       - the shared save at a save point (both copies byte-identical), the live
+#                             items and the container state;
+#   7. check_doors.py --reset game3.sav - the door image and the transition in both directions;
+#   8. liveness and the logs: no crash report; then the guest is asked to fault (pipe `crash`) and the
 #      report must be complete (code, eip as module+offset, registers, stack, log tail).
 #
 # Usage: sh tests/run_soak.sh <dll>
@@ -160,6 +162,7 @@ run_check "check_controls.py" 180 "$PY" -I "$HERE/check_controls.py" "$HP" "$GP"
 run_check "check_visible.py (the peer character is drawn)" 150 "$PY" -I "$HERE/check_visible.py" "$HP" "$GP"
 run_check "check_fight_pair.py (players attack each other)" 240 "$PY" -I "$HERE/check_fight_pair.py" "$HP" "$GP"
 run_check "soak34.py ($ITERS location changes)" 1500 "$PY" -I "$HERE/soak34.py" "$HP" "$GP" "$ITERS"
+run_check "check_world.py (shared save at a save point, items, containers)" 420 "$PY" -I "$HERE/check_world.py" "$HP" "$GP"
 run_check "check_doors.py --reset game3.sav" 300 "$PY" -I "$HERE/check_doors.py" "$HP" "$GP" --reset game3.sav
 
 echo "== liveness and crash reports"

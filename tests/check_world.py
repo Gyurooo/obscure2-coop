@@ -16,7 +16,7 @@ Phases (each prints its own verdict):
 
 Usage: python -I check_world.py <host pid> <guest pid> [--skip-save] [--skip-items] [--skip-container]
 """
-import os, sys, time, glob, struct, hashlib
+import os, sys, time, glob, struct, hashlib, math
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bot import Pipe, press
 from peek import Proc
@@ -121,6 +121,17 @@ def players(m):
     return [u32(m, u32(m, mg + 0xc) + 4 * i) for i in range(min(u32(m, mg + 4), 8))]
 
 
+def humans(m):
+    """This copy's humans by character tag (BOY1/GIR1/...) with their positions; a position that reads
+    as garbage (the objects are rebuilt during a load) is left out."""
+    out = {}
+    for h in players(m):
+        t, p = tag(u32(m, h + 0x14)), pos(m, h)
+        if t and all(abs(v) < 1e6 for v in p):
+            out[t] = p
+    return out
+
+
 def live_items(m):
     """The game's own liveness test: active (+0x20 != 0), not collected (+0xa8 == 0), not broken
     (+0xa4 == 0), and the three interaction gates clear (+0xc0/+0xac/+0xb0)."""
@@ -174,9 +185,30 @@ def save_snap(d):
     out = {}
     for f in glob.glob(os.path.join(d, '*.sav')):
         try:
-            out[os.path.basename(f)] = hashlib.sha1(open(f, 'rb').read()).hexdigest()[:12]
+            out[os.path.basename(f)] = hashlib.sha256(open(f, 'rb').read()).hexdigest()
         except OSError:
             pass
+    return out
+
+
+def save_times(d):
+    out = {}
+    for f in glob.glob(os.path.join(d, '*.sav')):
+        try:
+            out[os.path.basename(f)] = os.stat(f).st_mtime_ns
+        except OSError:
+            pass
+    return out
+
+
+def dir_snap(d):
+    out = {}
+    for f in glob.glob(os.path.join(d, '*')):
+        if os.path.isfile(f):
+            try:
+                out[os.path.basename(f)] = hashlib.sha256(open(f, 'rb').read()).hexdigest()
+            except OSError:
+                pass
     return out
 
 
@@ -197,83 +229,285 @@ def wait_save(m, name, sha, own_dir, other_dir, limit=30):
     return False, 'the other copy has %s' % save_snap(other_dir).get(name, 'no file')
 
 
-def use_savepoint(pipe, m, pl, who):
-    """Puts the level's save point in its idle state (+0x14 = 0, the value its own can-use check wants)
-    and makes this copy use it the way the interaction scan does."""
-    w = world(m)
+def reset_savepoint(m, pipe, who):
+    """Puts this copy's save point in its idle state +0x14 = 0: the value the save point's own can-use
+    check wants (FUN_0046e6c0) and the state its own save machine starts from (FUN_0046f330). The ten
+    test saves store every save point in the post-save state 3 (FINDINGS_60 2), so a save loaded from
+    one of them cannot save again without this. Test-only memory write, never done by the mod."""
     sp = find_pt(m, SAVEPT, pos(m, players(m)[0]) if players(m) else (0, 0, 0))
     if not sp:
         print('   %s: no save point in level %s' % (who, tag(level(m))))
-        return False
+        return 0
     if u32(m, sp + 0x14) != 0:
         print('   %s: save point +0x14 = %d (the state the save that made these saves left); setting 0'
               % (who, u32(m, sp + 0x14)))
         pipe.cmd('wr %x 00000000' % (sp + 0x14))
+    return sp
+
+
+def wait_state(m, want, limit):
+    """Seconds until this copy's world reaches state `want` (world+0x11c), -1 on timeout."""
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        w = world(m)
+        if w and u32(m, w + 0x11c) == want:
+            return time.time() - t0
+        time.sleep(0.3)
+    return -1
+
+
+def use_savepoint(pipe, m, pl, who):
+    """Puts the level's save point in its idle state and makes this copy use it the way the interaction
+    scan does (vtable slot 28, through the mod's TEST-ONLY `savepoint` pipe command)."""
+    if not reset_savepoint(m, pipe, who):
+        return False
     print('   %s: savepoint (player %d) -> %s' % (who, pl + 1, pipe.cmd('savepoint %d' % pl)))
     return True
 
 
+def panel_save_item(m):
+    """(panel, item) of the save panel (game+0x478): the item tagged "SFLO" (0x53464c4f)."""
+    g = game(m)
+    p = u32(m, g + 0x478) if g else 0
+    if not p:
+        return 0, 0
+    n, arr = u32(m, p + 0x38), u32(m, p + 0x40)
+    for i in range(min(n, 12)):
+        c = u32(m, arr + 4 * i)
+        if u32(m, c + 0x10) == 0x53464c4f:
+            return p, c
+    return p, 0
+
+
+def drive_save(pipe, m, who):
+    """The rest of the player's own save at a save point, with the game's own UI:
+      1. the save point's machine (FUN_0046f330 state 0) waits for pad A -> the animation,
+      2. 3 s animation + 3 s -> CLevel::Request_SaveGame -> world+0x11c = 10 and the save panel
+         (menus\\save.xmc's SFLO item on game+0x478) shows its slot list after 999 ms,
+      3. A picks the highlighted slot (state 2 -> 0x17 = the SPOP confirmation); DOWN + A picks the
+         button that saves, which runs FUN_004a25e0 (the game's own SaveGame builder) in state 0x18;
+      4. A closes the "save complete" popup (state 0x19), then the panel hides and world state 10 ends.
+    A press before the slot list exists, or while a popup is still opening, is dropped; so each press
+    waits for the item's own state instead of a fixed clock."""
+    if wait_state(m, 11, 10) < 0:
+        print('   %s: the save point use did not reach world state 11 (state %s)'
+              % (who, u32(m, world(m) + 0x11c) if world(m) else '-'))
+        return False
+    time.sleep(0.8)
+    press(pipe, 0, 'A', 0.25)
+    shown = wait_state(m, 10, 25)
+    if shown < 0:
+        print('   %s: the save panel (world+0x11c = 10) did not open (state %s)'
+              % (who, u32(m, world(m) + 0x11c) if world(m) else '-'))
+        return False
+    print('   %s: the save panel opened %.1f s after the pad A' % (who, shown))
+    t0, last = time.time(), 0.0
+    st2 = st17 = None
+    confirms = ['DOWN', 'UP', 'LEFT', 'RIGHT']
+    confirm_at = 0
+    next_status = 0.0
+    while time.time() - t0 < 70:
+        p, c = panel_save_item(m)
+        if not p or u32(m, p + 0x10) == 0:
+            print('   %s: the save panel closed after %.1f s' % (who, time.time() - t0))
+            return True
+        st = u32(m, c + 0xe0) if c else -1
+        now = time.time()
+        if now >= next_status:
+            next_status = now + 10.0
+            print('   %s: t+%.0f save item state %d, panel on %d, world %d'
+                  % (who, now - t0, st, u32(m, p + 0x10), u32(m, world(m) + 0x11c) if world(m) else -1))
+        if st != 2:
+            st2 = None
+        if st != 0x17:
+            st17 = None
+        if st == 2:
+            st2 = st2 or now
+            if now - st2 >= 1.0 and now - last > 2.0:
+                print('   %s: the slot list is ready (item state 2): pad A' % who)
+                press(pipe, 0, 'A', 0.2)
+                last = time.time()
+        elif st == 0x17:
+            # FUN_00553520(0x17) shows the SPOP confirmation (the save item's child at in_ECX[0x33]);
+            # the state machine only proceeds once SPOP is closed (child+0x34 == 0) and then reads the
+            # button that was picked (child+0xb8). The plain first button does not save: DOWN selects
+            # the second one, A activates it (proved solo). The other directions are only a fallback.
+            if st17 is None:
+                st17 = now
+                print('   %s: the save confirmation is up (item state 0x17): pad %s, then A'
+                      % (who, confirms[confirm_at % len(confirms)]))
+            elif now - st17 >= 2.5 and now - last > 3.0:
+                press(pipe, 0, confirms[confirm_at % len(confirms)], 0.2)
+                confirm_at += 1
+                time.sleep(0.8)
+                press(pipe, 0, 'A', 0.2)
+                last = time.time()
+        elif st == 0x19 and now - last > 2.0:
+            # the write is done and the game shows its own "save complete" popup
+            # (FUN_00553520(0x19) -> FUN_00546af0(0x8100005, 0x4000006)): A closes it, then the panel
+            # hides itself and world state 10 completes.
+            print('   %s: the save was written, the completion popup is up (item state 0x19): pad A' % who)
+            press(pipe, 0, 'A', 0.2)
+            last = time.time()
+        time.sleep(0.4)
+    print('   %s: the save panel did not close (world state %s)'
+          % (who, u32(m, world(m) + 0x11c) if world(m) else '-'))
+    return False
+
+
+def wait_new_save(d, before_hash, before_time, limit=45):
+    """Waits for the game to write a slot of folder `d` (its SHA-256 or its mtime changes)."""
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        now, now_t = save_snap(d), save_times(d)
+        for k, v in now.items():
+            if before_hash.get(k) != v or before_time.get(k) != now_t.get(k):
+                return k, v, time.time() - t0
+        time.sleep(0.5)
+    return None, None, time.time() - t0
+
+
 def save_phase():
     print('\n== A save: the same file on both copies')
-    before = [save_snap(d) for d in save_dirs()]
-    print('   host remote %d saves, guest remote %d saves' % (len(save_snap(save_dirs()[0])), len(save_snap(save_dirs()[1]))))
+    if not find_pt(H, SAVEPT, pos(H, players(H)[0]) if players(H) else (0, 0, 0)):
+        # The soak's location changes leave the pair in another level (J002) where this level's save
+        # point does not exist; the save test needs I100, the level save 01 loads.
+        print('   level %s has no save point: loading game0.sav (I100, the pair\'s start slot)'
+              % tag(level(H)))
+        print('   loadsave -> %s' % HP.cmd('loadsave game0.sav'))
+        if not wait_level(0x49313030):
+            print('save: NOT DONE - the level with the save point did not load')
+            fails.append('save')
+            return
+    dirs = save_dirs()
+    names = ['host remote', 'guest remote', 'host Save', 'guest Save']
+    b_hash = [save_snap(d) for d in dirs]
+    b_time = [save_times(d) for d in dirs]
+    b_dir = [dir_snap(d) for d in dirs]
+    for i, nm in enumerate(names):
+        print('   before %-12s %d files: %s' % (nm, len(b_dir[i]), sorted(b_dir[i])))
     ok = True
-    saved = False
+    saved = 0
+    slot = None
     # 1. the HOST saves at its save point (its own game path; the file goes to the guest)
     if not use_savepoint(HP, H, 0, 'host'):
         ok = False
-    else:
-        press(HP, 0, 'A', 0.25)
-        t0 = time.time()
-        name = sha = None
-        while time.time() - t0 < 40 and not name:
-            press(HP, 0, 'A', 0.25)
-            now = save_snap(save_dirs()[0])
-            for k, v in now.items():
-                if before[0].get(k) != v:
-                    name, sha = k, v
-                    break
-            time.sleep(1.0)
-        if name:
-            saved = True
-            print('   the host\'s game wrote %s (sha %s) after %.1f s' % (name, sha, time.time() - t0))
-            good, why = wait_save(H, name, sha, save_dirs()[0], save_dirs()[1])
-            print('   guest copy: %s' % why)
-            ok = ok and good
-        else:
-            print('   the host\'s game did NOT write a save in 40 s (world state %s, request %s)'
-                  % (u32(H, world(H) + 0x11c) if world(H) else '-', u32(H, game(H) + 0x320) if game(H) else '-'))
-    # 2. the GUEST uses its save point: a request the host performs
-    before = [save_snap(d) for d in save_dirs()]
-    if not use_savepoint(GP, G, 1, 'guest'):
+    elif not drive_save(HP, H, 'host'):
         ok = False
     else:
-        t0 = time.time()
-        name = sha = None
-        while time.time() - t0 < 40 and not name:
-            press(HP, 0, 'A', 0.25)
-            now = save_snap(save_dirs()[0])
-            for k, v in now.items():
-                if before[0].get(k) != v:
-                    name, sha = k, v
-                    break
-            time.sleep(1.0)
+        name, sha, dt = wait_new_save(dirs[0], b_hash[0], b_time[0])
         if name:
-            saved = True
-            print('   the host (asked by the guest) wrote %s (sha %s) after %.1f s' % (name, sha, time.time() - t0))
-            good, why = wait_save(H, name, sha, save_dirs()[0], save_dirs()[1])
-            print('   guest copy: %s' % why)
+            saved += 1
+            slot = name
+            print('   the host\'s game wrote %s after %.1f s: sha256 %s' % (name, dt, sha))
+            good, why = wait_save(H, name, sha, dirs[0], dirs[1])
+            print('   guest remote %s: %s -> sha256 %s' % (name, why, save_snap(dirs[1]).get(name)))
             ok = ok and good
         else:
-            print('   no save file was written for the guest\'s request in 40 s')
-    if not saved:
-        print('save: NOT DONE - the game\'s own save state (world+0x11c = 10) does not complete in these '
-              'saves, so no save file exists to compare (see FINDINGS_60)')
+            print('   the host\'s game did NOT write a save in 45 s (world state %s)'
+                  % (u32(H, world(H) + 0x11c) if world(H) else '-'))
+    # 2. the GUEST uses its save point: the mod refuses that use on the guest and the HOST performs it
+    #    with the game's own use on its copy of the save point, so the host's +0x14 must be idle too.
+    print('   -- the guest\'s save point: the host performs that save')
+    reset_savepoint(H, HP, 'host')
+    g_hash, g_time = save_snap(dirs[0]), save_times(dirs[0])
+    if not use_savepoint(GP, G, 1, 'guest'):
+        ok = False
+    elif not drive_save(HP, H, 'host (asked by the guest)'):
+        ok = False
+    else:
+        name, sha, dt = wait_new_save(dirs[0], g_hash, g_time)
+        if name:
+            saved += 1
+            slot = name
+            print('   the host (asked by the guest) wrote %s after %.1f s: sha256 %s' % (name, dt, sha))
+            good, why = wait_save(H, name, sha, dirs[0], dirs[1])
+            print('   guest remote %s: %s -> sha256 %s' % (name, why, save_snap(dirs[1]).get(name)))
+            ok = ok and good
+        else:
+            print('   no save file was written for the guest\'s request in 45 s (host world state %s)'
+                  % (u32(H, world(H) + 0x11c) if world(H) else '-'))
+    # 3. only that slot may have changed, and only inside coop_profile\remote (the game's own
+    #    ISteamRemoteStorage folder through the mod's proxy; FINDINGS_60 section 2)
+    print('   -- what changed in the save folders')
+    a_dir = [dir_snap(d) for d in dirs]
+    for i, nm in enumerate(names):
+        changed = sorted(k for k in set(b_dir[i]) | set(a_dir[i]) if b_dir[i].get(k) != a_dir[i].get(k))
+        print('   after  %-12s %d files changed: %s' % (nm, len(changed), changed or 'none'))
+        other = [k for k in changed if k != slot]
+        if other:
+            print('   %s changed a file that is not the saved slot: %s' % (nm, other))
+            ok = False
+        elif i < 2 and changed:
+            continue                                        # the slot itself, in the game's folder
+        elif changed:
+            # <exe>\Save is the mod's own mirror of what the game reads from coop_profile\remote
+            # (sync.c save60_store writes both); the game itself writes only the remote folder.
+            print('   %s: %s is the mod\'s mirror of the slot (sync.c save60_store), not a game write'
+                  % (nm, changed))
+    if saved == 0:
+        print('save: NOT DONE - no save file was written by the game')
         print('   host save counters:  %s' % [s for s in HP.cmd('sync').split('|') if 'saves sent' in s or 'savept' in s])
         print('   guest save counters: %s' % [s for s in GP.cmd('sync').split('|') if 'saves sent' in s or 'savept' in s])
+        print('save FAIL')
+        fails.append('save')
         return
+    # 4. the next session: the save both copies now hold loads into the same place on both
+    print('   -- the next session: both copies load %s' % slot)
+    saved_at = humans(H)
+    HP.cmd('pad 0 0 32000 0')           # walk away, so the load has a position to restore
+    time.sleep(1.2)
+    HP.cmd('pad 0 0 0 0')
+    time.sleep(0.8)
+    moved = humans(H)
+    walked = max((math.dist(saved_at[t], moved[t]) for t in saved_at if t in moved), default=0.0)
+    print('   the host walked %.1f units away from the saved spot' % walked)
+    lv = level(H)
+    print('   loadsave -> %s' % HP.cmd('loadsave ' + slot))
+    if not wait_level(lv):
+        print('   the save did not load on both copies')
+        ok = False
+    else:
+        good = False
+        stable = None
+        t0 = time.time()
+        last_note = t0
+        while time.time() - t0 < 45:
+            hs, gs = humans(H), humans(G)
+            if hs and set(hs) == set(gs) and all(any(abs(v) > 1e-3 for v in p) for p in hs.values()):
+                ds = {t: math.dist(hs[t], gs[t]) for t in hs}
+                if max(ds.values()) <= 2.5:
+                    if stable is None:
+                        stable = (hs, time.time())
+                    elif time.time() - stable[1] >= 1.5 and \
+                            all(math.dist(stable[0][t], hs[t]) <= 0.5 for t in hs):
+                        good = True
+                        print('   both copies hold %s within %.2f units after %.1f s: %s'
+                              % ('/'.join(sorted(ds)), max(ds.values()), time.time() - t0,
+                                 {t: round(v, 2) for t, v in sorted(ds.items())}))
+                        if walked > 10:
+                            back = {t: math.dist(saved_at[t], hs[t]) for t in saved_at if t in hs}
+                            print('   distance from the saved spot: %s'
+                                  % {t: round(v, 1) for t, v in sorted(back.items())})
+                            if back and max(back.values()) > 5:
+                                print('   the load did NOT restore the saved position')
+                                good = False
+                        break
+                else:
+                    stable = None
+            else:
+                stable = None
+            if time.time() - last_note > 10:
+                last_note = time.time()
+                print('   waiting for both copies to settle: host %s guest %s' % (hs, gs))
+            time.sleep(1.0)
+        if not good:
+            print('   the two copies are NOT in the same place after the load (host %s guest %s)'
+                  % (humans(H), humans(G)))
+            ok = False
     if ok:
-        print('save OK: every save file the game wrote on one copy is byte-identical on the other')
+        print('save OK: every save file the game wrote on one copy is byte-identical on the other, and '
+              'the file loads into the same place on both')
     else:
         print('save FAIL')
         fails.append('save')
