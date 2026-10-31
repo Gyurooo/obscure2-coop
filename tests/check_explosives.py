@@ -44,6 +44,43 @@ def tag4(v):
     return ''.join(chr((v >> s) & 0xff) if 32 <= ((v >> s) & 0xff) < 127 else '.' for s in (24, 16, 8, 0))
 
 
+def fx_counts(pipe):
+    """TASK 53: the effect-relay counters of one copy, from its `sync` reply. 'played' = the effects of the
+    PEER this copy's game spawned (the game's own effect call at the peer's position)."""
+    try:
+        s = pipe.cmd('sync')
+    except OSError:
+        return None
+    import re
+    m = re.search(r'fx local (\d+) sent (\d+) rcv (\d+) played (\d+)', s)
+    if not m:
+        return None
+    return dict(local=int(m.group(1)), sent=int(m.group(2)), rcv=int(m.group(3)), played=int(m.group(4)))
+
+
+def peer_effects(side, tag):
+    """The replayed effects in the PARTNER copy's log since the start: (tag, x, y, z) per line."""
+    data = read_log(side['peer_dir'], side['peer_off'])
+    out = []
+    import re
+    for line in data.decode('latin-1', 'replace').splitlines():
+        if 'effect from the peer played' not in line:
+            continue
+        m = re.search(r'effect from the peer played: (\S+) at \(([-\d.]+),([-\d.]+),([-\d.]+)\)', line)
+        if m:
+            out.append((m.group(1), float(m.group(2)), float(m.group(3)), float(m.group(4))))
+    return out
+
+
+def read_log(dirname, off):
+    try:
+        with open(os.path.join(dirname, 'obscoop.log'), 'rb') as f:
+            f.seek(off)
+            return f.read()
+    except OSError:
+        return b''
+
+
 class View:
     def __init__(self, pid):
         self.p = Proc(pid)
@@ -166,8 +203,10 @@ def main():
     t0g = os.path.getsize(os.path.join(root, 'obscure2-test2', 'obscoop.log')) if os.path.exists(
         os.path.join(root, 'obscure2-test2', 'obscoop.log')) else 0
     # the copy that owns each character, its pipe, and the copy that drives it as a puppet
-    SIDE = {own_h: dict(own=H, peer=G, pipe=HP, peer_pipe=GP, pl=0, peer_pl=1),
-            own_g: dict(own=G, peer=H, pipe=GP, peer_pipe=HP, pl=1, peer_pl=0)}
+    SIDE = {own_h: dict(own=H, peer=G, pipe=HP, peer_pipe=GP, pl=0, peer_pl=1,
+                        peer_dir=os.path.join(root, 'obscure2-test2'), peer_off=t0g),
+            own_g: dict(own=G, peer=H, pipe=GP, peer_pipe=HP, pl=1, peer_pl=0,
+                        peer_dir=os.path.join(root, 'obscure2-test'), peer_off=t0)}
     # Only a THROWABLE is an explosive; a character that holds none is reported and skipped (measured: the
     # melee/clip path of a weapon the puppet's table does not carry is TASK 46's business - the chainsaw's
     # attack clip CS3A is not in the puppet's animation table, so its swing cannot show the same clip).
@@ -209,6 +248,7 @@ def main():
             # aim (LB) and tap the attack (RB): the game throws the dynamite
             side['pipe'].cmd('pad 0 %x 0 0' % LB)
             time.sleep(0.5)
+            fx0 = fx_counts(side['peer_pipe'])   # TASK 53: the effects the partner's game spawned
             owner_s, puppet_s = [], []
             for i in range(70):          # 3.5 s at 50 ms: the throw, the fuse, the blast, the reaction
                 if i in (2, 14, 26):
@@ -227,6 +267,36 @@ def main():
                     owner_s[-1]['t_up'] = to['up'] if so else None
             side['pipe'].cmd('pad 0 0 0 0 0 0')
             time.sleep(0.5)
+            # TASK 53: the partner's copy must have PLAYED the owner's effects - the explosion included.
+            # The game's own effect call is what creates the particle/visual object, so a replayed call at
+            # the blast point IS the effect object there (the check reads the call's position from the
+            # partner's log, and the relay counter from its `sync`).
+            fx1 = fx_counts(side['peer_pipe'])
+            played = (fx1 or {}).get('played', -1) - (fx0 or {}).get('played', 0)
+            ev = peer_effects(side, thrower)
+            wdex = [e for e in ev if e[0] == 'WDEX']
+            if not wdex and held in ('DYNA', 'FLBG'):
+                t_w = time.time() + 4.0   # the fuse: the blast can be a moment after the throw
+                while time.time() < t_w and not wdex:
+                    time.sleep(0.5)
+                    ev = peer_effects(side, thrower)
+                    wdex = [e for e in ev if e[0] == 'WDEX']
+                fx1 = fx_counts(side['peer_pipe'])
+                played = (fx1 or {}).get('played', -1) - (fx0 or {}).get('played', 0)
+            near = None
+            pp = side['own'].pos(thrower)
+            for _t, x, y, z in wdex:
+                if pp and ((x - pp[0]) ** 2 + (y - pp[1]) ** 2) ** 0.5 < 200.0:
+                    near = (x, y, z)
+            print('   %s: partner effect calls played +%d (owner %s), WDEX replays seen %d%s'
+                  % (thrower, played, 'local %d sent %d' % ((fx1 or {}).get('local', -1), (fx1 or {}).get('sent', -1)),
+                     len(wdex), '' if not near else ' nearest (%.1f,%.1f,%.1f)' % near))
+            if played <= 0:
+                fails.append('%s throw %d: the partner copy played no effect of the thrower (%s)'
+                             % (thrower, k + 1, fx1))
+            if held in ('DYNA', 'FLBG') and not wdex:
+                fails.append('%s throw %d: no WDEX explosion reached the partner copy'
+                             % (thrower, k + 1))
             # the thrower: same state/clip sequence on both copies?
             st, cl = compare(owner_s, puppet_s, 'state'), compare(owner_s, puppet_s, 'up')
             ost, opu = runs(owner_s, 'state'), runs(owner_s, 'up')

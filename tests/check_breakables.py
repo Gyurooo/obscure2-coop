@@ -272,6 +272,291 @@ def usable(m):
             and sane(epos(m, e))]
 
 
+# ---- TASK 53: the props of the loaded level, and the pushed / carried / thrown behaviour -----------
+# The breakable/carryable classes (the same set sync.c prop_class_tag mirrors): CHAI CToeChair,
+# BKCS CToeBreakableCase, BKDT CToeBreakableDetailed, BKON CToeBreakableOnce, BKMA CToeBreakableManikin,
+# BKBA CToeBreakableByAnim, BK2S CToeBreakableTwoStates, HCAS CToeHeavyCase.
+PROP_TAGS = (0x43484149, 0x424b4353, 0x424b4454, 0x424b4f4e, 0x424b4d41, 0x424b4241, 0x424b3253, 0x48434153)
+
+
+def props(m):
+    return [e for e in ents(m) if u32(m, e + 0x10) in PROP_TAGS]
+
+
+def carryable(m):
+    return [e for e in props(m) if u32(m, e + 0x24) and not u32(m, e + 0xa4) and not u32(m, e + 0xc4)
+            and sane(epos(m, e))]
+
+
+def body_of(m, e):
+    """The entity's collision object (+0x68): its address and class name (the pushed-prop relay must move
+    the same transform the game's own physics moves)."""
+    c = u32(m, e + 0x68)
+    return c, (rtti(m, c) if c else '')
+
+
+def dump_props(m, label):
+    for e in props(m):
+        body, name = body_of(m, e)
+        print('  %s prop %s body %x %s' % (label, describe(m, e), body, name))
+
+
+def prop_same(m_own, e_own, m_oth):
+    """The other copy's prop for this one, by list index when the two copies' lists agree (both build them
+    from the same level file in the same order), else by position (the TASK 26 chair_same rule)."""
+    po = props(m_oth)
+    i = -1
+    for k, e in enumerate(props(m_own)):
+        if e == e_own:
+            i = k
+            break
+    if 0 <= i < len(po) and u32(m_oth, po[i] + 0x10) == u32(m_own, e_own + 0x10):
+        return po[i]
+    return 0
+
+
+def task53_level(mh, mg, ph, pg):
+    """TASK 53 needs props that are whole and can be carried. Save 01 (I100) has none - its seven chairs
+    are recorded broken in the save (measured in the TASK 53 run) - so the check loads save slot 3
+    (game3.sav = J002, 11 chairs, OBSERVED in the slot scan) on the HOST with the game's own load path;
+    the guest follows the host's level (TASK 37). A1: player 1 = the host's own character."""
+    want = 'J002'
+    if level_of(mh) == want and level_of(mg) == want and usable_like(mh):
+        return True
+    print('  TASK 53: loading save slot 3 (game3.sav = %s) on the host; the guest follows the level' % want)
+    print('  host loadsave game3.sav -> %s' % ph.cmd('loadsave game3.sav'))
+    t = time.time()
+    while time.time() - t < 120:
+        if level_of(mh) == want and level_of(mg) == want and usable_like(mh) and usable_like(mg):
+            time.sleep(2.5)
+            print('  TASK 53: both copies in %s (%d props each)' % (want, len(props(mh))))
+            return True
+        time.sleep(0.5)
+    print('  TASK 53: the copies did not reach %s (host %s, guest %s)' % (want, level_of(mh), level_of(mg)))
+    return False
+
+
+def usable_like(m):
+    return [e for e in props(m) if u32(m, e + 0x24) and not u32(m, e + 0xa4) and not u32(m, e + 0xc4)]
+
+
+def pickup(pipe, m, pl):
+    """Press the action button until this copy's player `pl` holds a prop. Returns the prop or 0."""
+    for i in range(4):
+        press_a(pipe, 0)
+        ok, secs = wait_for(lambda: carry_of(m, pl) != 0, 1.2)
+        if ok:
+            return carry_of(m, pl)
+    return 0
+
+
+def task53_carry_walk(mh, mg, ph):
+    """(a) the walk animation while carrying: the owner walks with the prop in its hands; the partner's
+    copy of the character must play the OWNER's state and both clips (upper AND lower body - the lower
+    layer is what TASK 53 fixes in the carry state)."""
+    fails = []
+    me = ctl_human(mh, 0)
+    mine = sorted(usable_like(mh), key=lambda e: d3(epos(mh, e), hpos(mh, me)))
+    if not mine:
+        fails.append('carry-walk: no usable prop on the host copy')
+        return fails
+    e = 0
+    for cand in mine[:4]:
+        ok, how = tp_near(ph, mh, 0, epos(mh, cand))
+        print('  carry-walk: tp -> prop %s: %s' % (describe(mh, cand), how))
+        if not ok:
+            continue
+        e = pickup(ph, mh, 0)
+        if e:
+            break
+    if not e:
+        fails.append('carry-walk: the host player could not pick a prop up')
+        return fails
+    tag_me = tag(u32(mh, ctl_human(mh, 0) + 0x14))
+    pe = human_by_tag(mg, tag_me)
+    print('  carry-walk: %s carries %s' % (tag_me, describe(mh, e)))
+    time.sleep(0.5)
+    # walk: the owner holds the stick forward while carrying
+    rows = []
+    ph.cmd('pad 0 0 0 32000')
+    t = time.time()
+    while time.time() - t < 1.6:
+        rows.append((anim_of(mh, ctl_human(mh, 0)), anim_of(mg, pe) if pe else None, u32(mh, ctl_human(mh, 0) + 0x2e0)))
+        time.sleep(0.05)
+    ph.cmd('pad 0 0 0 0')
+    time.sleep(0.5)
+    if not pe:
+        fails.append('carry-walk: the partner copy has no character %s' % tag_me)
+        return fails
+    same = sum(1 for a, b, _g in rows if b and a == b)
+    nonloco = [r for r in rows if r[0][0] not in (0, 1, 2, 4)]
+    nl_same = sum(1 for a, b, _g in nonloco if b and a == b)
+    print('  carry-walk: %d samples, %d identical state+clips (%.0f%%); %d samples in a non-locomotion '
+          'carry state, %d identical' % (len(rows), same, 100.0 * same / max(1, len(rows)), len(nonloco), nl_same))
+    seen = []
+    for a, b, g in rows:
+        k = (a[0], a[1], a[2], b[0] if b else -1, b[1] if b else 0, b[2] if b else 0)
+        if not seen or seen[-1][0] != k:
+            seen.append((k, g))
+    for k, g in seen[:10]:
+        print('    owner st %d up %s lo %s gait %d | partner st %d up %s lo %s'
+              % (k[0], tag(k[1]), tag(k[2]), g, k[3], tag(k[4]), tag(k[5])))
+    if not nonloco:
+        print('  carry-walk: the owner walks in a LOCOMOTION state while carrying (the movement machine '
+              'drives the lower body on both copies); no carry-state walk sample')
+    elif nl_same < 0.7 * len(nonloco):
+        fails.append('carry-walk: the partner plays a different animation while the owner walks carrying '
+                     '(%d/%d identical)' % (nl_same, len(nonloco)))
+    return fails
+
+
+def task53_push(mh, mg, ph):
+    """(b) a pushed prop: the host's character walks into a prop; when the dust settles the same prop must
+    be within 10 units of the same place on both copies."""
+    fails = []
+    me = ctl_human(mh, 0)
+    mine = sorted(usable_like(mh), key=lambda e: d3(epos(mh, e), hpos(mh, me)))
+    if not mine:
+        fails.append('push: no usable prop')
+        return fails
+    e = mine[0]
+    ok, how = tp_near(ph, mh, 0, epos(mh, e), )
+    print('  push: tp next to %s: %s' % (describe(mh, e), how))
+    if not ok:
+        fails.append('push: could not stand next to the prop')
+        return fails
+    eo = prop_same(mh, e, mg)
+    p0o, p0g = epos(mh, e), epos(mg, eo) if eo else (0, 0, 0)
+    print('  push: before: own (%.1f,%.1f,%.1f) | other (%.1f,%.1f,%.1f)' % (p0o + p0g))
+    # walk into it from four directions (the stick is camera-relative, so try them all)
+    for lx, ly in ((0, 32000), (32000, 0), (0, -32000), (-32000, 0), (0, 32000)):
+        ph.cmd('pad 0 0 %d %d' % (lx, ly))
+        time.sleep(0.55)
+    ph.cmd('pad 0 0 0 0')
+    time.sleep(1.2)
+    eo = prop_same(mh, e, mg)
+    po, pg_ = epos(mh, e), epos(mg, eo) if eo else None
+    moved = d3(po, p0o)
+    print('  push: after:  own (%.1f,%.1f,%.1f) moved %.1f | other %s'
+          % (po[0], po[1], po[2], moved, 'missing' if not pg_ else '(%.1f,%.1f,%.1f) differs %.1f'
+             % (pg_[0], pg_[1], pg_[2], d3(po, pg_))))
+    if moved < 1.0:
+        print('  push: the prop did not move on the host either - no push happened in this position')
+    elif not pg_ or d3(po, pg_) > 10.0:
+        fails.append('push: the pushed prop is not in the same place on both copies (%s)'
+                     % ('missing on the partner copy' if not pg_ else '%.1f units apart' % d3(po, pg_)))
+    return fails
+
+
+def task53_throw(mh, mg, ph, pg):
+    """(c) a prop broken by THROWING another prop at it: the break must reach both copies and neither game
+    may die (the 2.1 playtest: the box stayed whole on the guest and its game crashed). Throws with the
+    input the game uses for a carried prop (aim + attack); tries the two forms until the owner's copy
+    breaks the target."""
+    fails = []
+    me = ctl_human(mh, 0)
+    mine = sorted(usable_like(mh), key=lambda e: d3(epos(mh, e), hpos(mh, me)))
+    if len(mine) < 2:
+        fails.append('throw: fewer than two props in the level')
+        return fails
+    e = 0
+    for cand in mine[:3]:
+        ok, how = tp_near(ph, mh, 0, epos(mh, cand))
+        if ok:
+            e = pickup(ph, mh, 0)
+            if e:
+                break
+    if not e:
+        fails.append('throw: the host player could not pick a prop up')
+        return fails
+    targets = [x for x in usable_like(mh) if x != e]
+    t0 = 0
+    target, best = 0, 1e9
+    for x in targets:
+        dd = d3(epos(mh, x), epos(mh, e))
+        if dd < best:
+            best, target = dd, x
+    if not target:
+        fails.append('throw: no second prop to throw at')
+        return fails
+    print('  throw: carrying %s, target %s %.1f units away' % (describe(mh, e), describe(mh, target), best))
+    ok, how = tp_near(ph, mh, 0, epos(mh, target))
+    print('  throw: tp toward the target: %s' % how)
+    to = prop_same(mh, target, mg)
+    print('  throw: before: target own broken %d | other broken %d'
+          % (u32(mh, target + 0xa4), u32(mg, to + 0xa4) if to else -1))
+    broke = False
+    for name, keys in (('aim + tap attack', 'aimtap'), ('aim + hold attack', 'aimhold'), ('aim + action', 'aima')):
+        if broke:
+            break
+        if keys == 'aimtap':
+            ph.cmd('pad 0 %x 0 0' % 0x100)
+            time.sleep(0.4)
+            for _ in range(2):
+                ph.cmd('pad 0 %x 0 0' % (0x100 | 0x200))
+                time.sleep(0.12)
+                ph.cmd('pad 0 %x 0 0' % 0x100)
+                time.sleep(0.15)
+        elif keys == 'aimhold':
+            ph.cmd('pad 0 %x 0 0' % (0x100 | 0x200))
+            time.sleep(0.5)
+        else:
+            ph.cmd('pad 0 %x 0 0' % 0x100)
+            time.sleep(0.4)
+            ph.cmd('pad 0 %x 0 0' % (0x100 | 0x1000))
+            time.sleep(0.2)
+        ph.cmd('pad 0 0 0 0')
+        time.sleep(2.0)
+        broke = u32(mh, target + 0xa4) != 0
+        print('  throw: %-18s -> target broken on the owner copy: %s (carried prop now %s)'
+              % (name, 'yes' if broke else 'no', describe(mh, e)))
+    if not broke:
+        print('  throw: none of the input forms broke the target - no throw observed (see FINDINGS)')
+        return fails
+    okb, secs = wait_for(lambda: u32(mg, (prop_same(mh, target, mg) or 0) + 0xa4) != 0, 4.0)
+    to = prop_same(mh, target, mg)
+    print('  throw: break on the partner copy: %s after %.2f s -> %s'
+          % ('yes' if okb else 'NO', secs, describe(mg, to)))
+    if not okb:
+        fails.append('throw: the prop broken by the thrown prop stays whole on the partner copy')
+    # both copies alive and ticking (the 2.1 playtest crash): the game thread's frame counter must have
+    # advanced and the child processes must still be there
+    fh0, fg0 = frames(ph), frames(pg)
+    time.sleep(1.0)
+    fh1, fg1 = frames(ph), frames(pg)
+    print('  throw: frames host %s -> %s | guest %s -> %s' % (fh0, fh1, fg0, fg1))
+    try:
+        alive = ph.cmd('ping').startswith('pong') and pg.cmd('ping').startswith('pong')
+    except OSError:
+        alive = False
+    if not alive or fh0 == fh1 or fg0 == fg1:
+        fails.append('throw: a copy stopped after the throw (alive %s, frames host %s->%s guest %s->%s)'
+                     % (alive, fh0, fh1, fg0, fg1))
+    return fails
+
+
+def raw_move_test(m, pipe, label):
+    """Can the pushed-prop transform be written raw? Move a whole, unheld prop's entity position (+0x6c)
+    by 20 units and read it back after half a second. If the game's physics restores it, the collision
+    body (+0x68) is the source of truth and the relay has to move that instead."""
+    cand = [e for e in props(m) if u32(m, e + 0x24) and not u32(m, e + 0xa4) and not u32(m, e + 0xc4)
+            and sane(epos(m, e))]
+    if not cand:
+        print('  %s: no whole prop to move' % label)
+        return
+    e = cand[0]
+    p = epos(m, e)
+    want = (p[0] + 20.0, p[1], p[2])
+    r = pipe.cmd('wr %x %s' % (e + 0x6c, struct.pack('<3f', *want).hex()))
+    time.sleep(0.6)
+    got = epos(m, e)
+    print('  %s: raw move of %s ent %x to (%.1f,%.1f,%.1f): %s -> now (%.1f,%.1f,%.1f) %s'
+          % (label, tag(u32(m, e + 0x10)), e, want[0], want[1], want[2], r, got[0], got[1], got[2],
+             'STICKS' if d3(got, want) < 2.0 else 'REVERTED (the physics body is the source)'))
+    tgt = [x for x in cand if x != e]
+    _ = tgt
+
+
 def main():
     hp, gp = int(sys.argv[1]), int(sys.argv[2])
     mh, mg = Proc(hp), Proc(gp)
@@ -288,17 +573,29 @@ def main():
         print('  host  chair %s' % describe(mh, e))
     for e in chairs(mg):
         print('  guest chair %s' % describe(mg, e))
-    if not ch:
-        print('breakables: SKIP - this level has no CToeChair (the save has no breakable prop here)')
-        return 0
-    if not usable(mh):
-        print('breakables: SKIP - every chair in this level is already broken (enabled 0, broken 1); '
-              'the save slot recorded them destroyed. Load a slot with a usable chair (SAVE_SLOT=3, J002).')
-        return 0
-    print('breakables: player 1 on the host carries chair %s, player 2 on the guest carries another'
-          % describe(mh, min(usable(mh), key=lambda e: d3(epos(mh, e), hpos(mh, ctl_human(mh, 0))))))
+    # TASK 53: every breakable/carryable class of this level (not only CHAI), with its collision body.
+    print('breakables: TASK 53 prop inventory (host / guest)')
+    dump_props(mh, 'host ')
+    dump_props(mg, 'guest')
     fails = []
-    used = set()
+    # TASK 53: carry-walk animation, a pushed prop, a prop broken by a thrown prop. Save 01 (I100) has no
+    # prop that is still whole (measured), so the phase first loads save slot 3 (game3.sav = J002).
+    print('\nbreakables: TASK 53 phases')
+    if task53_level(mh, mg, ph, pg):
+        fails += task53_carry_walk(mh, mg, ph)
+        fails += task53_push(mh, mg, ph)
+        fails += task53_throw(mh, mg, ph, pg)
+        lv_h = level_of(mh)
+    else:
+        fails.append('TASK 53: a level with whole props could not be reached')
+    # ---- TASK 26 chair phases: need a chair that is still whole in this level ----
+    if not usable(mh):
+        print('breakables: the TASK 26 chair phases are skipped here (no whole chair in %s)' % lv_h)
+        used = set()
+    else:
+        print('breakables: player 1 on the host carries chair %s, player 2 on the guest carries another'
+              % describe(mh, min(usable(mh), key=lambda e: d3(epos(mh, e), hpos(mh, ctl_human(mh, 0))))))
+        used = set()
 
     def one_player(owner, other, m_own, m_oth, pipe_own, pl, label):
         """pl 0 = player 1 (host copy), pl 1 = player 2 (guest copy)."""
@@ -436,8 +733,14 @@ def main():
     # (TASK 27 runs 2 and 3). What is left to test - a break by either player reaching the other copy - is
     # what the two phases below do, and the resend path is exercised by every break whose announcement this
     # copy did not simulate itself.
-    one_player(None, None, mh, mg, ph, 0, 'player 1 (host)')
-    one_player(None, None, mg, mh, pg, 1, 'player 2 (guest)')
+    if usable(mh):
+        one_player(None, None, mh, mg, ph, 0, 'player 1 (host)')
+        one_player(None, None, mg, mh, pg, 1, 'player 2 (guest)')
+
+    # TASK 53 diagnostic: is the entity position the physics source (a raw write sticks), or must the
+    # collision body be moved? Runs last: moving a prop leaves the copies different.
+    raw_move_test(mh, ph, 'host ')
+    raw_move_test(mg, pg, 'guest')
 
     print('\nbreakables: inventory host %d guest %d' % (inv_count(mh), inv_count(mg)))
     print('breakables: game ticks (frames) host %s guest %s' % (frames(ph), frames(pg)))

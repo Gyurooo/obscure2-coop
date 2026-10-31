@@ -98,7 +98,10 @@ static void host_send_progress(int force);            // sync.c
 static int guest_party_copy(unsigned level, BYTE *out);   // sync.c: the host's party table for this level
 static void game_load_tick(unsigned game);                // sync.c: a real save load, on the game thread
 static void teammate_game_guard(unsigned game, int before_update);   // sync.c (TASK 38)
-static int door_animation_running(void);                // sync.c (TASK 34/43): this copy's own door use is running
+static int door_animation_running(void);                // sync.c (TASK 34/43): the door use of this copy
+static void fx_replay_tick(void);                        // sync.c (TASK 53): the peer's effects
+static unsigned game_obj(void);                          // sync.c
+static int mem_ok(const void *p, size_t n);              // sync.c
 static void host_save_include(const char *name);          // sync.c: remember the loaded file, send it to the guest
 static void host_save_forget(void);                       // sync.c: the world no longer comes from a save file
 
@@ -421,6 +424,9 @@ static void __fastcall hk_game_update(void *game, void *edx, int dt)
 	// TASK 50: a peer's break of a window/crate is played with the object's own class entry (vtable slot
 	// 25) here, in the game's own update, never in Present (sync.c: prop_game_break_tick).
 	prop_game_break_tick();
+	// TASK 53: the effects the peer's game spawned are played here too (sync.c: fx_replay_tick ->
+	// fx_spawn): a game call, on the game's own thread, outside Present.
+	fx_replay_tick();
 	// TASK 38: the game's own code reads the teammate controller's character in the scripted-event skip
 	// (state 7) and in the enter-normal-play attach; the unlink (TASK 35) is only valid in normal play.
 	teammate_game_guard((unsigned)(uintptr_t)game, 1);
@@ -490,10 +496,76 @@ static void __fastcall hk_blast(void *self, void *edx)
 		g_blast(self, edx);
 }
 
+// TASK 53: the generic EFFECT spawner FUN_00591230 (thiscall on the effect manager, game+0x3c4 - the
+// call site 0x495087 loads `ecx = [[0x6c3068]+0x3c4]` and the function is `mov esi,ecx` then
+// `lea ecx,[esi+0x2c]` before the type lookup; its epilogue is `ret 0x2c`, eleven stack arguments). Every
+// weapon effect goes through it: the dynamite blast spawns "WDEX" at the blast point (decompile 83536),
+// the fuse "WDFI" (83665), and the muzzle flashes / tracers / impacts of the weapon classes call it with
+// the weapon object's position (e.g. 0x57474649 at 88000). TASK 49 suppressed the whole blast on the
+// guest, so the guest's screen lost the explosion with the damage (owner's 2.1 report). The effect call
+// itself carries no damage and no physics, so it can be replayed on the other copy: each copy records
+// every effect its own game spawns (sync.c fx_local_record -> PKT_FX) and plays the peer's effects with
+// the same call (fx_spawn below). A relayed effect is not recorded again (g_fx_replaying), so the two
+// copies cannot bounce one effect back and forth.
+typedef void(__fastcall *fx_t)(void *, void *, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD,
+                               DWORD, DWORD);
+static fx_t g_effect;
+static volatile LONG g_fx_replaying;
+static void fx_local_record(DWORD tag, DWORD a6, DWORD a7, DWORD a8, DWORD a9, DWORD a10, DWORD a11,
+                            const float *pos, int has_pos);   // sync.c
+static volatile LONG g_fx_calls;
+
+static void __fastcall hk_effect(void *self, void *edx, DWORD tag, DWORD a2, DWORD a3, DWORD a4, DWORD pos,
+                                 DWORD a6, DWORD a7, DWORD a8, DWORD a9, DWORD a10, DWORD a11)
+{
+	float p[3] = { 0.0f, 0.0f, 0.0f };
+	int has = 0;
+	// The position argument is a pointer to three floats (or 0, or an object the caller passes instead -
+	// 0x4e74c0 hands a stack temporary, FUN_005913a0 hands 0). Copy it only when it really reads as a
+	// world position, so a relayed call never hands the game a garbage pointer.
+	if (pos && !IsBadReadPtr((const void *)(uintptr_t)pos, 12)) {
+		const float *f = (const float *)(uintptr_t)pos;
+		if (f[0] > -100000.0f && f[0] < 100000.0f && f[1] > -100000.0f && f[1] < 100000.0f &&
+		    f[2] > -100000.0f && f[2] < 100000.0f) {
+			p[0] = f[0];
+			p[1] = f[1];
+			p[2] = f[2];
+			has = 1;
+		}
+	}
+	if (g_effect)
+		g_effect(self, edx, tag, a2, a3, a4, pos, a6, a7, a8, a9, a10, a11);
+	if (!g_fx_replaying)   // a replay of the peer's effect is not this copy's news
+		fx_local_record(tag, a6, a7, a8, a9, a10, a11, p, has);
+	InterlockedIncrement(&g_fx_calls);
+}
+
+// Play one effect the peer's game spawned, through the same game call. The effect manager is read live
+// (game+0x3c4) and the position is a local copy: the effect system takes it by pointer.
+static int fx_spawn(const fx_ev *e)
+{
+	unsigned g = game_obj();
+	if (!g || !mem_ok((const void *)(uintptr_t)(g + 0x3c4), 4))
+		return 0;
+	unsigned mgr = rd32(g + 0x3c4), w = rd32(g + 0x378);
+	if (!mgr || !w || rd32(g + 0x310) != 1 || IsBadReadPtr((const void *)(uintptr_t)mgr, 0x40))
+		return 0;
+	if (!g_effect || !e->tag)
+		return 0;
+	float p[3] = { e->pos[0], e->pos[1], e->pos[2] };
+	InterlockedIncrement(&g_fx_replaying);
+	g_effect((void *)(uintptr_t)mgr, NULL, e->tag, 0, 0, 0, e->has_pos ? (DWORD)(uintptr_t)p : 0,
+	         e->a6, e->a7, e->a8, e->a9, e->a10, e->a11);
+	InterlockedDecrement(&g_fx_replaying);
+	return 1;
+}
+
 static void install_request_hooks(void)
 {
 	static const BYTE p_blast[6] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x28 };
 	g_blast = (blast_t)hook_entry((BYTE *)0x48df50, p_blast, 6, (void *)hk_blast, "dynamite blast (0x48df50)");
+	static const BYTE p_fx[9] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x56, 0x8b, 0xf1 };   // 9 bytes: ret 0x2c reads [ebp+8..]
+	g_effect = (fx_t)hook_entry((BYTE *)0x591230, p_fx, 9, (void *)hk_effect, "effect spawn (0x591230)");
 	static const BYTE p_change[6] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08 };
 	static const BYTE p_prog[9] = { 0x55, 0x8b, 0xec, 0x8b, 0x81, 0x1c, 0x03, 0x00, 0x00 };
 	static const BYTE p_name[6] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08 };

@@ -1271,6 +1271,8 @@ typedef struct { unsigned ent; DWORD cls, id, broken, vt; unsigned carrier, drop
 static void prop_defer_break(unsigned ent, DWORD dcls, DWORD did, const float *dpos, int host_word);
 static void prop_apply_break(unsigned ent, DWORD dcls, DWORD did, const float *dpos, int host_word);
 static void prop_align_drop(unsigned ent, DWORD dcls, DWORD did, const float *dpos, int host_word);
+static int prop_own_here(unsigned ent);                          // TASK 53 (below)
+static void prop_apply_move(unsigned ent, const float *pos, const float *dir);   // TASK 53 (below)
 
 static prop_slot g_props[PROP_MAX];
 static int g_prop_n;
@@ -1798,6 +1800,14 @@ static int prop_apply_packet(const pkt_prop *pp)
 		InterlockedIncrement(&g_prop_applied);
 		return 1;
 	}
+	if (pp->kind == 4) {   // TASK 53: the prop moved on the copy whose character touched it
+		if (!ent)
+			return 0;      // not in the table yet: try again after the next scan
+		if (!prop_own_here(ent))
+			prop_apply_move(ent, pp->pos, pp->drop_pos);
+		InterlockedIncrement(&g_prop_applied);
+		return 1;
+	}
 	if (pp->kind != 3)
 		return 1;
 	if (!ent) {
@@ -2104,6 +2114,255 @@ static void prop_announce_break(int i, DWORD now)
 		drop ? tag4(rd32(drop + 0x10), c) : "none");
 }
 
+// ---- TASK 53: the effects of THIS copy's game reach the other copy --------------------------------
+// The effect spawner hook (hooks.c hk_effect on FUN_00591230) records every effect this copy's game
+// creates; the transport thread sends the newest ones in PKT_FX, and the receiver plays them with the
+// same game call (hooks.c fx_spawn) before its own game update. This is what the non-owner copy was
+// missing: TASK 49 stopped the guest from running the blast at all, so the host's explosion was simply
+// absent from the guest's screen. An effect call has no damage and no physics (the blast's damage loop is
+// separate code in FUN_0048df50), so replaying it does not re-open the TASK 49 double-damage bug.
+#define FX_RING 32
+static fx_ev g_fx_ring[FX_RING];
+static volatile LONG g_fx_seq, g_fx_sent;
+#define FX_SEEN 16
+static DWORD g_fx_seen[FX_SEEN];    // a hash of (tag, arguments, rounded position) seen recently
+static DWORD g_fx_seen_at[FX_SEEN];
+static int g_fx_seen_next;
+static volatile LONG g_fx_local, g_fx_sent_n, g_fx_rcv_n, g_fx_play_n, g_fx_skip_n, g_fx_dup_n;
+
+static DWORD fx_hash(const fx_ev *e)
+{
+	DWORD h = e->tag * 0x9e3779b1u;
+	h ^= (e->a6 + 0x85ebca6bu) ^ (e->a7 << 7);
+	if (e->has_pos) {
+		h ^= (DWORD)(LONG)(e->pos[0] * 2.0f) * 0x27d4eb2du;
+		h ^= (DWORD)(LONG)(e->pos[1] * 2.0f) * 0x165667b1u;
+		h ^= (DWORD)(LONG)(e->pos[2] * 2.0f) * 0x9e3779b9u;
+	}
+	return h ? h : 1;
+}
+
+// Called from the effect hook on the game thread, after the game's own call. Only in normal play: an
+// effect spawned in a menu or while a level is built has no position the other copy can use.
+static void fx_local_record(DWORD tag, DWORD a6, DWORD a7, DWORD a8, DWORD a9, DWORD a10, DWORD a11,
+                            const float *pos, int has_pos)
+{
+	if (!g_role)
+		return;
+	unsigned g = game_obj();
+	if (!g || rd32(g + 0x310) != 1 || !rd32(g + 0x378))
+		return;
+	fx_ev e;
+	memset(&e, 0, sizeof e);
+	e.tag = tag;
+	e.a6 = a6; e.a7 = a7; e.a8 = a8; e.a9 = a9; e.a10 = a10; e.a11 = a11;
+	e.has_pos = has_pos ? 1 : 0;
+	if (has_pos)
+		memcpy(e.pos, pos, sizeof e.pos);
+	DWORD h = fx_hash(&e), now = GetTickCount();
+	for (int i = 0; i < FX_SEEN; i++) {
+		if (g_fx_seen[i] == h && now - g_fx_seen_at[i] < 150) {
+			InterlockedIncrement(&g_fx_dup_n);
+			return;   // the same call reached us twice (a weapon's own loop, a retried frame)
+		}
+	}
+	g_fx_seen[g_fx_seen_next] = h;
+	g_fx_seen_at[g_fx_seen_next] = now;
+	g_fx_seen_next = (g_fx_seen_next + 1) & (FX_SEEN - 1);
+	LONG n = g_fx_seq + 1;
+	g_fx_ring[n & (FX_RING - 1)] = e;
+	g_fx_seq = n;   // publish only when the slot is complete
+	InterlockedIncrement(&g_fx_local);
+}
+
+// Transport thread (net_tick): send what the game spawned since the last packet. A burst goes out in one
+// packet (FX_MAX effects); everything older than the ring is dropped.
+static void fx_send_local(void)
+{
+	if (!g_role || !g_peer_ok)
+		return;
+	LONG sent = g_fx_sent, seq = g_fx_seq;
+	if (sent == seq)
+		return;
+	if (seq - sent > FX_RING - 1) {
+		InterlockedExchangeAdd(&g_fx_skip_n, seq - sent - (FX_RING - 1));
+		sent = seq - (FX_RING - 1);
+	}
+	pkt_fx p;
+	memset(&p, 0, sizeof p);
+	while (sent < seq && p.n < FX_MAX) {
+		p.e[p.n++] = g_fx_ring[(sent + 1) & (FX_RING - 1)];
+		sent++;
+	}
+	g_fx_sent = sent;
+	net_send(PKT_FX, &p, (WORD)(sizeof(pkt_fx) - sizeof(pkt_hdr) - (FX_MAX - p.n) * sizeof(fx_ev)));
+	InterlockedIncrement(&g_fx_sent_n);
+}
+
+// Network thread: the peer's effects wait here until the game thread plays them (a game call from the
+// transport thread would race the game's own update).
+static CRITICAL_SECTION g_fx_cs;
+static fx_ev g_fx_rx[FX_RING];
+static int g_fx_rx_head, g_fx_rx_tail;
+
+static void peer_on_fx(const char *buf, int n)
+{
+	if (n < (int)(sizeof(pkt_hdr) + sizeof(DWORD)))
+		return;
+	const pkt_fx *p = (const pkt_fx *)buf;
+	if (!p->n || p->n > FX_MAX)
+		return;
+	// n = the whole datagram (header + payload), like every other packet handler here; the payload is
+	// FX_MAX events at most, and p->n of them are present.
+	if (n != (int)(sizeof(pkt_fx) - (FX_MAX - p->n) * sizeof(fx_ev)))
+		return;
+	EnterCriticalSection(&g_fx_cs);
+	for (DWORD i = 0; i < p->n; i++) {
+		int next = (g_fx_rx_tail + 1) & (FX_RING - 1);
+		if (next == g_fx_rx_head) {
+			g_fx_rx_head = (g_fx_rx_head + 1) & (FX_RING - 1);   // full: the oldest effect is lost
+			InterlockedIncrement(&g_fx_skip_n);
+		}
+		g_fx_rx[g_fx_rx_tail] = p->e[i];
+		g_fx_rx_tail = next;
+	}
+	LeaveCriticalSection(&g_fx_cs);
+	InterlockedIncrement(&g_fx_rcv_n);
+}
+
+// Game thread, from the game update hook: play the peer's effects, one frame's worth at a time.
+static void fx_replay_tick(void)
+{
+	if (!g_role || !g_peer_ok)
+		return;
+	static DWORD logged_tag[16];
+	static int logged_n;
+	for (;;) {
+		fx_ev e;
+		EnterCriticalSection(&g_fx_cs);
+		if (g_fx_rx_head == g_fx_rx_tail) {
+			LeaveCriticalSection(&g_fx_cs);
+			return;
+		}
+		e = g_fx_rx[g_fx_rx_head];
+		g_fx_rx_head = (g_fx_rx_head + 1) & (FX_RING - 1);
+		LeaveCriticalSection(&g_fx_cs);
+		if (!fx_spawn(&e))
+			continue;
+		InterlockedIncrement(&g_fx_play_n);
+		int known = 0;   // one log line per effect TYPE: the relay chain is visible in both logs
+		for (int i = 0; i < logged_n; i++)
+			if (logged_tag[i] == e.tag)
+				known = 1;
+		if (!known && logged_n < 16) {
+			char t[5];
+			logged_tag[logged_n++] = e.tag;
+			logf("%s: effect from the peer played: %s at (%.1f,%.1f,%.1f) pos %u",
+				g_role == 2 ? "guest" : "host", tag4(e.tag, t), e.pos[0], e.pos[1], e.pos[2], e.has_pos);
+		}
+	}
+}
+
+// TASK 53: a prop that MOVES while nobody carries it (a character walks into it, another prop knocks it)
+// is simulated by the game's own physics on BOTH copies and they end up in different places (owner's 2.1
+// report: "pushing / colliding with boxes moves them differently on the two screens"). The copy whose own
+// character stands closer to the prop is the one whose character pushed it, so that copy streams the
+// prop's transform while it moves (prop_move_tick) and the other copy writes it (prop_apply_move). The
+// distance rule is symmetric and both copies know both characters (the peer's is the puppet), so exactly
+// one side sends and the receiver never writes a prop its own character is touching.
+typedef struct { unsigned ent; float pos[3]; DWORD at; } prop_move_slot;
+static prop_move_slot g_pmove[PROP_MAX];
+static volatile LONG g_prop_moves;
+static unsigned puppet_target(void);   // below (TASK 42/53: the peer's character on this copy)
+
+static float prop_dist2(const float *a, unsigned ch)
+{
+	const float *p = (const float *)(uintptr_t)(ch + H_POS);
+	float dx = a[0] - p[0], dy = a[1] - p[1], dz = a[2] - p[2];
+	return dx * dx + dy * dy + dz * dz;
+}
+
+static int prop_own_here(unsigned ent)
+{
+	unsigned me = g_role ? player_human(g_role == 2 ? 1 : 0) : 0;
+	unsigned peer = puppet_target();
+	if (!me || IsBadReadPtr((const void *)(uintptr_t)(ent + 0x6c), 12))
+		return 1;   // cannot tell: keep the local physics
+	float *ep = (float *)(uintptr_t)(ent + 0x6c);
+	if (!peer || IsBadReadPtr((const void *)(uintptr_t)(peer + H_POS), 12))
+		return 1;
+	return prop_dist2(ep, me) < prop_dist2(ep, peer) - 1.0f;
+}
+
+static prop_move_slot *prop_move_entry(unsigned ent, DWORD now, int create)
+{
+	prop_move_slot *oldest = &g_pmove[0];
+	for (int i = 0; i < PROP_MAX; i++) {
+		if (g_pmove[i].ent == ent)
+			return &g_pmove[i];
+		if ((LONG)(g_pmove[i].at - oldest->at) < 0)
+			oldest = &g_pmove[i];
+	}
+	if (!create)
+		return 0;
+	oldest->ent = ent;
+	oldest->at = now;
+	return oldest;
+}
+
+// The entity's own position and facing - the two fields the renderer and the game's entity code read
+// (prop_refresh reads the same +0x6c; FUN_00412720 reads the facing at +0x78).
+static void prop_apply_move(unsigned ent, const float *pos, const float *dir)
+{
+	if (!ent || IsBadWritePtr((void *)(uintptr_t)(ent + 0x6c), 12))
+		return;
+	memcpy((void *)(uintptr_t)(ent + 0x6c), pos, 12);
+	if (dir && !IsBadWritePtr((void *)(uintptr_t)(ent + 0x78), 12))
+		memcpy((void *)(uintptr_t)(ent + 0x78), dir, 12);
+	InterlockedIncrement(&g_prop_moves);
+}
+
+static void prop_move_tick(DWORD level)
+{
+	if (!g_role || !g_peer_ok)
+		return;
+	DWORD now = GetTickCount();
+	for (int i = 0; i < g_prop_n && i < PROP_MAX; i++) {
+		prop_slot *p = &g_props[i];
+		if (!p->ent || p->broken || p->carrier || !prop_alive(p->ent, p->cls, p->vt))
+			continue;
+		const float *ep = (const float *)(uintptr_t)(p->ent + 0x6c);
+		prop_move_slot *m = prop_move_entry(p->ent, now, 1);
+		if (!m)
+			continue;
+		if (!m->pos[0] && !m->pos[1] && !m->pos[2]) {   // first sight: remember it, do not send
+			memcpy(m->pos, ep, sizeof m->pos);
+			m->at = now;
+			continue;
+		}
+		float dx = ep[0] - m->pos[0], dy = ep[1] - m->pos[1], dz = ep[2] - m->pos[2];
+		if (dx * dx + dy * dy + dz * dz < 0.36f)   // 0.6 units: what the physics settle leaves behind
+			continue;
+		if (now - m->at < 60)   // 16 Hz per prop: enough for a box the other copy follows
+			continue;
+		if (!prop_own_here(p->ent))
+			continue;           // the peer's character is the one touching it: its copy decides
+		m->at = now;
+		memcpy(m->pos, ep, sizeof m->pos);
+		pkt_prop q;
+		memset(&q, 0, sizeof q);
+		q.kind = 4;
+		q.level = level;
+		q.cls = p->cls;
+		q.id = p->id;
+		memcpy(q.pos, ep, sizeof q.pos);
+		if (mem_ok((const void *)(uintptr_t)(p->ent + 0x78), 12))
+			memcpy(q.drop_pos, (const void *)(uintptr_t)(p->ent + 0x78), sizeof q.drop_pos);
+		net_send(PKT_PROP, &q, (WORD)(sizeof q - sizeof(pkt_hdr)));
+		InterlockedIncrement(&g_prop_sent);
+	}
+}
+
 static void prop_tick(void)
 {
 	if (!g_role || !g_peer_ok)
@@ -2138,6 +2397,7 @@ static void prop_tick(void)
 		host_send_prop_state(level);
 	else
 		guest_apply_prop_state();
+	prop_move_tick(level);   // TASK 53: a prop this copy's character pushed follows on the other screen
 
 	// 1. the character this copy owns: announce what it carries (on change, plus a slow heartbeat so a
 	// lost packet cannot leave the copies different). Host owns player 1, guest player 2 (PKT_CHAR).
@@ -3036,10 +3296,23 @@ typedef void(__fastcall *char_gait_t)(void *, void *, DWORD);
 static volatile LONG g_pb_gaits;
 static int puppet_aim(DWORD st);   // below: the aim-stance family
 
+// TASK 53: the CARRY states. With a chair or a box in its hands the owner's state is 0xa8c (carrying) or
+// 0xa8d (swinging it, decompile 138552/138559) - and FINDINGS_50 section 2 measured the owner in state
+// 0x12d with the carry clip CHAB - and those setter cases play the UPPER body only (slot 0x44 with
+// 0x4a4d5041 / 0x4a4d4355). The legs then stay on whichever lower-body clip the previous state left:
+// the owner's copy blends them with the carry animation of the chair's own update (FUN_00411420), but the
+// puppet's copy has no carry animation running, so a walking carrier's legs were frozen (owner's report:
+// "the walk animation while carrying is wrong on the partner's screen"). The streamed gait (+0x2e0) is
+// what the game's own machine turns into that layer, so drive it here exactly as in the aim states.
+static int puppet_carry(DWORD st)
+{
+	return st == 0xa8c || st == 0xa8d || st == 0x12d;
+}
+
 static void puppet_gait(unsigned ch, const psample *s)
 {
 	DWORD st = rd32(ch + 0x2dc);
-	if (!puppet_aim(st) || s->gait > 4 || IsBadWritePtr((void *)(uintptr_t)(ch + 0x2e0), 4))
+	if ((!puppet_aim(st) && !puppet_carry(st)) || s->gait > 4 || IsBadWritePtr((void *)(uintptr_t)(ch + 0x2e0), 4))
 		return;
 	unsigned vt = rd32(ch), stop = vt ? rd32(vt + 0x6c) : 0, set = vt ? rd32(vt + 0x4c) : 0;
 	if (rd32(ch + 0x2e0) != s->gait) {   // the gait changed: stop the old layer clip, as the machine does
@@ -3235,8 +3508,15 @@ static int puppet_prepare(unsigned ch)
 	} else if (puppet_attack(want)) {
 		// TASK 49: the attack states show the owner's clip but must not RUN the attack on this copy (its
 		// setter path launched a real dynamite here - see puppet_attack). The state id stays, so every
-		// other reader of +0x2dc sees what the owner is doing; the clip is the owner's own.
-		// EXPERIMENT chk49c: nothing at all (state and clip untouched)
+		// other reader of +0x2dc sees what the owner is doing.
+		// TASK 53: because the setter is not called for this state, the game's own state/clip on this copy
+		// is still the one of the state BEFORE the attack while puppet_finish forces +0x2dc to 200. When
+		// the owner comes back to a state the setter last saw (aim 100 -> attack 200 -> aim 100), the
+		// "already done" value would skip the setter and the copy would keep the pre-attack pose for good -
+		// the owner's 2.1 report ("the host's character is sometimes stuck in attack stance on the guest's
+		// screen although the host left it"). Mark the state as NOT established, so the next normal state
+		// goes through the setter and re-plays its clip.
+		g_pb_anim_done = 0xffffffffu;
 	} else {
 		// an action state (the aim stance included - its machine path is the one TASK 42 gated), or the
 		// way back from one: the game's own state setter
@@ -7095,6 +7375,7 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_rload_cs);
 	InitializeCriticalSection(&g_pick_cs);
 	InitializeCriticalSection(&g_prop_cs);
+	InitializeCriticalSection(&g_fx_cs);     // TASK 53: the peer's effect queue
 	InitializeCriticalSection(&g_tp_cs);
 	InitializeCriticalSection(&g_lvl_cs);
 	InitializeCriticalSection(&g_iuse_cs);
@@ -7249,6 +7530,12 @@ static void frame_tick(void)
 				     (long)g_ev_rec, (long)g_ev_rep, (long)g_puppet_move_run, (long)g_puppet_move_gated,
 				     pup ? *(const float *)(uintptr_t)(pup + 0x288) : 0.0f,
 				     pup ? *(const float *)(uintptr_t)(pup + 0x28c) : 0.0f);
+				// TASK 53: the effect relay - what this copy's game spawned, what it sent, and what it
+				// played for the peer. Only when something happened: an idle room is silent.
+				if (g_fx_local || g_fx_rcv_n || g_fx_play_n)
+					logf("effects: local %ld sent %ld rcv %ld played %ld dup %ld skipped %ld | spawn calls %ld",
+					     (long)g_fx_local, (long)g_fx_sent_n, (long)g_fx_rcv_n, (long)g_fx_play_n,
+					     (long)g_fx_dup_n, (long)g_fx_skip_n, (long)g_fx_calls);
 				// TASK 43: which guard of puppet_target() refused this copy's puppet in the last 10 s.
 				{
 					char gs[220];
@@ -7350,8 +7637,12 @@ static void sync_status(char *reply, size_t replysz)
 			g_pb_delay, g_pb_under, g_pb_anim_sets, g_pb_anim_diff, g_pb_anim_ok, g_pb_writes);
 	l = strlen(reply);
 	if (l < replysz)
-		_snprintf(reply + l, replysz - l, " | prop sent %ld rcv %ld applied %ld broke %ld drop %ld missing %ld",
-			g_prop_sent, g_prop_rcv, g_prop_applied, g_prop_broken, g_prop_drop, g_prop_missing);
+		_snprintf(reply + l, replysz - l, " | prop sent %ld rcv %ld applied %ld broke %ld drop %ld missing %ld moves %ld",
+			g_prop_sent, g_prop_rcv, g_prop_applied, g_prop_broken, g_prop_drop, g_prop_missing, g_prop_moves);
+	l = strlen(reply);
+	if (l < replysz)
+		_snprintf(reply + l, replysz - l, " | fx local %ld sent %ld rcv %ld played %ld dup %ld skipped %ld calls %ld",
+			g_fx_local, g_fx_sent_n, g_fx_rcv_n, g_fx_play_n, g_fx_dup_n, g_fx_skip_n, g_fx_calls);
 	l = strlen(reply);
 	l = strlen(reply);
 	if (l < replysz)
