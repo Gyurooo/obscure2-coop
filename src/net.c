@@ -296,7 +296,6 @@ static sid_t g_peer;
 static volatile LONG g_peer_ok;
 static volatile LONG g_net_rx, g_net_tx, g_net_bad, g_net_rtt_ms = -1;
 static volatile LONG g_last_input_seq, g_last_hostpad_seq;
-static DWORD g_last_guest_buttons;   // host: edge detection for the guest's START (pause request)
 static volatile DWORD g_last_rx_tick;
 static DWORD g_tx_seq;
 static volatile float g_guest_rtt;      // host: the round trip the guest measured
@@ -529,11 +528,13 @@ static void net_handle(const char *buf, int n, sid_t from)
 			if (n != sizeof *in || (LONG)(h->seq - (DWORD)g_last_input_seq) <= 0)
 				break;
 			g_last_input_seq = (LONG)h->seq;
-			// START from the guest pauses both copies: pulse player 1's START, which the game and the
-			// HOSTPAD stream both see. Only while the guest is in a level.
-			if (in->in_level && (in->pad.buttons & 0x0010) && !(g_last_guest_buttons & 0x0010) && game_in_level())
-				g_pause_pulse_until = GetTickCount() + 120;
-			g_last_guest_buttons = in->pad.buttons;
+			// TASK 58: the guest's START used to be turned into a START pulse on player 1's pad here ("START
+			// pauses both copies"). That was a SECOND, unsequenced way into the shared pause menu, racing the
+			// guest's own game request and the convergence (measured, run_s58_diag1.log: the pulse opened the
+			// host's pause on some rounds and was dropped on others, and it is what pressed START again on a
+			// pause the host had just closed). The pause menu is now opened and closed by the sequenced
+			// requests in sync.c (menu_tick): the guest runs the game's own request for its own press and the
+			// host follows the streamed state, so no pad pulse is needed.
 			if (in->yaw_valid) { g_peer_yaw = in->yaw; g_peer_yaw_valid = 1; }
 			ring_push(&g_ring_p2, in->t_ms, &in->pad);
 			g_guest_rtt = in->rtt_ms;

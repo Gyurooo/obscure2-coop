@@ -579,20 +579,25 @@ static void drop_remote_look(xstate *s)
 	s->ry = 0;
 }
 
-// Player 2's START is the game's "leave the game" key. Online the host turns a START from the guest
-// into a START pulse on player 1 (both copies pause, since pause is shared); drop it from the remote
-// pad so the leave dialog never opens.
+// Player 2's START is the game's "leave the game" key: drop it from the remote pad so the leave dialog
+// never opens.
 //
-// TASK 38: while a shared menu is up, START is the menu's own key (it closes the pause menu), and the
-// copy whose own pad pressed it has to act on it too: the host's network pulse only reaches the host, so
-// the guest's pause menu used to stay open until the convergence pulsed it (a race that failed in the
-// TASK 37 reviewer run). Every rising edge of player 2's START is counted here; menu_tick turns it into a
-// START pulse on player 1's pad on this copy as well.
-// TASK 57: the same for BACK, which the game reads only on player 1's pad: the guest's BACK has to open
-// the inventory on BOTH copies, so menu_tick runs the game's own state request on the copy that saw the
-// edge. (Player 2's buttons still reach the game on its own pad; only their MENU meaning is handled here.)
+// TASK 38/57: START and BACK are menu keys the game reads on PLAYER 1's pad only, so the copy that saw the
+// edge gives it its menu meaning itself (menu_tick runs the game's own world-state request there) and the
+// peer follows the streamed state. Every rising edge of player 2's START / BACK is counted here.
+// TASK 58: the same for PLAYER 1's START, which the game's own pause path cannot be relied on for: the
+// world update opens the pause from the pad dispatch (decompile 110577-110582: FUN_004b2b30(0x23,..) ->
+// FUN_004b2730), but its CLOSE needs the menu manager's current screen to be the pause panel (decompile
+// 209305-209315), which a pause opened by the PEER's request need not be: measured, the GUEST opened the
+// pause menu, the HOST pressed START and both copies stayed in 5 for the rest of the run (the TASK 57
+// reviewer's run; FINDINGS_58 §1-§2). The two counters below are counted with the world state AT THE POLL
+// (world+0x11c: the world update of that frame has not run yet), so an edge that arrived while normal play
+// was up is an OPEN and one that arrived while the pause menu was up is a CLOSE - the press that opens a
+// menu can never close it again.
 static volatile LONG g_p2_start_edges, g_p2_back_edges;
 static int g_p2_start_down, g_p2_back_down;
+static volatile LONG g_p1_start_open_edges, g_p1_start_close_edges;
+static int g_p1_start_down;
 // TASK 45: the owner's NATIVE drop-in. A world loaded from a ONE-player save has player 2 unattached and
 // the partner on the teammate AI; the game itself joins player 2 when START is pressed on the second pad.
 // The mod drops START from player 2's pad on purpose (with two players it pauses both copies or opens
@@ -621,7 +626,6 @@ static void drop_remote_start(xstate *s)
 	g_p2_back_down = back;
 }
 
-static volatile DWORD g_pause_pulse_until;   // host: keep START on player 1 until this tick (guest asked to pause)
 static volatile DWORD g_accept_at, g_accept_until;   // host: pulse A on player 1 to accept the join dialog
 static int accept_pulse_on(void)
 {
@@ -777,10 +781,7 @@ static DWORD pad_read(DWORD user, void *state)
 	} else {
 		r = (real_XInputGetState && !g_hide_real_pads) ? real_XInputGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
 	}
-	// A guest START is turned into a short START on player 1, so the pause menu opens on both copies.
 	if (r == ERROR_SUCCESS && g_role == 1 && user == 0) {
-		if ((LONG)(GetTickCount() - g_pause_pulse_until) < 0)
-			((xstate *)state)->buttons |= 0x0010;
 		if (accept_pulse_on())
 			((xstate *)state)->buttons |= 0x1000;   // accept the 'player 2 is joining' dialog after a load
 	}
@@ -836,23 +837,33 @@ static void menu_pulse_apply(DWORD user, xstate *s)
 		s->rt = (BYTE)g_menu_pulse_rt;
 }
 
-// TASK 57: player 1's START is the game's own pause key. It OPENS the pause menu by itself, but its
-// CLOSE path needs the menu manager's "current action" record to be the pause action (decompile
-// 209305-209315: FUN_0059b3e0(0x23) active AND manager+0x94 -> +0x10 == "PAUS"), and a D-pad press in the
-// menu replaces that record - measured in run_s57_a2.log: the host's START 0.5 s after a D-pad press left
-// both copies in state 5. So the memory of the last poll with START down is kept here; menu_tick repeats
-// the game's own close request when START is held while the pause menu has been open for a while.
-static volatile DWORD g_p1_start_at;   // the last poll with START down on player 1's pad
+// The world's state at a pad poll: world+0x11c (1 normal play, 2 inventory, 5 pause menu). Read without the
+// sync helpers (sync.c is included later). The game polls the pads and then runs the world update, so this is
+// the state the press was made in, not the one the frame will end in.
+static unsigned poll_world_state(void)
+{
+	unsigned g = IsBadReadPtr((void *)0x6c3068, 4) ? 0 : *(volatile unsigned *)0x6c3068;
+	unsigned w = (g && !IsBadReadPtr((void *)(uintptr_t)(g + 0x378), 4))
+	                 ? *(volatile unsigned *)(uintptr_t)(g + 0x378) : 0;
+	return (w && !IsBadReadPtr((void *)(uintptr_t)(w + 0x11c), 4)) ? *(volatile unsigned *)(uintptr_t)(w + 0x11c) : 0;
+}
 
-// Every user<2 return of XInputGetState goes through here: inject the mod's pulse and watch player 1's
-// START.
+// Every user<2 return of XInputGetState goes through here: inject the mod's pulse and count player 1's
+// START edges against the state they were made in (see the counters above).
 static DWORD pad_finish(DWORD user, void *state)
 {
 	if (user < 2) {
 		menu_pulse_apply(user, (xstate *)state);
 		if (user == 0) {
-			if (((xstate *)state)->buttons & 0x0010)
-				g_p1_start_at = GetTickCount();
+			int down = (((xstate *)state)->buttons & 0x0010) != 0;
+			if (down && !g_p1_start_down) {
+				unsigned st = poll_world_state();
+				if (st == 1)
+					InterlockedIncrement(&g_p1_start_open_edges);
+				else if (st == 5)
+					InterlockedIncrement(&g_p1_start_close_edges);
+			}
+			g_p1_start_down = down;
 		}
 	}
 	return ERROR_SUCCESS;
@@ -980,8 +991,6 @@ DWORD WINAPI XInputGetState(DWORD user, void *state)
 			merge_pad((xstate *)state, &g_vpad[0]);
 		LeaveCriticalSection(&g_vpad_cs);
 		if (g_role == 1 && user == 0) {
-			if ((LONG)(GetTickCount() - g_pause_pulse_until) < 0)
-				((xstate *)state)->buttons |= 0x0010;   // virtual pad 0 is also the host's player 1
 			if (accept_pulse_on())
 				((xstate *)state)->buttons |= 0x1000;
 		}

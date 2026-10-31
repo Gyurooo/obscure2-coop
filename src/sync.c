@@ -7472,6 +7472,7 @@ static int item_use_forward(int player, unsigned tag, char *reply, size_t replys
 #define MENU_SETTLE_MS 300      // TASK 57: no correction for this long after a LOCAL state change
 #define MENU_STABLE_MS 150      // TASK 57: the divergence must persist this long in fresh packets
 #define MENU_REQ_GAP_MS 150     // TASK 57: two game requests are at least this far apart
+#define MENU_PRESS_RETRY_MS 500 // TASK 58: a press whose request the game refused is retried this long
 
 static volatile LONG g_menu_state = -1, g_menu_ui0, g_menu_ui1;        // this copy (game thread writes)
 static volatile LONG g_peer_menu_state = -1, g_peer_menu_ui0, g_peer_menu_ui1, g_peer_menu_level, g_peer_menu_seq;
@@ -7493,13 +7494,25 @@ static volatile LONG g_menu_corrections, g_menu_gated;   // requests issued for 
 // TASK 38/57: player 2's START and BACK edges (drop_remote_start in obscoop2.c). The game reads both
 // keys on PLAYER 1's pad only, so menu_tick gives them their menu meaning on the copy that saw the edge
 // (the peer then follows the streamed state): START opens/leaves the pause menu, BACK opens the inventory.
+// TASK 58: player 1's START edges, counted by pad_finish with the world state at the poll: an edge made in
+// normal play opens the pause menu, an edge made in the pause menu closes it (the state at the poll keeps
+// the opening press from closing it again).
 static DWORD g_menu_p2_edges, g_menu_p2_back_edges;
-static DWORD g_menu_menu_since;   // TASK 57: when this copy entered the pause menu (5)
-// Menu changes are ordered by a sequence number, exactly like the scene sync's leave_seq (TASK 31): every
-// LOCAL change bumps g_menu_my_seq, and a copy only corrects a divergence for a state NEWER than the one it
-// has already applied. Without the order the two copies chase each other (measured: 2 -> 1 -> 2 ... every
-// 400 ms, each copy pulsing the other). A tie goes to the host: only the guest corrects on a tie.
-static DWORD g_menu_my_seq, g_menu_seen_seq;
+static DWORD g_menu_p1_open_edges, g_menu_p1_close_edges;
+// TASK 58: the transition a press asked for (5 = open the pause menu, -5 = close it, 0 = none) and the
+// deadline of its retry: the game refuses a request while another one is in flight (world+0x12c != 0), and a
+// press must not be lost to that.
+static int g_menu_want;
+static DWORD g_menu_want_until;
+// Menu changes are ordered by a SEQUENCE NUMBER, exactly like the level transitions of TASK 37: every LOCAL
+// change bumps g_menu_my_seq to one more than any number this copy has seen (g_menu_peer_clock, a Lamport
+// clock updated from every peer packet), so a copy's own state is always "newer" than everything it has
+// received, and the peer applies a transition only when its number is newer than its own state's. Without
+// the order the two copies chase each other (measured: 2 -> 1 -> 2 ... every 400 ms, each copy pulsing the
+// other). An equal number is a tie - two presses that did not see each other - and there the HOST's state
+// wins: only the guest applies it.
+static DWORD g_menu_my_seq;
+static volatile LONG g_menu_peer_clock;
 
 // The world's menu state and the two controllers' UI state.
 static void menu_read(int *state, int *ui0, int *ui1)
@@ -7765,6 +7778,16 @@ static void peer_on_menu(const char *buf, int n)
 	InterlockedIncrement(&g_menu_rcv);
 }
 
+// TASK 58: remember the transition a player's press asked for; menu_tick runs the game's own request for it
+// (retried for MENU_PRESS_RETRY_MS while the world has another request in flight, so a press is never lost).
+static void menu_press(int want, DWORD now)
+{
+	if (!want)
+		return;
+	g_menu_want = want;
+	g_menu_want_until = now + MENU_PRESS_RETRY_MS;
+}
+
 // Game thread, once per frame: publish this copy's menu state and repair a divergence.
 static void menu_tick(void)
 {
@@ -7776,10 +7799,12 @@ static void menu_tick(void)
 	g_menu_state = st;
 	g_menu_ui0 = ui0;
 	g_menu_ui1 = ui1;
-	if (st != prev && st == 5)
-		g_menu_menu_since = GetTickCount();   // TASK 57: the pause menu just opened on this copy
 	if (!g_peer_ok)
 		return;
+	// TASK 58: Lamport receive - every local change below is stamped on top of the newest number the peer
+	// has shown this copy, so this copy's own state is always newer than everything it has received.
+	if ((int)g_peer_menu_seq > (int)g_menu_peer_clock)
+		g_menu_peer_clock = (LONG)g_peer_menu_seq;
 	// TASK 52: the inventory's two cursors - patch the pad-2 D-pad parameters once per built array and
 	// publish/mirror the cursors; in every other state there are no cursors to publish.
 	if (st == 2)
@@ -7790,19 +7815,17 @@ static void menu_tick(void)
 		g_menu_cur1 = -1;
 	}
 	DWORD now = GetTickCount();
-	// TASK 38/57: player 2's START and BACK are menu keys the game reads on PLAYER 1's pad only. The copy
-	// whose own pad pressed runs the game's own request here; the peer follows the streamed state. START
-	// in normal play opens the pause menu and START in the pause menu leaves it; BACK in normal play opens
-	// the inventory (that is the press the guest could never make: owner issue 2). Both are EDGES, so the
-	// press that opened a menu can never close it again.
+	// TASK 38/57/58: START and BACK are menu keys the game reads on PLAYER 1's pad only, so the copy that
+	// saw the edge gives it its menu meaning itself with the game's OWN world-state request, and the peer
+	// follows the streamed state. Player 2's pad (guest) opens/leaves the pause menu with START and opens
+	// the inventory with BACK; player 1's pad (host) opens the pause menu with a START made in normal play and
+	// leaves it with a START made in the pause menu - the state at the press is carried by the counter that
+	// counted it, so the press that opened a menu can never close it again.
 	if (g_role == 2) {
 		DWORD edges = (DWORD)g_p2_start_edges;
 		if (edges != g_menu_p2_edges) {
 			g_menu_p2_edges = edges;
-			if (st == 1)
-				menu_game_open(5);
-			else if (st == 5)
-				menu_game_close(5);
+			menu_press(st == 1 ? 5 : (st == 5 ? -5 : 0), now);
 		}
 		DWORD bedges = (DWORD)g_p2_back_edges;
 		if (bedges != g_menu_p2_back_edges) {
@@ -7811,33 +7834,49 @@ static void menu_tick(void)
 				menu_game_open(2);
 		}
 	}
-	// TASK 57: player 1's START is the game's own pause key and it OPENS the menu by itself; this only
-	// repeats the game's own CLOSE when START is held while the pause menu has been open for a while (the
-	// game's own close misses it once its current-action record is not the pause action any more, see
-	// obscoop2.c g_p1_start_at). The 500 ms window is what keeps the press that OPENED the menu - held
-	// for 200 ms - from closing it.
-	if (st == 5 && now - g_menu_menu_since >= 500 && g_p1_start_at && now - g_p1_start_at <= 120 &&
-	    now - g_menu_req_at >= MENU_REQ_GAP_MS) {
-		unsigned w = world_obj();
-		int ok = menu_game_close(5);
-		if (ok) {
-			InterlockedIncrement(&g_menu_reqs);
-			logf("%s: menu request: leaving the pause menu after player 1's START (request %lu, prev state %lu)",
-			     g_role == 2 ? "guest" : "host", (unsigned long)(w ? rd32(w + 0x12c) : 0),
-			     (unsigned long)(w ? rd32(w + 0x180) : 0));
+	if (g_role == 1) {
+		DWORD oe = (DWORD)g_p1_start_open_edges;
+		if (oe != g_menu_p1_open_edges) {
+			g_menu_p1_open_edges = oe;
+			menu_press(5, now);
+		}
+		DWORD ce = (DWORD)g_p1_start_close_edges;
+		if (ce != g_menu_p1_close_edges) {
+			g_menu_p1_close_edges = ce;
+			menu_press(-5, now);
 		}
 	}
-	// TASK 37: while EITHER copy is in a menu, both keep publishing (a menu session). That is what makes
-	// the freshness rule below possible: the copy that is back in normal play still says so every 250 ms.
-	int active = menu_world_menu(st) || ui0 >= 3 || ui1 >= 3 || menu_world_menu((int)g_peer_menu_state);
+	if (g_menu_want) {
+		int want_press = g_menu_want;
+		int before = want_press > 0 ? 1 : 5;   // the state the press was made in
+		if (st != before) {
+			g_menu_want = 0;   // the game's own pad path did it, or the state moved on by itself
+		} else if (want_press > 0 ? menu_game_open(5) : menu_game_close(5)) {
+			g_menu_want = 0;
+			g_menu_local_changed_at = now;   // a LOCAL change: the peer's packet about it may still be on the way
+			InterlockedIncrement(&g_menu_reqs);
+			logf("%s: menu request: %s (player's START, this copy %d)", g_role == 2 ? "guest" : "host",
+			     want_press > 0 ? "opening the pause menu" : "leaving the pause menu", st);
+		} else if ((LONG)(now - g_menu_want_until) >= 0) {
+			g_menu_want = 0;
+			InterlockedIncrement(&g_menu_gated);
+			logf("%s: menu request: the game refused a press for %d ms (this copy %d): dropped",
+			     g_role == 2 ? "guest" : "host", MENU_PRESS_RETRY_MS, st);
+		}
+	}
+	// TASK 37/58: both copies keep publishing, in every state (this used to be gated on a menu session).
+	// The freshness rule below needs it - the copy that is back in normal play still says so every 250 ms -
+	// and so does the ordering: a copy can only stamp its own change above the peer's number if it has
+	// RECEIVED that number, and a copy that stops publishing in normal play lets the other's clock run
+	// ahead, which would make a later press look older than the peer's state.
 	int changed = st != g_menu_sent_state || (DWORD)ui0 != g_menu_sent_ui0 || (DWORD)ui1 != g_menu_sent_ui1 ||
 	              (DWORD)g_menu_tab != g_menu_sent_tab || (DWORD)g_menu_cur0 != g_menu_sent_cur0 ||
 	              (DWORD)g_menu_cur1 != g_menu_sent_cur1;
 	if (st != prev) {   // a LOCAL change: it becomes the newest state of the pair (see g_menu_my_seq)
-		g_menu_my_seq = (g_menu_my_seq > g_menu_seen_seq ? g_menu_my_seq : g_menu_seen_seq) + 1;
+		g_menu_my_seq = (g_menu_my_seq > (DWORD)g_menu_peer_clock ? g_menu_my_seq : (DWORD)g_menu_peer_clock) + 1;
 		g_menu_local_changed_at = now;
 	}
-	if (changed || (active && now - g_menu_sent_at >= MENU_PERIOD_MS)) {
+	if (changed || now - g_menu_sent_at >= MENU_PERIOD_MS) {
 		unsigned w = world_obj();
 		pkt_menu p;
 		memset(&p, 0, sizeof p);
@@ -7860,8 +7899,9 @@ static void menu_tick(void)
 		g_menu_sent_cur0 = (DWORD)g_menu_cur0;
 		g_menu_sent_cur1 = (DWORD)g_menu_cur1;
 		if (st != prev && (menu_world_menu(st) || menu_world_menu(prev)))
-			logf("%s: menu state %d -> %d (ui %d/%d, level %08lx, seq %lu)", g_role == 2 ? "guest" : "host", prev, st,
-			     ui0, ui1, (unsigned long)(w ? rd32(w + 4) : 0), (unsigned long)g_menu_my_seq);
+			logf("%s: menu state %d -> %d (ui %d/%d, level %08lx, seq %lu, request %lu, stored %lu)", g_role == 2 ? "guest" : "host", prev, st,
+			     ui0, ui1, (unsigned long)(w ? rd32(w + 4) : 0), (unsigned long)g_menu_my_seq,
+			     (unsigned long)(w ? rd32(w + 0x12c) : 0), (unsigned long)(w ? rd32(w + 0x180) : 0));
 	}
 	if (g_peer_menu_state < 0 || now - g_peer_menu_at > MENU_PEER_STALE_MS)
 		return;
@@ -7903,26 +7943,22 @@ static void menu_tick(void)
 		g_menu_div_since = now;
 	if (now - g_menu_div_since < MENU_STABLE_MS)
 		return;   // not confirmed yet
-	if (pseq > (int)g_menu_seen_seq) {
-		g_menu_seen_seq = (DWORD)pseq;   // the peer's newest change: this copy follows it
-	} else {
-		if (pseq < (int)g_menu_seen_seq)
-			return;                     // an older state than the one already applied: never act on it
-		if (g_role != 2)
-			return;                     // a tie: the host does not correct, so the two cannot chase each other
-	}
+	// TASK 58: the NEWEST state of the pair wins, like the level transitions of TASK 37. The peer's state is
+	// applied only when its transition is newer than this copy's current one; an OLDER number is a packet
+	// sent before this copy's change, and acting on it is what re-opened a menu this copy had just left (the
+	// TASK 57 reviewer: the guest's pre-close packet brought the pause menu back on the host). An equal
+	// number is a tie - two presses that did not see each other - and there the HOST's state wins, so only
+	// the guest applies it (otherwise the two would chase each other).
+	if (pseq < (int)g_menu_my_seq)
+		return;
+	if (pseq == (int)g_menu_my_seq && g_role != 2)
+		return;
 	{
 		unsigned w = world_obj();
 		DWORD lvl = w ? rd32(w + 4) : 0;
 		if ((DWORD)g_peer_menu_level != lvl)
 			return;   // the peer's menu state is from another level
 	}
-	// TASK 57: a menu THIS copy opened is only left when the peer's state is newer than that open.
-	// Otherwise the peer's packet from before it saw the open (still "normal play") shut this copy's own
-	// pause 460 ms after the player opened it (measured, run_s57_a1.log: 5 -> 1 at 13.261 while the peer
-	// had not followed yet; the same for the inventory at 19.683).
-	if (want == 1 && pseq < (int)g_menu_my_seq)
-		return;
 	if (now - g_menu_req_at < MENU_REQ_GAP_MS)
 		return;   // one request at a time
 	g_menu_req_at = now;
