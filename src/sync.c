@@ -1283,6 +1283,9 @@ static DWORD g_prop_gen;                   // ... and the world generation it be
 // without announcing them (they are the level's state, not a break this copy performed).
 static DWORD g_prev_level;
 static float g_prop_pos[PROP_MAX][3];
+// TASK 55: the props whose collision body THIS copy switched off while the host moved them (see
+// prop_sim_tick); every other prop keeps its own physics.
+static unsigned g_frozen[PROP_MAX];
 static unsigned char g_prop_listed[PROP_MAX];   // 1 = the manager's lists hold this prop right now
 
 // A prop pointer is only used when the object is still alive and still the class it was: an entity that
@@ -1384,6 +1387,8 @@ static void prop_scan(unsigned w, DWORD level)
 	int same_world = (g_prop_gen == g_world_gen && g_prop_world == w);
 	prop_slot old[PROP_MAX];
 	memcpy(old, g_props, sizeof(prop_slot) * (size_t)g_prop_n);
+	if (!same_world)
+		memset(g_frozen, 0, sizeof g_frozen);   // TASK 55: a rebuilt world freed the bodies we froze
 	g_prop_n = 0;
 	g_prop_level = level;
 	g_prop_world = w;
@@ -2361,45 +2366,23 @@ static void fx_replay_tick(void)
 
 // TASK 53: a prop that MOVES while nobody carries it (a character walks into it, another prop knocks it)
 // is simulated by the game's own physics on BOTH copies and they end up in different places (owner's 2.1
-// report: "pushing / colliding with boxes moves them differently on the two screens"). The copy whose own
-// character stands closer to the prop is the one whose character pushed it, so that copy streams the
-// prop's transform while it moves (prop_move_tick) and the other copy writes it (prop_apply_move). The
-// distance rule is symmetric and both copies know both characters (the peer's is the puppet), so exactly
-// one side sends and the receiver never writes a prop its own character is touching.
-// TASK 54: a prop that has NOT moved on the owner is still sent once a second. The receiver keeps
-// simulating it (the puppet's collision body shoves it too), and nothing else ever tells the receiver's
-// copy to come back: run 5 of this task left the two copies 37 units apart although the owner's prop had
-// been static since the push (its copy had been shoved by the puppet in the other world).
+// report: "pushing / colliding with boxes moves them differently on the two screens").
+// TASK 55: the copy that owns a prop's physics is the HOST, always - Obscure 1's design
+// (`host_send_props`, coopdll/src/sync.c:2262: "The host sends the props that moved ...; the guest
+// applies them with the engine's own setters"). TASK 53/54 decided it per prop from which character
+// stood closer, and the two copies disagreed near a tie: TASK 54's run 7 log has BOTH copies applying
+// the OTHER's position to their own prop every second (25.2 units, mirrored) - a ping-pong, and the
+// real reason a push on the steam link ended 25-150 units apart. The guest's character is simulated on
+// the host's copy as the puppet, so a push by either player moves the prop there and is streamed back.
 typedef struct { unsigned ent; float pos[3]; DWORD at; } prop_move_slot;
 static prop_move_slot g_pmove[PROP_MAX];
 static volatile LONG g_prop_moves;
 static unsigned puppet_target(void);   // below (TASK 42/53: the peer's character on this copy)
 
-static float prop_dist2(const float *a, unsigned ch)
-{
-	const float *p = (const float *)(uintptr_t)(ch + H_POS);
-	float dx = a[0] - p[0], dy = a[1] - p[1], dz = a[2] - p[2];
-	return dx * dx + dy * dy + dz * dz;
-}
-
 static int prop_own_here(unsigned ent)
 {
-	unsigned me = g_role ? player_human(g_role == 2 ? 1 : 0) : 0;
-	unsigned peer = puppet_target();
-	if (!me || IsBadReadPtr((const void *)(uintptr_t)(ent + 0x6c), 12))
-		return 1;   // cannot tell: keep the local physics
-	float *ep = (float *)(uintptr_t)(ent + 0x6c);
-	if (!peer || IsBadReadPtr((const void *)(uintptr_t)(peer + H_POS), 12))
-		return 1;
-	float dm = prop_dist2(ep, me), dp = prop_dist2(ep, peer);
-	if (dm < dp - 1.0f)
-		return 1;
-	if (dp < dm - 1.0f)
-		return 0;
-	// TASK 54: both characters are about equally close (a prop between them) - the rule must still name
-	// exactly ONE sender, or neither copy streams and the receiver's own physics (the puppet's body
-	// shoving the prop) is never corrected. The host owns a tie.
-	return g_role == 1;
+	(void)ent;
+	return g_role == 1;   // host owns prop physics; the guest only applies the host's transform
 }
 
 static prop_move_slot *prop_move_entry(unsigned ent, DWORD now, int create)
@@ -2464,6 +2447,175 @@ static void prop_apply_move(unsigned ent, const float *pos, const float *dir)
 	InterlockedIncrement(&g_prop_moves);
 }
 
+// TASK 55 (A1-3): the receiving copy must not simulate a prop the host is moving. The prop's collision
+// body (entity+0x68) has an ENABLE FLAG (+0x2c) behind its vtable slot 0x44 (byte) = FUN_005ac5a0: on, it
+// enters the character-collision grid through slot 0x3c; off, it leaves it through slot 0x40 (decompile
+// of both slots, plus FUN_00411f80's attach which turns a carried chair's body off with exactly this
+// call, 10260-10262). A prop whose body is out of the grid is pushed by no character, so the local
+// physics stops fighting the streamed transform. The body's own position setter (slot 0xc, which the
+// entity setter PROP_ENT_SETPOS calls) leaves the flag alone and its re-entry is gated by it, so a
+// frozen prop stays frozen while the transforms keep coming in.
+#define PROP_BODY_COLL 0x5ac5a0u
+static volatile LONG g_prop_freezes;
+static void prop_body_collision(unsigned ent, int on)
+{
+	if (!ent || IsBadReadPtr((const void *)(uintptr_t)(ent + 0x68), 4))
+		return;
+	unsigned b = rd32(ent + 0x68);
+	unsigned vt = b && !IsBadReadPtr((const void *)(uintptr_t)b, 4) ? rd32(b) : 0;
+	if (!vt || !image_ptr(vt) || IsBadReadPtr((const void *)(uintptr_t)(vt + 0x44), 4))
+		return;
+	unsigned fn = rd32(vt + 0x44);
+	if (fn != PROP_BODY_COLL || !code_in_exe(fn))
+		return;
+	((void(__fastcall *)(void *, void *, int))fn)((void *)(uintptr_t)b, NULL, on);
+	if (!on)
+		InterlockedIncrement(&g_prop_freezes);   // the counter names real game calls, not attempts
+}
+
+// The lease on a prop a MOVE packet named. Only real motion (pkt_propmove.moving) refreshes it - the 1 Hz
+// heartbeat of an untouched prop must not keep the receiver's physics switched off.
+#define PROP_FREEZE_MS 700
+typedef struct { unsigned ent; DWORD until; } prop_lease;
+static prop_lease g_lease[PROP_MAX];
+
+static void prop_lease_mark(unsigned ent)
+{
+	if (!ent)
+		return;
+	DWORD now = GetTickCount();
+	prop_lease *slot = 0;
+	for (int i = 0; i < PROP_MAX; i++) {
+		if (g_lease[i].ent == ent) {
+			g_lease[i].until = now + PROP_FREEZE_MS;
+			return;
+		}
+		if (!g_lease[i].ent && !slot)
+			slot = &g_lease[i];
+	}
+	if (!slot) {   // full: reuse the one that expires first
+		slot = &g_lease[0];
+		for (int i = 1; i < PROP_MAX; i++)
+			if ((LONG)(g_lease[i].until - slot->until) < 0)
+				slot = &g_lease[i];
+	}
+	slot->ent = ent;
+	slot->until = now + PROP_FREEZE_MS;
+}
+
+static int prop_leased(unsigned ent, DWORD now)
+{
+	for (int i = 0; i < PROP_MAX; i++)
+		if (g_lease[i].ent == ent)
+			return g_lease[i].until && (LONG)(g_lease[i].until - now) > 0;
+	return 0;
+}
+
+// TASK 55: a character's collision body shoves a prop the moment it overlaps it - and on the receiver's
+// copy the peer's character is a body that JUMPS (SetPosition to the streamed pose). Run 1 of this task's
+// push phase measured exactly that: the host's own prop never moved (moved 0.0) while the guest's copy
+// of it had been thrown 29.8 units away, and after the next approach 64.9 units. The host never learns
+// (its copy is static), so the receiver must not let any character push a prop it does not simulate.
+// A prop is therefore frozen while it is within 3 units (horizontally) of ANY human on this copy.
+#define PROP_NEAR2 9.0f
+static int prop_near_human(unsigned ent)
+{
+	const float *p = (const float *)(uintptr_t)(ent + 0x6c);
+	if (!mem_ok(p, 12) || !fin3(p))
+		return 0;
+	unsigned w = world_obj();
+	unsigned mgr = w && mem_ok((const void *)(uintptr_t)(w + 0x175c), 4) ? rd32(w + 0x175c) : 0;
+	if (!mgr || IsBadReadPtr((const void *)(uintptr_t)mgr, 0x10))
+		return 0;
+	int n = (int)rd32(mgr + 4);
+	unsigned arr = rd32(mgr + 0xc);
+	if (n > 8)
+		n = 8;
+	for (int i = 0; i < n; i++) {
+		unsigned h = arr && !IsBadReadPtr((const void *)(uintptr_t)(arr + 4 * i), 4) ? rd32(arr + 4 * i) : 0;
+		if (!h || IsBadReadPtr((const void *)(uintptr_t)(h + H_POS), 12))
+			continue;
+		const float *q = (const float *)(uintptr_t)(h + H_POS);
+		float dx = p[0] - q[0], dy = p[1] - q[1];
+		if (dx * dx + dy * dy < PROP_NEAR2)
+			return 1;
+	}
+	return 0;
+}
+
+// Freeze / hand back one prop. `on` = freeze. A prop that is carried or broken is never ours to freeze.
+static void prop_set_frozen(unsigned ent, int on)
+{
+	int have = -1;
+	for (int i = 0; i < PROP_MAX; i++)
+		if (g_frozen[i] == ent) {
+			have = i;
+			break;
+		}
+	if (on) {
+		prop_body_collision(ent, 0);
+		if (have < 0) {
+			for (int i = 0; i < PROP_MAX; i++)
+				if (!g_frozen[i]) {
+					g_frozen[i] = ent;
+					break;
+				}
+		}
+	} else if (have >= 0) {
+		prop_body_collision(ent, 1);
+		g_frozen[have] = 0;
+	}
+}
+
+// Per tick: the guest freezes exactly the props the host is moving; every other prop keeps its own
+// physics (a prop nobody touches never pauses, so the guest's world behaves normally between pushes).
+// Does this copy have to keep the prop out of its own physics? The guest only: the host owns prop
+// physics, and it keeps simulating the guest's character there as the puppet. Two reasons to freeze:
+// the host is moving the prop (lease), or a character is close enough to shove it (the peer's character
+// is a teleporting body on this copy, see prop_near_human).
+static int prop_freeze_here(prop_slot *p, DWORD now)
+{
+	if (g_role != 2 || !g_peer_ok || p->carrier || p->broken)
+		return 0;
+	if (!prop_alive(p->ent, p->cls, p->vt))
+		return 0;
+	return prop_leased(p->ent, now) || prop_near_human(p->ent);
+}
+
+static void prop_sim_tick(void)
+{
+	DWORD now = GetTickCount();
+	for (int i = 0; i < g_prop_n && i < PROP_MAX; i++)
+		if (g_props[i].ent && prop_freeze_here(&g_props[i], now))
+			prop_set_frozen(g_props[i].ent, 1);
+	for (int i = 0; i < PROP_MAX; i++) {
+		unsigned e = g_frozen[i];
+		if (!e)
+			continue;
+		int keep = 0, known = 0, owned_by_game = 0;
+		for (int k = 0; k < g_prop_n && k < PROP_MAX; k++)
+			if (g_props[k].ent == e) {
+				known = 1;
+				owned_by_game = g_props[k].carrier || g_props[k].broken;
+				if (!owned_by_game && prop_freeze_here(&g_props[k], now))
+					keep = 1;
+			}
+		if (keep)
+			continue;
+		if (owned_by_game) {
+			// the game attached or broke it and owns the body now (its attach disables it, its place/drop
+			// path enables it again, decompile 69842): forget it, do not switch anything back on
+			g_frozen[i] = 0;
+			continue;
+		}
+		if (!known && (e <= 0x10000 || IsBadReadPtr((const void *)(uintptr_t)e, 0x120) || !prop_class_tag(rd32(e + 0x10)))) {
+			g_frozen[i] = 0;   // the entity is gone with its world: nothing to hand back
+			continue;
+		}
+		prop_set_frozen(e, 0);   // nothing to hide it from any more: hand the prop back to physics
+	}
+}
+
 static void prop_move_tick(DWORD level)
 {
 	if (!g_role || !g_peer_ok)
@@ -2499,6 +2651,7 @@ static void prop_move_tick(DWORD level)
 		q.level = level;
 		q.cls = p->cls;
 		q.id = p->id;
+		q.moving = (DWORD)(moved != 0);   // TASK 55: only real motion gives the receiver's physics a pause
 		memcpy(q.pos, pos, sizeof q.pos);
 		memcpy(q.dir, dir, sizeof q.dir);
 		net_send(PKT_PROPMOVE, &q, (WORD)(sizeof q - sizeof(pkt_hdr)));
@@ -2545,6 +2698,8 @@ static void peer_apply_moves(void)
 		unsigned ent = prop_find(p.cls, p.id, p.pos);
 		if (!ent)
 			continue;
+		if (p.moving)
+			prop_lease_mark(ent);   // TASK 55: the host is moving it - this copy's physics pauses
 		if (!prop_own_here(ent))
 			prop_apply_move(ent, p.pos, p.dir);
 	}
@@ -2581,6 +2736,8 @@ static void prop_tick(void)
 	peer_apply_props();
 	hang_phase("in peer_apply_moves (the peer's moved props)");
 	peer_apply_moves();
+	hang_phase("in prop_sim_tick");
+	prop_sim_tick();   // TASK 55: freeze / hand back the props the host is moving
 	hang_phase("in prop_tick_pending (a break)");
 	prop_tick_pending();
 	hang_phase("in prop_retry_tick");
@@ -3089,7 +3246,7 @@ static volatile LONG g_rx_state_new;
 #define PUP_DELAY_MAX 220.0f
 #define PUP_EXTRAP_MAX 120  // ms of dead reckoning past the newest sample
 typedef struct { DWORD t; float pos[3], dir[3], vel[3]; DWORD speed, anim, ui, wsel;
-                 float intent[3]; DWORD wanted, ev_seq, ev_val[4], gait, up;
+                 float intent[3]; DWORD wanted, ev_seq, ev_val[4], gait, up, lo;
                  DWORD wep[4]; } psample;   // up: the owner's upper clip tag (TASK 49); wep: the tags in
                                             // the owner's four live weapon slots (TASK 50, its OWN character)
 
@@ -3148,6 +3305,7 @@ static void peer_on_char(const char *buf, int n)
 	memcpy(s->ev_val, p->ev_val, sizeof s->ev_val);
 	s->gait = p->gait;
 	s->up = p->up;
+	s->lo = p->lo;
 	memcpy(s->wep, p->me.wep, sizeof s->wep);   // TASK 50: the hands of the character this stream belongs to
 	g_pb_n = i + 1;
 	while (i > 0 && (LONG)(g_pb[i - 1].t - g_pb[i].t) > 0) {   // out of order (jitter)
@@ -3486,47 +3644,49 @@ static void puppet_anim(unsigned ch, DWORD st)
 	InterlockedIncrement(&g_pb_anim_sets);
 }
 
-// TASK 46: the LOWER-BODY animation layer in the states the movement machine may not run on the puppet
-// (the aim stance: its machine path is the action path TASK 42 gated). The machine changes that layer
-// exactly like this (decompile 142194..142199): when the gait index character+0x2e0 differs, it stops the
-// old layer clip (vtable slot 0x6c = FUN_004c7620) and plays the new one (vtable slot 0x4c =
-// FUN_004e7420, which writes the new index into +0x224). The gait itself is FUN_004da570's answer from
-// the intent AND the AIM TARGET (+0x750, FUN_004db0e0) - the aim target is not streamed, so the owner's
-// gait index is (measured on HEAD: the owner's +0x224 is LWAF/LWAL in the aim stance, the puppet's LPAU).
+// TASK 46/55: the LOWER-BODY animation layer. The machine changes that layer by comparing the gait
+// index and then stopping the old layer clip and playing the new one (decompile 142194..142199: slot
+// 0x6c = FUN_004c7620 stops, slot 0x4c = FUN_004e7420 plays and writes the index into +0x224). TASK 46
+// mirrored the GAIT INDEX (character+0x2e0) while the puppet was in an aim/carry state; TASK 55 found
+// the two ways that left the legs wrong: the index only names the five locomotion clips the movement
+// machine knows, and the mirror STOPPED as soon as the owner left the aim stance - the puppet then kept
+// the stance's LPAU legs for good (the owner's own copy goes back to WALK, repro in FINDINGS_55 §0).
+// The owner's real lower clip TAG is streamed now (pkt_char.lo) and played here in EVERY state through
+// the same two calls the machine makes, so the legs always follow the owner.
 typedef void(__fastcall *char_stop_t)(void *, void *, DWORD, int);
-typedef void(__fastcall *char_gait_t)(void *, void *, DWORD);
-static volatile LONG g_pb_gaits;
-static int puppet_aim(DWORD st);   // below: the aim-stance family
-
-// TASK 53: the CARRY states. With a chair or a box in its hands the owner's state is 0xa8c (carrying) or
-// 0xa8d (swinging it, decompile 138552/138559) - and FINDINGS_50 section 2 measured the owner in state
-// 0x12d with the carry clip CHAB - and those setter cases play the UPPER body only (slot 0x44 with
-// 0x4a4d5041 / 0x4a4d4355). The legs then stay on whichever lower-body clip the previous state left:
-// the owner's copy blends them with the carry animation of the chair's own update (FUN_00411420), but the
-// puppet's copy has no carry animation running, so a walking carrier's legs were frozen (owner's report:
-// "the walk animation while carrying is wrong on the partner's screen"). The streamed gait (+0x2e0) is
-// what the game's own machine turns into that layer, so drive it here exactly as in the aim states.
-static int puppet_carry(DWORD st)
+typedef int(__fastcall *char_clip_t)(void *, void *, DWORD, int, int, float);
+static volatile LONG g_pb_lows;
+static DWORD g_pb_low_tag, g_pb_low_val;
+// Play the owner's lower-body clip on the puppet's +0x224. Only when the tag changes, so the game's own
+// animation clock keeps running (the same rule as puppet_clip for the upper layer); the stop call is
+// the one the movement machine makes right before it plays a new gait clip.
+static void puppet_lower(unsigned ch, DWORD tag)
 {
-	return st == 0xa8c || st == 0xa8d || st == 0x12d;
-}
-
-static void puppet_gait(unsigned ch, const psample *s)
-{
-	DWORD st = rd32(ch + 0x2dc);
-	if ((!puppet_aim(st) && !puppet_carry(st)) || s->gait > 4 || IsBadWritePtr((void *)(uintptr_t)(ch + 0x2e0), 4))
+	if (!tag || IsBadReadPtr((const void *)(uintptr_t)ch, 0x230))
 		return;
-	unsigned vt = rd32(ch), stop = vt ? rd32(vt + 0x6c) : 0, set = vt ? rd32(vt + 0x4c) : 0;
-	if (rd32(ch + 0x2e0) != s->gait) {   // the gait changed: stop the old layer clip, as the machine does
-		unsigned tab = rd32(ch + 0x210), idx = rd32(ch + 0x224);
-		if (stop && code_in_exe(stop) && tab && idx < 0x1000)
-			((char_stop_t)stop)((void *)(uintptr_t)ch, NULL, rd32(tab + idx * 0x28 + 0xc), -1);
-		InterlockedIncrement(&g_pb_gaits);
+	DWORD who = rd32(ch + H_TAG);
+	if (who != g_pb_low_tag) {   // another character: start from now
+		g_pb_low_tag = who;
+		g_pb_low_val = 0;
 	}
-	// FUN_004c74e0 returns early when the clip is already playing, so this is idempotent per frame - and
-	// it repairs a layer the state setter had pointed at a different clip.
-	if (set && code_in_exe(set))
-		((char_gait_t)set)((void *)(uintptr_t)ch, NULL, s->gait);
+	// Compare with the clip the layer plays NOW, not the last one played here: the game resets +0x224 on
+	// its own (the aim-walk/aim-run soak phases measured 45 % / 30 % with a last-played guard).
+	unsigned tab = rd32(ch + 0x210), idx = rd32(ch + 0x224);
+	int cur_ok = tab && idx < 0x1000 && mem_ok((const void *)(uintptr_t)(tab + idx * 0x28), 0x28);
+	if (cur_ok && rd32(tab + idx * 0x28 + 0xc) == tag)
+		return;
+	unsigned vt = rd32(ch), stop = vt ? rd32(vt + 0x6c) : 0;
+	if (stop && code_in_exe(stop) && cur_ok)
+		((char_stop_t)stop)((void *)(uintptr_t)ch, NULL, rd32(tab + idx * 0x28 + 0xc), -1);
+	unsigned play = vt ? rd32(vt + 0x68) : 0;
+	if (!play || !code_in_exe(play))
+		return;
+	int /* index */ nidx = ((char_clip_t)play)((void *)(uintptr_t)ch, NULL, tag, -1, 0, 1.0f);
+	if (nidx >= 0 && !IsBadWritePtr((void *)(uintptr_t)(ch + 0x224), 4)) {
+		*(DWORD *)(uintptr_t)(ch + 0x224) = (DWORD)nidx;   // what FUN_004e7420 does with slot 0x68's answer
+		g_pb_low_val = tag;
+		InterlockedIncrement(&g_pb_lows);
+	}
 }
 
 // ---- TASK 49: the OWNER'S CLIP on the puppet, and the attack that must not run here ----------------
@@ -3539,7 +3699,6 @@ static void puppet_gait(unsigned ch, const psample *s)
 // FUN_004c74e0: find the tag in the character's animation table, start it, return the index the setter
 // then stores in +0x220). Only called when the tag differs from the last one played for this character,
 // so the game's own animation clock keeps running (FINDINGS_49 section 5).
-typedef int(__fastcall *char_clip_t)(void *, void *, DWORD, int, int, float);
 static DWORD g_pb_clip_tag, g_pb_clip_val;
 static volatile LONG g_pb_clips;
 
@@ -3661,15 +3820,6 @@ static int puppet_locomotion(DWORD st)
 	return st == 0 || st == 1 || st == 2 || st == 4;
 }
 
-// The aim-stance family: the owner keeps walking/strafing while the upper body aims, and its LOWER-BODY
-// layer then follows the direction (+0x224 = LWAF/LWAL/LWAB - measured on HEAD). That layer is the only
-// thing this copy has to drive itself in these states (puppet_gait); the state and the upper clip stay
-// with the game's own setter (puppet_anim) and the movement machine stays gated, as TASK 42 left it.
-static int puppet_aim(DWORD st)
-{
-	return st == 100 || st == 0x65 || st == 0x66;
-}
-
 // Which state the owner is in at the playback instant, replaying a state change that arrived since the
 // last update (one per update, in order). A state outside the safe list keeps the puppet where it is.
 static DWORD puppet_wanted(unsigned ch, const psample *s)
@@ -3732,9 +3882,12 @@ static int puppet_prepare(unsigned ch)
 		// an action state (the aim stance included - its machine path is the one TASK 42 gated), or the
 		// way back from one: the game's own state setter
 		puppet_anim(ch, want);
-		puppet_gait(ch, &s);   // ... and its lower-body layer follows the owner's gait
 		puppet_clip(ch, s.up, puppet_react(want));   // TASK 49: ... and the clip the owner plays
 	}
+	// TASK 55: the LEGS follow the owner in every state. The setter above does not touch the lower-body
+	// layer and the locomotion branch leaves it to the movement machine, which only re-picks it in the
+	// aim/attack branch (FINDINGS_55 section 1) - so the owner's streamed lower clip is played here.
+	puppet_lower(ch, s.lo);
 	// TASK 50: the hands come from the character's OWNER, through the same stream (pkt_char.me.wep + wsel).
 	// Before this task the host streamed every human's slots in pkt_state and the guest wrote them into
 	// EVERY character - its own included (the 86 GIR1 flip-flops of the 2.0 playtest, FINDINGS_50).
@@ -3974,6 +4127,12 @@ static void char_send_local(void)
 		LONG idx = (LONG)rd32(me + 0x220);
 		p.up = (tab && idx >= 0 && idx < 0x1000 && mem_ok((const void *)(uintptr_t)(tab + idx * 0x28), 0x28))
 			? rd32(tab + idx * 0x28 + 0xc) : 0;
+		// TASK 55: the clip the owner's LOWER-body layer plays (+0x224), which the puppet's copy otherwise
+		// never hears about: the state setter does not touch that layer and the game's movement machine
+		// only re-picks it in the aim/attack branch (FINDINGS_55 section 1).
+		LONG lidx = (LONG)rd32(me + 0x224);
+		p.lo = (tab && lidx >= 0 && lidx < 0x1000 && mem_ok((const void *)(uintptr_t)(tab + lidx * 0x28), 0x28))
+			? rd32(tab + lidx * 0x28 + 0xc) : 0;
 	}
 	p.ev_seq = (DWORD)g_ev_host.seq;
 	for (int i = 0; i < EV_KEEP; i++)
@@ -7846,13 +8005,13 @@ static void sync_status(char *reply, size_t replysz)
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | char sent %ld rcv %ld applied %ld blends %ld snaps %ld skipped %ld extrap %ld"
-			" | puppet delay %.0f ms under %ld anim_sets %ld anim_diff %ld anim_ok %ld writes %ld",
+			" | puppet delay %.0f ms under %ld anim_sets %ld anim_diff %ld anim_ok %ld writes %ld lower %ld",
 			g_char_sent, g_char_rcv, g_char_applied, g_char_blends, g_char_snaps, g_char_skipped, g_pb_extrap,
-			g_pb_delay, g_pb_under, g_pb_anim_sets, g_pb_anim_diff, g_pb_anim_ok, g_pb_writes);
+			g_pb_delay, g_pb_under, g_pb_anim_sets, g_pb_anim_diff, g_pb_anim_ok, g_pb_writes, g_pb_lows);
 	l = strlen(reply);
 	if (l < replysz)
-		_snprintf(reply + l, replysz - l, " | prop sent %ld rcv %ld applied %ld broke %ld drop %ld missing %ld moves %ld",
-			g_prop_sent, g_prop_rcv, g_prop_applied, g_prop_broken, g_prop_drop, g_prop_missing, g_prop_moves);
+		_snprintf(reply + l, replysz - l, " | prop sent %ld rcv %ld applied %ld broke %ld drop %ld missing %ld moves %ld freezes %ld",
+			g_prop_sent, g_prop_rcv, g_prop_applied, g_prop_broken, g_prop_drop, g_prop_missing, g_prop_moves, g_prop_freezes);
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | fx local %ld sent %ld rcv %ld played %ld dup %ld skipped %ld calls %ld",

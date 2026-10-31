@@ -291,12 +291,13 @@ def main():
             print('   %s: partner effect calls played +%d (owner %s), WDEX replays seen %d%s'
                   % (thrower, played, 'local %d sent %d' % ((fx1 or {}).get('local', -1), (fx1 or {}).get('sent', -1)),
                      len(wdex), '' if not near else ' nearest (%.1f,%.1f,%.1f)' % near))
-            if played <= 0:
-                fails.append('%s throw %d: the partner copy played no effect of the thrower (%s)'
-                             % (thrower, k + 1, fx1))
-            if held in ('DYNA', 'FLBG') and not wdex:
-                fails.append('%s throw %d: no WDEX explosion reached the partner copy'
-                             % (thrower, k + 1))
+            # TASK 55: these two assertions belong to a throw that ACTUALLY happened. The test save holds
+            # one DYNA, so the check's second iteration re-selects the (now empty) slot and never throws -
+            # while the FIRST throw's fuse explodes right at the boundary of the two sampling windows
+            # (measured: the 16 replayed effects of that blast at 01:34:54.911 in the guest log, i.e. in
+            # the throw-1 window, and run_s55_b2.log then failed "throw 2: played +0" although the same
+            # copy had just replayed the WDEX). Judging "no effects" for a window without a throw counts
+            # the previous blast twice and is what failed; the effects of a real throw are still required.
             # the thrower: same state/clip sequence on both copies?
             st, cl = compare(owner_s, puppet_s, 'state'), compare(owner_s, puppet_s, 'up')
             ost, opu = runs(owner_s, 'state'), runs(owner_s, 'up')
@@ -314,6 +315,12 @@ def main():
                 print('   %s: no attack started (out of ammunition for %s) - %d throw(s) tested'
                       % (thrower, held, k))
                 break
+            if played <= 0:
+                fails.append('%s throw %d: the partner copy played no effect of the thrower (%s)'
+                             % (thrower, k + 1, fx1))
+            if held in ('DYNA', 'FLBG') and not wdex:
+                fails.append('%s throw %d: no WDEX explosion reached the partner copy'
+                             % (thrower, k + 1, held))
             if st < 0.80:
                 fails.append('%s throw %d: the state sequence differs on the puppet (%.0f%%)'
                              % (thrower, k + 1, 100 * st))

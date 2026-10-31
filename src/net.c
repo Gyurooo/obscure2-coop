@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 28   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 29   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -94,6 +94,15 @@
                         //     body's own setter FUN_005ac670 instead of the raw +0x6c write that the physics
                         //     reverted (pkt_prop kind 4 is no longer sent). Non-finite transforms are never
                         //     sent or applied (a break while carried turned the owner's chair NaN).
+                        // 29: TASK 55. pkt_char carries the owner's LOWER-body clip tag (+0x224), so the
+                        //     puppet's legs follow the owner in every state (the gait index the game maps
+                        //     is only the 5-clip subset the movement machine knows, and it stopped being
+                        //     mirrored when the owner left the aim stance - the partner kept the stance's
+                        //     LPAU legs). pkt_propmove carries a `moving` flag: only a prop that actually
+                        //     MOVED gives the host's copy authority over the receiver's physics (the 1 Hz
+                        //     heartbeat of a prop at rest does not). The host owns prop physics (Obscure 1
+                        //     host_send_props); the receiver freezes the prop's collision body while the
+                        //     motion lasts instead of simulating it a second time.
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,
@@ -138,7 +147,13 @@ typedef struct { pkt_hdr h; DWORD t_ms; DWORD level; ch_state me; float vel[3]; 
                  // knockdown, thrown by a blast, death) are chosen by the game from the hit kind and the
                  // source direction (FUN_004e2fa0), not by the state id, so the receiver needs the tag to
                  // play the SAME clip on the puppet (FINDINGS_49 section 5).
-                 DWORD up; } pkt_char;
+                 DWORD up;
+                 // lo: the CLIP the owner's LOWER-body layer is playing - animtable[character+0x224]+0xc
+                 // (FINDINGS_55 section 1). The state setter never touches that layer and the game's own
+                 // movement machine only re-picks it in the aim/attack branch, so the receiver plays this
+                 // tag on the puppet's lower layer whenever it differs - the legs then follow the owner
+                 // out of the aim stance (WALK again) and through every other lower-body clip.
+                 DWORD lo; } pkt_char;
 typedef struct { pkt_hdr h; DWORD kind, a, b, c; char name[64]; DWORD seq; } pkt_req;
 // life = character+0x320 (float bits), state = character+0x2dc (the NPC's AI/animation/death state; the
 // same field the humans stream as `anim`). TASK 21: the host owns enemy life and death, the guest applies
@@ -234,7 +249,7 @@ typedef struct { pkt_hdr h; DWORD n; fx_ev e[FX_MAX]; } pkt_fx;
 // position to the physics simulator); a raw +0x6c write is undone by the body (check_breakables'
 // raw_move_test: REVERTED on both copies), and so is the body's own +0xcc. A non-finite transform is
 // never sent or applied.
-typedef struct { pkt_hdr h; DWORD level; DWORD cls, id; float pos[3]; float dir[3]; } pkt_propmove;
+typedef struct { pkt_hdr h; DWORD level; DWORD cls, id; DWORD moving; float pos[3]; float dir[3]; } pkt_propmove;
 #pragma pack(pop)
 
 static void guest_on_state(const char *buf, int n);

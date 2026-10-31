@@ -35,6 +35,8 @@ REST = 0.9           # s it is left
 CYCLES = 5
 LAG = 0.6            # s the partner may need to follow a change
 ATTACK = True        # every cycle also ATTACKS from the stance (the state 200 the report names)
+DPAD = (('LEFT', 0x4), ('RIGHT', 0x8), ('DOWN', 0x2), ('UP', 0x1))
+THROWABLE = {'DYNA', 'FLBG', 'FLGU', 'AMFG', 'GREN'}
 
 
 def tag4(v):
@@ -92,6 +94,19 @@ class View:
         ch = self.humans().get(tag, 0)
         return struct.unpack('<3f', self.p.read(ch + H_POS, 12)) if ch else None
 
+    def held(self, tag):
+        """The weapon tag in the hand (the SELECTED slot) and the four slots, as check_explosives reads
+        them: character+0x704 + i*4 -> weapon+0x10, the selected slot character+0x714."""
+        ch = self.humans().get(tag, 0)
+        if not ch:
+            return '----', -1, []
+        slots = []
+        for s in range(4):
+            wp = self.p.u32(ch + 0x704 + 4 * s)
+            slots.append(tag4(self.p.u32(wp + 0x10) if wp else 0))
+        cur = self.p.u32(ch + 0x714)
+        return (slots[cur] if isinstance(cur, int) and 0 <= cur < 4 else '----'), cur, slots
+
 
 def fmt(s):
     if not s:
@@ -106,6 +121,85 @@ def idle_ish(s, base):
     if not s or not base:
         return False
     return s['state'] == 0 and s['up'] == base['up'] and s['lo'] == base['lo']
+
+
+def agree(side, who, label, wait=1.5):
+    """Both copies must show the same state AND the same upper/lower clips: the owner's report is a
+    partner whose LOWER clip stayed on the aim stance's LPAU while the owner was back on its base clip."""
+    t0, ok, a, b = time.time(), False, None, None
+    while time.time() - t0 < wait:
+        a, b = side['own'].snap(who), side['peer'].snap(who)
+        if a and b and a['state'] == 0 and b['state'] == 0 and a['up'] == b['up'] and a['lo'] == b['lo']:
+            ok = True
+            break
+        time.sleep(DT)
+    print('   %s: owner %s | partner %s -> %s' % (label, fmt(a), fmt(b), 'same' if ok else 'DIFFERENT'))
+    if ok:
+        return []
+    return ['%s: %s (partner %s, owner %s)' % (who, label, fmt(b), fmt(a))]
+
+
+def stance_reachable(side, who):
+    """Can the owner enter the aim stance at all? LB needs a WEAPON IN THE HAND: with the empty slot that
+    check_explosives leaves selected after throwing the only DYNA, LB does nothing (TASK 54 run 4: the
+    owner stayed on 0/PAUS/WALK through every cycle, FINDINGS_54 section 3.6)."""
+    side['pipe'].cmd('pad 0 %x 0 0' % LB)
+    t0, ok = time.time(), False
+    while time.time() - t0 < 0.45:
+        s = side['own'].snap(who)
+        if s and s['state'] != 0:
+            ok = True
+            break
+        time.sleep(DT)
+    side['pipe'].cmd('pad 0 0 0 0')
+    time.sleep(0.30)
+    return ok
+
+
+def pick_weapon(side, who):
+    """D-pad steps the weapon slot until LB puts the owner in the stance (the D-pad is weapon select,
+    GAME_MECHANICS), so the stance cycles measure something after a throw consumed the selected item."""
+    for _ in range(2):
+        if stance_reachable(side, who):
+            return True
+        for _name, code in DPAD:
+            side['pipe'].cmd('pad 0 %x' % code)
+            time.sleep(0.12)
+            side['pipe'].cmd('pad 0 0')
+            time.sleep(0.35)
+            if stance_reachable(side, who):
+                return True
+    return False
+
+
+def warmup_sequence(side, who):
+    """TASK 55: the stance is checked right AFTER a throw/attack sequence too, which is the sequence the
+    owner's report came from (and the one TASK 54's stance run never ran: it was the first check of its
+    run). Two swings from the stance, then a throw when the hand holds a throwable."""
+    pipe = side['pipe']
+    for _ in range(2):
+        pipe.cmd('pad 0 %x 0 0' % LB)
+        time.sleep(0.35)
+        pipe.cmd('pad 0 %x 0 0' % (LB | RB))
+        time.sleep(0.12)
+        pipe.cmd('pad 0 %x 0 0' % LB)
+        time.sleep(0.35)
+    pipe.cmd('pad 0 0 0 0')
+    time.sleep(0.4)
+    held = side['own'].held(who)[0]
+    if held in THROWABLE:
+        print('   warm-up: throw %s (owner %s)' % (held, who))
+        pipe.cmd('pad 0 %x 0 0' % LB)
+        time.sleep(0.4)
+        for _ in range(3):
+            pipe.cmd('pad 0 %x 0 0' % (LB | RB))
+            time.sleep(0.10)
+            pipe.cmd('pad 0 %x 0 0' % LB)
+            time.sleep(0.30)
+        pipe.cmd('pad 0 0 0 0')
+        time.sleep(1.2)
+    else:
+        print('   warm-up: attack sequence only (the hand holds no throwable: %s)' % held)
 
 
 def main():
@@ -139,6 +233,16 @@ def main():
         if not base_o or not base_p:
             fails.append('%s: missing on one copy' % who)
             continue
+        # TASK 55: the state the reviewer's run failed on, measured BEFORE this check touches anything:
+        # the check that ran before this one ended with a throw/attack, and the two copies must agree on
+        # the state and BOTH clips.
+        fails += agree(side, who, 'right after the previous check (its throw/attack)')
+        # ... and the same sequence is part of this check too (the weapon a throw consumed must be
+        # replaced before LB can enter the stance at all).
+        warmup_sequence(side, who)
+        if not pick_weapon(side, who):
+            print('   %s: LB enters no stance even after cycling the weapon slots' % who)
+        fails += agree(side, who, 'after the throw/attack')
         for k in range(CYCLES):
             t_first, t_last, seen = 0.0, 0.0, []
             side['pipe'].cmd('pad 0 %x 0 0' % LB)     # hold LB = attack stance
