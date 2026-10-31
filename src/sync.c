@@ -1286,6 +1286,13 @@ static float g_prop_pos[PROP_MAX][3];
 // TASK 55: the props whose collision body THIS copy switched off while the host moved them (see
 // prop_sim_tick); every other prop keeps its own physics.
 static unsigned g_frozen[PROP_MAX];
+// TASK 56: the PUSH LEASE of each prop: which copy's player is pushing it (1 = this copy, 2 = peer) and
+// until when (see prop_own_tick). The other copy freezes the prop and follows its streamed transform.
+typedef struct { unsigned ent; DWORD owner; DWORD until; } prop_own_slot;
+static prop_own_slot g_pown[PROP_MAX];
+// ... and how fast each character is walking (the pusher must MOVE toward the prop, not just stand by it)
+typedef struct { unsigned h; float pos[3]; float vx, vy; DWORD at; } prop_mover;
+static prop_mover g_mv_local, g_mv_peer;
 static unsigned char g_prop_listed[PROP_MAX];   // 1 = the manager's lists hold this prop right now
 
 // A prop pointer is only used when the object is still alive and still the class it was: an entity that
@@ -1387,8 +1394,11 @@ static void prop_scan(unsigned w, DWORD level)
 	int same_world = (g_prop_gen == g_world_gen && g_prop_world == w);
 	prop_slot old[PROP_MAX];
 	memcpy(old, g_props, sizeof(prop_slot) * (size_t)g_prop_n);
-	if (!same_world)
+	if (!same_world) {
 		memset(g_frozen, 0, sizeof g_frozen);   // TASK 55: a rebuilt world freed the bodies we froze
+		memset(g_pown, 0, sizeof g_pown);       // TASK 56: ... and the entities the push leases named
+		g_mv_local.h = g_mv_peer.h = 0;
+	}
 	g_prop_n = 0;
 	g_prop_level = level;
 	g_prop_world = w;
@@ -2367,22 +2377,198 @@ static void fx_replay_tick(void)
 // TASK 53: a prop that MOVES while nobody carries it (a character walks into it, another prop knocks it)
 // is simulated by the game's own physics on BOTH copies and they end up in different places (owner's 2.1
 // report: "pushing / colliding with boxes moves them differently on the two screens").
-// TASK 55: the copy that owns a prop's physics is the HOST, always - Obscure 1's design
-// (`host_send_props`, coopdll/src/sync.c:2262: "The host sends the props that moved ...; the guest
-// applies them with the engine's own setters"). TASK 53/54 decided it per prop from which character
-// stood closer, and the two copies disagreed near a tie: TASK 54's run 7 log has BOTH copies applying
-// the OTHER's position to their own prop every second (25.2 units, mirrored) - a ping-pong, and the
-// real reason a push on the steam link ended 25-150 units apart. The guest's character is simulated on
-// the host's copy as the puppet, so a push by either player moves the prop there and is streamed back.
+// TASK 55: TASK 53/54 decided the owner of a prop per prop from which character stood closer, and the
+// two copies disagreed near a tie: TASK 54's run 7 log has BOTH copies applying the OTHER's position to
+// their own prop every second (25.2 units, mirrored) - a ping-pong, and the real reason a push on the
+// steam link ended 25-150 units apart. TASK 56 replaces both rules with the push lease below.
 typedef struct { unsigned ent; float pos[3]; DWORD at; } prop_move_slot;
 static prop_move_slot g_pmove[PROP_MAX];
 static volatile LONG g_prop_moves;
 static unsigned puppet_target(void);   // below (TASK 42/53: the peer's character on this copy)
 
+// TASK 56: THE PUSH LEASE. TASK 55 made the HOST the owner of every prop's physics and froze every prop
+// near any human on the guest: the guest's own player then could never push (its props were frozen), and
+// the reviewer's push phase measured the host's prop standing `moved 0.0` while the check walked blindly.
+// TASK 56 leases a prop to the copy whose player is PUSHING it - the pusher, not the role:
+//   * "pushing" = the character is within PROP_TOUCH2 of the prop AND moving at least PROP_PUSH_SPEED
+//     toward it (a player only STANDING beside a chair never takes the lease: the other player can still
+//     push it, and a prop near the local player is never frozen);
+//   * the lease outlives the last evidence by PROP_OWN_MS, so a prop still sliding after the pusher
+//     stopped stays with the copy that holds its physics;
+//   * both copies watch the same two characters (the peer's is the puppet, 55 ms behind), so a prop both
+//     players push at once is resolved the same way on both copies: role breaks the tie (the host wins
+//     and the guest yields to a moving packet, see peer_apply_moves);
+//   * owner 1 = THIS copy's player, owner 2 = the peer's. Only the owner streams the transform; the
+//     other copy freezes exactly that prop and follows it (prop_freeze_here / prop_apply_move).
+// When no lease is live the OLD rule still holds: the host streams the 1 Hz heartbeat, so a prop nobody
+// touches is corrected across (Obscure 1 host_send_props, coopdll/src/sync.c:2312).
+#define PROP_TOUCH2 10000.0f      // (100 units = 1 m)^2: the prop's body is in reach of the character. Measured
+                                  // in this task's run a4: a character pushing a CHAI stays ~70 units from its
+                                  // origin, and the chair slides ~150 units/s - the units are centimetres.
+#define PROP_PUSH_SPEED2 225.0f   // (units/s)^2 the character must move for a PUSH (15 units/s = 0.15 m/s)
+#define PROP_WALK_MAX2 2250000.0f // (1500 units/s)^2: faster than that is a TELEPORT, not a walk
+#define PROP_OWN_MS 900           // the lease outlives the last push evidence by this long
+static volatile LONG g_prop_own_local, g_prop_own_peer;
+
+static prop_own_slot *prop_own_find(unsigned ent, DWORD now)
+{
+	prop_own_slot *free_slot = 0;
+	for (int i = 0; i < PROP_MAX; i++) {
+		if (g_pown[i].ent == ent)
+			return &g_pown[i];
+		if (!g_pown[i].ent || (LONG)(g_pown[i].until - now) <= 0)
+			if (!free_slot)
+				free_slot = &g_pown[i];
+	}
+	return free_slot;
+}
+
+static DWORD prop_owner_of(unsigned ent, DWORD now)
+{
+	if (!ent)
+		return 0;
+	prop_own_slot *o = prop_own_find(ent, now);
+	if (o && o->ent == ent && (LONG)(o->until - now) > 0)
+		return o->owner;
+	return 0;
+}
+
+static void prop_own_mark(unsigned ent, DWORD owner, DWORD now)
+{
+	prop_own_slot *o = prop_own_find(ent, now);
+	if (!o)
+		return;
+	if (o->ent != ent || (LONG)(o->until - now) <= 0 || o->owner != owner)
+		InterlockedIncrement(owner == 1 ? &g_prop_own_local : &g_prop_own_peer);
+	o->ent = ent;
+	o->owner = owner;
+	o->until = now + PROP_OWN_MS;
+}
+
+static void prop_own_clear(unsigned ent)
+{
+	for (int i = 0; i < PROP_MAX; i++)
+		if (g_pown[i].ent == ent)
+			g_pown[i].ent = 0;
+}
+
+// Streamer rule: the lease decides; with no lease the host keeps the props in step (heartbeat).
 static int prop_own_here(unsigned ent)
 {
-	(void)ent;
-	return g_role == 1;   // host owns prop physics; the guest only applies the host's transform
+	DWORD o = prop_owner_of(ent, GetTickCount());
+	return o ? o == 1 : g_role == 1;
+}
+
+// The horizontal distance from a character to a prop. Horizontal only: a prop is pushed along the ground
+// and the character's feet stand at the prop's base.
+static int prop_human_d2(unsigned ent, unsigned h, float *out)
+{
+	if (!h || IsBadReadPtr((const void *)(uintptr_t)(h + H_POS), 12))
+		return 0;
+	const float *p = (const float *)(uintptr_t)(ent + 0x6c);
+	const float *q = (const float *)(uintptr_t)(h + H_POS);
+	if (!mem_ok(p, 12) || !fin3(p) || !fin3(q))
+		return 0;
+	float dx = p[0] - q[0], dy = p[1] - q[1];
+	*out = dx * dx + dy * dy;
+	return 1;
+}
+
+// How fast a character moves on the ground, and where. Sampled every >=100 ms (a longer gap - a load, a
+// menu - is not a speed). The velocity DIRECTION is what separates "walking into the prop" from "walking
+// past it": only the former takes a lease (prop_push_evidence).
+static void prop_mover_sample(prop_mover *m, unsigned h, DWORD now)
+{
+	if (!h || IsBadReadPtr((const void *)(uintptr_t)(h + H_POS), 12)) {
+		m->h = 0;
+		m->vx = m->vy = 0.0f;
+		return;
+	}
+	const float *p = (const float *)(uintptr_t)(h + H_POS);
+	if (m->h != h) {   // another character (a level load, the puppet tag changed): start from here
+		m->h = h;
+		memcpy(m->pos, p, sizeof m->pos);
+		m->at = now;
+		m->vx = m->vy = 0.0f;
+		return;
+	}
+	DWORD dt = now - m->at;
+	if (dt < 100)
+		return;
+	if (dt > 400) {
+		m->vx = m->vy = 0.0f;
+	} else {
+		m->vx = (p[0] - m->pos[0]) * 1000.0f / (float)dt;
+		m->vy = (p[1] - m->pos[1]) * 1000.0f / (float)dt;
+	}
+	memcpy(m->pos, p, sizeof m->pos);
+	m->at = now;
+}
+
+// Is this character PUSHING the prop? In reach, moving, and moving TOWARD it (within 60 degrees: a
+// character walking past a chair pushes nothing, and must not take the prop away from the other player).
+static int prop_push_evidence(unsigned ent, prop_mover *m, float *d2out)
+{
+	if (!m->h || !prop_human_d2(ent, m->h, d2out) || *d2out > PROP_TOUCH2)
+		return 0;
+	float v2 = m->vx * m->vx + m->vy * m->vy;
+	if (v2 < PROP_PUSH_SPEED2 || v2 > PROP_WALK_MAX2)
+		return 0;
+	const float *p = (const float *)(uintptr_t)(ent + 0x6c);
+	const float *q = (const float *)(uintptr_t)(m->h + H_POS);
+	float tx = p[0] - q[0], ty = p[1] - q[1];
+	return (m->vx * tx + m->vy * ty) > 0.5f * sqrtf(*d2out * v2);   // cos 60 deg
+}
+
+// One tick of the lease: sample both characters and give each prop to the copy that is pushing it.
+static volatile LONG g_prop_own_logs;
+static void prop_own_tick(DWORD now)
+{
+	unsigned me = player_human(g_role == 2 ? 1 : 0);
+	unsigned peer = puppet_target();
+	prop_mover_sample(&g_mv_local, me, now);
+	prop_mover_sample(&g_mv_peer, peer, now);
+	for (int i = 0; i < g_prop_n && i < PROP_MAX; i++) {
+		prop_slot *p = &g_props[i];
+		if (!p->ent)
+			continue;
+		if (p->carrier || p->broken) {   // the game owns it now (its attach disables the body itself)
+			prop_own_clear(p->ent);
+			continue;
+		}
+		float dl2 = 1.0e9f, dp2 = 1.0e9f;
+		int lp = prop_push_evidence(p->ent, &g_mv_local, &dl2);
+		int pp = prop_push_evidence(p->ent, &g_mv_peer, &dp2);
+		int lt = dl2 <= PROP_TOUCH2;   // within reach (the push evidence already measured it)
+		int pt = dp2 <= PROP_TOUCH2;
+		DWORD prev = prop_owner_of(p->ent, now);
+		if (lp && pp)
+			prop_own_mark(p->ent, g_role == 1 ? 1u : 2u, now);   // both push it: the host's simulation wins
+		else if (lp)
+			prop_own_mark(p->ent, 1, now);
+		else if (pp)
+			prop_own_mark(p->ent, 2, now);
+		// Nobody PUSHES it right now and no lease is live: the copy whose player STANDS at it owns it. A prop
+		// near the local player is never frozen (the owner's side of this rule); the peer's copy must not let
+		// its own physics shove a prop the peer's player is standing at either - the drift TASK 55 measured
+		// (29 units per heartbeat) was exactly that, and it is avoided instead of corrected here. A live
+		// lease is never overridden by proximity alone (that made the owner flap at the 1 m boundary).
+		else if (!prev && lt && !pt)
+			prop_own_mark(p->ent, 1, now);
+		else if (!prev && pt && !lt)
+			prop_own_mark(p->ent, 2, now);
+		else if (!prev && lt && pt)
+			prop_own_mark(p->ent, g_role == 1 ? 1u : 2u, now);
+		// no new evidence: a live lease stands until it expires (the prop may still be sliding)
+		DWORD own = prop_owner_of(p->ent, now);
+		if (own && own != prev && InterlockedIncrement(&g_prop_own_logs) <= 24) {
+			float lv = sqrtf(g_mv_local.vx * g_mv_local.vx + g_mv_local.vy * g_mv_local.vy);
+			float pv = sqrtf(g_mv_peer.vx * g_mv_peer.vx + g_mv_peer.vy * g_mv_peer.vy);
+			logf("%s: prop %x push lease -> %s (local %.1f u %.1f u/s, peer %.1f u %.1f u/s)",
+				g_role == 2 ? "guest" : "host", p->ent, own == 1 ? "this copy" : "the peer",
+				sqrtf(dl2), lv, sqrtf(dp2), pv);
+		}
+	}
 }
 
 static prop_move_slot *prop_move_entry(unsigned ent, DWORD now, int create)
@@ -2473,76 +2659,6 @@ static void prop_body_collision(unsigned ent, int on)
 		InterlockedIncrement(&g_prop_freezes);   // the counter names real game calls, not attempts
 }
 
-// The lease on a prop a MOVE packet named. Only real motion (pkt_propmove.moving) refreshes it - the 1 Hz
-// heartbeat of an untouched prop must not keep the receiver's physics switched off.
-#define PROP_FREEZE_MS 700
-typedef struct { unsigned ent; DWORD until; } prop_lease;
-static prop_lease g_lease[PROP_MAX];
-
-static void prop_lease_mark(unsigned ent)
-{
-	if (!ent)
-		return;
-	DWORD now = GetTickCount();
-	prop_lease *slot = 0;
-	for (int i = 0; i < PROP_MAX; i++) {
-		if (g_lease[i].ent == ent) {
-			g_lease[i].until = now + PROP_FREEZE_MS;
-			return;
-		}
-		if (!g_lease[i].ent && !slot)
-			slot = &g_lease[i];
-	}
-	if (!slot) {   // full: reuse the one that expires first
-		slot = &g_lease[0];
-		for (int i = 1; i < PROP_MAX; i++)
-			if ((LONG)(g_lease[i].until - slot->until) < 0)
-				slot = &g_lease[i];
-	}
-	slot->ent = ent;
-	slot->until = now + PROP_FREEZE_MS;
-}
-
-static int prop_leased(unsigned ent, DWORD now)
-{
-	for (int i = 0; i < PROP_MAX; i++)
-		if (g_lease[i].ent == ent)
-			return g_lease[i].until && (LONG)(g_lease[i].until - now) > 0;
-	return 0;
-}
-
-// TASK 55: a character's collision body shoves a prop the moment it overlaps it - and on the receiver's
-// copy the peer's character is a body that JUMPS (SetPosition to the streamed pose). Run 1 of this task's
-// push phase measured exactly that: the host's own prop never moved (moved 0.0) while the guest's copy
-// of it had been thrown 29.8 units away, and after the next approach 64.9 units. The host never learns
-// (its copy is static), so the receiver must not let any character push a prop it does not simulate.
-// A prop is therefore frozen while it is within 3 units (horizontally) of ANY human on this copy.
-#define PROP_NEAR2 9.0f
-static int prop_near_human(unsigned ent)
-{
-	const float *p = (const float *)(uintptr_t)(ent + 0x6c);
-	if (!mem_ok(p, 12) || !fin3(p))
-		return 0;
-	unsigned w = world_obj();
-	unsigned mgr = w && mem_ok((const void *)(uintptr_t)(w + 0x175c), 4) ? rd32(w + 0x175c) : 0;
-	if (!mgr || IsBadReadPtr((const void *)(uintptr_t)mgr, 0x10))
-		return 0;
-	int n = (int)rd32(mgr + 4);
-	unsigned arr = rd32(mgr + 0xc);
-	if (n > 8)
-		n = 8;
-	for (int i = 0; i < n; i++) {
-		unsigned h = arr && !IsBadReadPtr((const void *)(uintptr_t)(arr + 4 * i), 4) ? rd32(arr + 4 * i) : 0;
-		if (!h || IsBadReadPtr((const void *)(uintptr_t)(h + H_POS), 12))
-			continue;
-		const float *q = (const float *)(uintptr_t)(h + H_POS);
-		float dx = p[0] - q[0], dy = p[1] - q[1];
-		if (dx * dx + dy * dy < PROP_NEAR2)
-			return 1;
-	}
-	return 0;
-}
-
 // Freeze / hand back one prop. `on` = freeze. A prop that is carried or broken is never ours to freeze.
 static void prop_set_frozen(unsigned ent, int on)
 {
@@ -2567,24 +2683,24 @@ static void prop_set_frozen(unsigned ent, int on)
 	}
 }
 
-// Per tick: the guest freezes exactly the props the host is moving; every other prop keeps its own
-// physics (a prop nobody touches never pauses, so the guest's world behaves normally between pushes).
-// Does this copy have to keep the prop out of its own physics? The guest only: the host owns prop
-// physics, and it keeps simulating the guest's character there as the puppet. Two reasons to freeze:
-// the host is moving the prop (lease), or a character is close enough to shove it (the peer's character
-// is a teleporting body on this copy, see prop_near_human).
+// Does THIS copy have to keep the prop out of its own physics? Yes exactly when the PEER's player holds
+// the push lease (prop_own_tick): the peer simulates the push and streams the transform, so this copy
+// must not simulate it a second time. TASK 55 froze a prop near ANY human on the guest; TASK 56 freezes
+// only what the peer is PUSHING, so a prop near the local player is never frozen and the local player can
+// always push (a local push takes the lease on the next tick).
 static int prop_freeze_here(prop_slot *p, DWORD now)
 {
-	if (g_role != 2 || !g_peer_ok || p->carrier || p->broken)
+	if (!g_peer_ok || p->carrier || p->broken)
 		return 0;
 	if (!prop_alive(p->ent, p->cls, p->vt))
 		return 0;
-	return prop_leased(p->ent, now) || prop_near_human(p->ent);
+	return prop_owner_of(p->ent, now) == 2;
 }
 
 static void prop_sim_tick(void)
 {
 	DWORD now = GetTickCount();
+	prop_own_tick(now);   // TASK 56: give each pushed prop to the copy whose player pushes it
 	for (int i = 0; i < g_prop_n && i < PROP_MAX; i++)
 		if (g_props[i].ent && prop_freeze_here(&g_props[i], now))
 			prop_set_frozen(g_props[i].ent, 1);
@@ -2698,9 +2814,14 @@ static void peer_apply_moves(void)
 		unsigned ent = prop_find(p.cls, p.id, p.pos);
 		if (!ent)
 			continue;
-		if (p.moving)
-			prop_lease_mark(ent);   // TASK 55: the host is moving it - this copy's physics pauses
-		if (!prop_own_here(ent))
+		DWORD now = GetTickCount();
+		// TASK 56: a MOVING packet means the peer is pushing this prop - it holds the lease, this copy
+		// follows (and freezes it, prop_freeze_here). The heartbeat of a prop at rest names no lease.
+		// Both players pushing the same prop is resolved the same way on both copies: the host's own push
+		// wins, so the guest yields here; the host ignores a guest packet for a prop it is pushing itself.
+		if (p.moving && !(g_role == 1 && prop_owner_of(ent, now) == 1))
+			prop_own_mark(ent, 2, now);
+		if (prop_owner_of(ent, now) != 1)
 			prop_apply_move(ent, p.pos, p.dir);
 	}
 }
@@ -8010,8 +8131,9 @@ static void sync_status(char *reply, size_t replysz)
 			g_pb_delay, g_pb_under, g_pb_anim_sets, g_pb_anim_diff, g_pb_anim_ok, g_pb_writes, g_pb_lows);
 	l = strlen(reply);
 	if (l < replysz)
-		_snprintf(reply + l, replysz - l, " | prop sent %ld rcv %ld applied %ld broke %ld drop %ld missing %ld moves %ld freezes %ld",
-			g_prop_sent, g_prop_rcv, g_prop_applied, g_prop_broken, g_prop_drop, g_prop_missing, g_prop_moves, g_prop_freezes);
+		_snprintf(reply + l, replysz - l, " | prop sent %ld rcv %ld applied %ld broke %ld drop %ld missing %ld moves %ld freezes %ld owns %ld/%ld",
+			g_prop_sent, g_prop_rcv, g_prop_applied, g_prop_broken, g_prop_drop, g_prop_missing, g_prop_moves, g_prop_freezes,
+			g_prop_own_local, g_prop_own_peer);
 	l = strlen(reply);
 	if (l < replysz)
 		_snprintf(reply + l, replysz - l, " | fx local %ld sent %ld rcv %ld played %ld dup %ld skipped %ld calls %ld",

@@ -14,7 +14,7 @@ Read-only memory reads, the mod's own safe `tp` and normal
 pad presses; `netpause` is the existing test-only link pause. Exit 0 = PASS or SKIP, 1 = FAIL.
 Usage: python -I check_breakables.py <host pid> <guest pid>
 """
-import sys, os, struct, time
+import sys, os, struct, time, math
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bot
 from peek import Proc
@@ -516,48 +516,170 @@ def task53_carry_walk(mh, mg, ph):
     return fails
 
 
-def task53_push(mh, mg, ph):
-    """(b) a pushed prop: the host's character walks into a prop; when the dust settles the same prop must
-    be within 10 units of the same place on both copies."""
-    fails = []
-    me = ctl_human(mh, 0)
-    mine = sorted(usable_like(mh), key=lambda e: d3(epos(mh, e), hpos(mh, me)))
-    if not mine:
-        fails.append('push: no usable prop')
-        return fails
-    e = mine[0]
-    moved = 0.0
-    po, pg_, p0o = epos(mh, e), None, epos(mh, e)
-    for attempt in range(3):   # TASK 54: the safe tp can settle the character where the walk never touches
-        ok, how = tp_near(ph, mh, 0, epos(mh, e))
-        print('  push: attempt %d: tp next to %s: %s' % (attempt + 1, describe(mh, e), how))
-        if not ok:
-            continue
-        eo = prop_same(mh, e, mg)
-        p0o, p0g = epos(mh, e), epos(mg, eo) if eo else (0, 0, 0)
-        print('  push: before: own (%.1f,%.1f,%.1f) | other (%.1f,%.1f,%.1f)' % (p0o + p0g))
-        print('  push: before body: own %s | other %s' % (fmt_xf(body_xf(mh, e)), fmt_xf(body_xf(mg, eo) if eo else None)))
-        # walk into it from four directions (the stick is camera-relative, so try them all)
-        for lx, ly in ((0, 32000), (32000, 0), (0, -32000), (-32000, 0), (0, 32000)):
-            ph.cmd('pad 0 0 %d %d' % (lx, ly))
-            time.sleep(0.55)
-        ph.cmd('pad 0 0 0 0')
-        time.sleep(2.0)   # the 1 Hz transform heartbeat must land and settle before the reading
-        eo = prop_same(mh, e, mg)
-        po, pg_ = epos(mh, e), epos(mg, eo) if eo else None
-        moved = d3(po, p0o)
-        print('  push: after:  own (%.1f,%.1f,%.1f) moved %.1f | other %s'
-              % (po[0], po[1], po[2], moved, 'missing' if not pg_ else '(%.1f,%.1f,%.1f) differs %.1f'
-                 % (pg_[0], pg_[1], pg_[2], d3(po, pg_))))
-        print('  push: after body: own %s | other %s' % (fmt_xf(body_xf(mh, e)), fmt_xf(body_xf(mg, eo) if eo else None)))
-        if moved >= 1.0:
+# ---- TASK 56: pushing a prop, on both players ----------------------------------------------------------
+PUSH_MIN = 30.0       # units the prop must move on the PUSHER's own copy
+PUSH_AGREE = 10.0     # units the two copies may be apart once the push has settled
+STICK = 30000
+
+
+def probe_move(pipe, m, pl, lx, ly, secs=0.30):
+    """Press one stick direction and return the character's world displacement (dx, dy). The stick is
+    CAMERA-relative and the two copies' cameras are independent (src/obscoop2.c remap_stick), so the
+    stick->world frame is MEASURED on the copy being driven rather than assumed from the yaw."""
+    p0 = hpos(m, ctl_human(m, pl))
+    pipe.cmd('pad 0 0 %d %d' % (lx, ly))
+    time.sleep(secs)
+    pipe.cmd('pad 0 0 0 0')
+    time.sleep(0.12)
+    p1 = hpos(m, ctl_human(m, pl))
+    return (p1[0] - p0[0], p1[1] - p0[1])
+
+
+def stick_frame(pipe, m, pl):
+    """The two stick axes as world vectors: [stick right, stick up]. None when the character cannot move."""
+    r = probe_move(pipe, m, pl, STICK, 0)
+    u = probe_move(pipe, m, pl, 0, STICK)
+    if (r[0] ** 2 + r[1] ** 2) ** 0.5 < 0.6 or (u[0] ** 2 + u[1] ** 2) ** 0.5 < 0.6:
+        return None
+    return (r, u)
+
+
+def stick_for(want, frame):
+    """The stick whose measured world displacement points along `want`."""
+    (rx, ry), (ux, uy) = frame
+    det = rx * uy - ux * ry
+    if abs(det) < 1e-6:
+        return None
+    lx = (uy * want[0] - ux * want[1]) / det
+    ly = (-ry * want[0] + rx * want[1]) / det
+    n = (lx * lx + ly * ly) ** 0.5 or 1.0
+    return int(STICK * lx / n), int(STICK * ly / n)
+
+
+def walk_into(pipe, m, pl, e, want, timeout=12.0):
+    """Walk the local player INTO prop `e` until it has moved `want` units on this copy. The stick is kept
+    pointed at the prop every 120 ms (the prop slides away faster than the character walks, so the
+    direction has to follow it) and the frame is measured again when the character stops CLOSING IN (the
+    camera turns while walking). Returns the displacement measured on this copy."""
+    p0 = epos(m, e)
+    frame = stick_frame(pipe, m, pl)
+    t = prog_t = last_log = time.time()
+    best_d = 1.0e9
+    prev_hp = None
+    while time.time() - t < timeout:
+        pp, hp = epos(m, e), hpos(m, ctl_human(m, pl))
+        moved, dist = d3(pp, p0), d3(pp, hp)
+        if prev_hp and d3(hp, prev_hp) > 400.0 / 4.0:   # > 1 m between two samples ~= a teleport, not a walk
+            print('  push: walk: the character JUMPED %.0f units between two samples - giving this approach up'
+                  % d3(hp, prev_hp))
             break
-        print('  push: the prop did not move on the host in this position - another approach')
-    if moved < 1.0:
-        fails.append('push: the host character could not push the prop in three positions')
-    elif not pg_ or d3(po, pg_) > 10.0:
-        fails.append('push: the pushed prop is not in the same place on both copies (%s)'
-                     % ('missing on the partner copy' if not pg_ else '%.1f units apart' % d3(po, pg_)))
+        prev_hp = hp
+        if moved >= want:
+            break
+        if dist < best_d - 0.4:
+            best_d, prog_t = dist, time.time()
+        elif time.time() - prog_t > 1.2:
+            frame = stick_frame(pipe, m, pl)   # the camera turned (or the character is blocked): measure again
+            best_d, prog_t = dist, time.time()
+        if not frame:
+            break
+        st = stick_for((pp[0] - hp[0], pp[1] - hp[1]), frame)
+        if not st:
+            break
+        pipe.cmd('pad 0 0 %d %d' % st)
+        time.sleep(0.12)
+        if time.time() - last_log > 1.5:
+            last_log = time.time()
+            print('  push: walk %.1fs: pusher (%.1f,%.1f) prop (%.1f,%.1f) %.1f units apart, moved %.1f'
+                  % (time.time() - t, hp[0], hp[1], pp[0], pp[1], dist, moved))
+    pipe.cmd('pad 0 0 0 0')
+    print('  push: walk: closest approach %.1f units' % best_d)
+    return d3(epos(m, e), p0)
+
+
+def tp_place(pipe, m, pl, target, angles=(0, 90, 180, 270), radii=(180.0, 220.0, 260.0)):
+    """Safe-tp the player `radius` units from `target`, trying the given angles around it (0 = the side the
+    character is on now). NEVER close to the prop: the safe tp writes the character's position in one
+    frame, and the physics answers a body that jumped tens of units by EJECTING the prop (measured in this
+    task's run a1: the chair a 7-unit tp landed beside left the spot at 60+ units per second), so the push
+    starts outside the physics' reach and the character WALKS in."""
+    hp = hpos(m, ctl_human(m, pl))
+    tried = 0
+    for radius in radii:
+        for ang in angles:
+            dx, dy = hp[0] - target[0], hp[1] - target[1]
+            dd = (dx * dx + dy * dy) ** 0.5 or 1.0
+            ca, sa = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+            ux, uy = (dx / dd) * ca - (dy / dd) * sa, (dx / dd) * sa + (dy / dd) * ca
+            stand = (target[0] + ux * radius, target[1] + uy * radius, target[2])
+            r = pipe.cmd('tp %d %.3f %.3f %.3f %.3f %.3f' % (pl, stand[0], stand[1], stand[2],
+                                                             target[0] - stand[0], target[1] - stand[1]))
+            tried += 1
+            if r.startswith('ok'):
+                return True, 'safe tp at %.0f units (%s)' % (radius, r)
+    return False, 'safe tp refused every spot (%d tried)' % tried
+
+
+def push_round(m_own, m_oth, pipe, pl, label):
+    """One push on the copy `m_own` (whose local pad is `pipe`): place the local player beside the nearest
+    whole prop, walk INTO it with feedback, then let the link settle and measure both copies. Returns
+    (units the prop moved on the pusher's copy, distance between the two copies) or None."""
+    me = ctl_human(m_own, pl)
+    cands = sorted(usable_like(m_own), key=lambda e: d3(epos(m_own, e), hpos(m_own, me)))
+    for cand in cands[:2]:
+        for ang in (0, 180):   # 0 = approach from where the pusher stands now, 180 = the other side
+            ok, how = tp_place(pipe, m_own, pl, epos(m_own, cand), angles=(ang, ang + 45, ang - 45))
+            print('  push: %s: tp next to %s: %s' % (label, describe(m_own, cand), how))
+            if not ok:
+                continue
+            eo = prop_same(m_own, cand, m_oth)
+            p0o = epos(m_own, cand)
+            pg0 = epos(m_oth, eo) if eo else None
+            hp = hpos(m_own, ctl_human(m_own, pl))
+            print('  push: %s: before: own (%.1f,%.1f,%.1f) | other %s | pusher %.1f units away'
+                  % (label, p0o[0], p0o[1], p0o[2],
+                     'missing' if not pg0 else '(%.1f,%.1f,%.1f)' % pg0, d3(hp, p0o)))
+            walk_into(pipe, m_own, pl, cand, PUSH_MIN)
+            time.sleep(2.0)   # the 1 Hz transform heartbeat must land and settle before the reading
+            po = epos(m_own, cand)
+            eo = prop_same(m_own, cand, m_oth)
+            pg1 = epos(m_oth, eo) if eo else None
+            moved = d3(po, p0o)
+            apart = d3(po, pg1) if pg1 else None
+            print('  push: %s: after:  own (%.1f,%.1f,%.1f) moved %.1f | other %s'
+                  % (label, po[0], po[1], po[2], moved,
+                     'missing' if not pg1 else '(%.1f,%.1f,%.1f) differs %.1f' % (pg1[0], pg1[1], pg1[2], apart)))
+            print('  push: %s: bodies: own %s | other %s'
+                  % (label, fmt_xf(body_xf(m_own, cand)), fmt_xf(body_xf(m_oth, eo) if eo else None)))
+            if moved >= PUSH_MIN:
+                return moved, apart
+            print('  push: %s: only %.1f units in this position - another side/prop' % (label, moved))
+    return None
+
+
+def task53_push(mh, mg, ph, pg):
+    """(b) TASK 56: a pushed prop, on BOTH players. The local player walks INTO the prop until it has moved
+    PUSH_MIN units on the pusher's own copy (with feedback: the old phase pressed five blind stick segments
+    in four directions, and on the steam profile the character often never reached the prop - TASK 55's
+    reviewer run had `moved 0.0` three times, and the m54 control log has the same first attempt). Then the
+    other copy must end within PUSH_AGREE units of the pusher's copy. Three pushes per player."""
+    fails = []
+    for pl, m_own, m_oth, pipe, label in ((0, mh, mg, ph, 'host (player 1 on the host copy)'),
+                                          (1, mg, mh, pg, 'guest (player 2 on the guest copy)')):
+        for k in range(3):
+            r = push_round(m_own, m_oth, pipe, pl, '%s push %d/3' % ('host' if pl == 0 else 'guest', k + 1))
+            if r is None:
+                fails.append('push: %s push %d: no prop could be pushed' % (label, k + 1))
+                continue
+            moved, apart = r
+            if moved < PUSH_MIN:
+                fails.append('push: %s push %d: the prop moved only %.1f units on the pusher\'s copy'
+                             % (label, k + 1, moved))
+            elif apart is None:
+                fails.append('push: %s push %d: the other copy has no prop for it' % (label, k + 1))
+            elif apart > PUSH_AGREE:
+                fails.append('push: %s push %d: the pushed prop is %.1f units apart on the two copies'
+                             % (label, k + 1, apart))
     return fails
 
 
@@ -624,7 +746,7 @@ def main():
     if task53_level(mh, mg, ph, pg):
         fails += task54_break_while_carried(mh, mg, ph, pg)
         fails += task53_carry_walk(mh, mg, ph)
-        fails += task53_push(mh, mg, ph)
+        fails += task53_push(mh, mg, ph, pg)
         fails += task53_throw(mh, mg, ph, pg)
         lv_h = level_of(mh)
     else:
@@ -798,4 +920,5 @@ def main():
     return 0
 
 
-sys.exit(main())
+if __name__ == '__main__':
+    sys.exit(main())
