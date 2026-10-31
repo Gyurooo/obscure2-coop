@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 27   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 28   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -89,6 +89,11 @@
                         //     same position through the same game call. An effect call carries no damage and
                         //     no physics, so the TASK 49 rule (one authority for damage) is untouched
                         //     (FINDINGS_53).
+                        // 28: TASK 54, PROPS IN MOTION: PKT_PROPMOVE carries a moved prop's collision-body
+                        //     position (+0xcc) and direction (+0xd8); the receiver applies them with the
+                        //     body's own setter FUN_005ac670 instead of the raw +0x6c write that the physics
+                        //     reverted (pkt_prop kind 4 is no longer sent). Non-finite transforms are never
+                        //     sent or applied (a break while carried turned the owner's chair NaN).
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,
@@ -222,12 +227,14 @@ typedef struct { pkt_hdr h; DWORD level; DWORD state, ui0, ui1; DWORD owner; DWO
 #define FX_MAX 4     // effects per packet (a burst - an explosion plus its shock/sound - arrives together)
 typedef struct { DWORD tag, a6, a7, a8, a9, a10, a11; float pos[3]; DWORD has_pos; } fx_ev;
 typedef struct { pkt_hdr h; DWORD n; fx_ev e[FX_MAX]; } pkt_fx;
-// TASK 53: a prop's TRANSFORM while the copy that moved it streams it (a prop pushed by the walk into it
-// or knocked about by another prop). pos/quat are the mesh transform the renderer draws (mesh+0x1c8 and
-// mesh+0x1e0) - the same two fields the game's carried transform (FUN_00412720) writes - and the entity
-// position (+0x6c) is written with them. A raw write of +0x6c alone is restored by the physics body
-// (measured: raw_move_test REVERTED), which is why the mesh transform is what a moving prop needs.
-typedef struct { pkt_hdr h; DWORD level; DWORD cls, id; float pos[3]; float quat[4]; } pkt_propmove;
+// TASK 53/54: a prop's TRANSFORM while the copy that moved it streams it (a prop pushed by the walk into
+// it, knocked about by another prop, or turned NaN by a break while carried). pos is the entity position
+// (+0x6c), dir its facing (+0x78). The receiver applies pos through the game's OWN entity setter, vtable
+// slot 34 (bytes +0x88) = FUN_00402930 (it moves the collision body and the mesh node and hands the
+// position to the physics simulator); a raw +0x6c write is undone by the body (check_breakables'
+// raw_move_test: REVERTED on both copies), and so is the body's own +0xcc. A non-finite transform is
+// never sent or applied.
+typedef struct { pkt_hdr h; DWORD level; DWORD cls, id; float pos[3]; float dir[3]; } pkt_propmove;
 #pragma pack(pop)
 
 static void guest_on_state(const char *buf, int n);
@@ -252,6 +259,7 @@ static void peer_on_door(const char *buf, int n);    // TASK 34: a door used on 
 static void host_on_levelask(const char *buf, int n);   // TASK 34: the guest asks the host for a level change
 static void peer_on_menu(const char *buf, int n);       // TASK 36: the peer's menu state (both roles)
 static void peer_on_fx(const char *buf, int n);         // TASK 53: the peer's effects (both roles)
+static void peer_on_propmove(const char *buf, int n);   // TASK 54: a prop the peer's character pushed
 static void fx_send_local(void);                        // TASK 53: this copy's effects (sync.c)
 static unsigned rd32(unsigned addr);      // sync.c
 static unsigned world_obj(void);          // sync.c
@@ -560,6 +568,9 @@ static void net_handle(const char *buf, int n, sid_t from)
 		case PKT_FX:
 			peer_on_fx(buf, n);         // TASK 53: an effect the guest's game spawned
 			break;
+		case PKT_PROPMOVE:
+			peer_on_propmove(buf, n);   // TASK 54: a prop the guest's character pushed
+			break;
 		}
 	} else if (g_role == 2) {
 		if (!g_peer_ok) {
@@ -612,6 +623,8 @@ static void net_handle(const char *buf, int n, sid_t from)
 		peer_on_menu(buf, n);    // TASK 36: the host's menu state (convergence signal)
 	} else if (h->type == PKT_FX) {
 		peer_on_fx(buf, n);      // TASK 53: an effect the host's game spawned
+	} else if (h->type == PKT_PROPMOVE) {
+		peer_on_propmove(buf, n);   // TASK 54: a prop the host's character pushed
 	} else if (h->type == PKT_STATE) {
 			guest_on_state(buf, n);
 		} else if (h->type == PKT_REGION) {

@@ -295,10 +295,24 @@ def body_of(m, e):
     return c, (rtti(m, c) if c else '')
 
 
+def body_xf(m, e):
+    """The collision body's own transform (ent+0x68: position +0xcc..+0xd4, direction +0xd8..+0xe0). The
+    game's entity setter FUN_00402930 (vtable slot 34) moves it with the entity; printed so the field the
+    pushed-prop relay has to end up moving is visible in the output."""
+    b = u32(m, e + 0x68)
+    if not b:
+        return None
+    return tuple(f32(m, b + 0xcc + 4 * i) for i in range(3)) + tuple(f32(m, b + 0xd8 + 4 * i) for i in range(3))
+
+
+def fmt_xf(t):
+    return 'n/a' if not t else '(%.2f,%.2f,%.2f dir %.2f,%.2f,%.2f)' % t
+
+
 def dump_props(m, label):
     for e in props(m):
         body, name = body_of(m, e)
-        print('  %s prop %s body %x %s' % (label, describe(m, e), body, name))
+        print('  %s prop %s body %x %s %s' % (label, describe(m, e), body, name, fmt_xf(body_xf(m, e))))
 
 
 def prop_same(m_own, e_own, m_oth):
@@ -319,17 +333,27 @@ def task53_level(mh, mg, ph, pg):
     """TASK 53 needs props that are whole and can be carried. Save 01 (I100) has none - its seven chairs
     are recorded broken in the save (measured in the TASK 53 run) - so the check loads save slot 3
     (game3.sav = J002, 11 chairs, OBSERVED in the slot scan) on the HOST with the game's own load path;
-    the guest follows the host's level (TASK 37). A1: player 1 = the host's own character."""
+    the guest follows the host's level (TASK 37). A1: player 1 = the host's own character.
+    TASK 54: both worlds must also be back in NORMAL PLAY (world+0x11c == 1), not only in the level: over
+    the relay the guest's build of J002 kept its world out of normal play for 26.6 s after the level tag
+    was already J002, and the puppet is (correctly) not driven while the world is not normal - the
+    carry-walk comparison then read a stale pose."""
     want = 'J002'
-    if level_of(mh) == want and level_of(mg) == want and usable_like(mh):
+
+    def normal(m):
+        w = world(m)
+        return bool(w) and u32(m, w + 0x11c) == 1
+
+    if level_of(mh) == want and level_of(mg) == want and usable_like(mh) and normal(mh) and normal(mg):
         return True
     print('  TASK 53: loading save slot 3 (game3.sav = %s) on the host; the guest follows the level' % want)
     print('  host loadsave game3.sav -> %s' % ph.cmd('loadsave game3.sav'))
     t = time.time()
     while time.time() - t < 120:
-        if level_of(mh) == want and level_of(mg) == want and usable_like(mh) and usable_like(mg):
+        if level_of(mh) == want and level_of(mg) == want and usable_like(mh) and usable_like(mg) \
+                and normal(mh) and normal(mg):
             time.sleep(2.5)
-            print('  TASK 53: both copies in %s (%d props each)' % (want, len(props(mh))))
+            print('  TASK 53: both copies in %s (%d props each), normal play' % (want, len(props(mh))))
             return True
         time.sleep(0.5)
     print('  TASK 53: the copies did not reach %s (host %s, guest %s)' % (want, level_of(mh), level_of(mg)))
@@ -348,6 +372,70 @@ def pickup(pipe, m, pl):
         if ok:
             return carry_of(m, pl)
     return 0
+
+
+def task54_break_while_carried(mh, mg, ph, pg, cycles=5):
+    """TASK 54 (A1-1): the 2.1 playtest guest died silently right after the chair the HOST carried was
+    broken while the 0.5 s carry heartbeats were in flight; its last two log lines name that chair.
+    This repeats the sequence: pick a whole chair up, walk with it (heartbeats at 500 ms), swing it
+    broken while it is in hand, and after every break require both copies alive, ticking and agreeing.
+    Five cycles, as the task asks."""
+    fails = []
+    for k in range(cycles):
+        mine = sorted(usable(mh), key=lambda e: d3(epos(mh, e), hpos(mh, ctl_human(mh, 0))))
+        if not mine:
+            fails.append('break-while-carried %d: no whole chair left on the host copy' % (k + 1))
+            break
+        e = 0
+        for cand in mine[:3]:
+            ok, how = tp_near(ph, mh, 0, epos(mh, cand))
+            print('  break-while-carried %d/%d: tp -> chair #%d: %s' % (k + 1, cycles, chair_index(mh, cand), how))
+            if ok:
+                e = pickup(ph, mh, 0)
+                if e:
+                    break
+        if not e:
+            fails.append('break-while-carried %d: the host player could not pick a chair up' % (k + 1))
+            break
+        print('  break-while-carried %d/%d: carrying chair #%d %s' % (k + 1, cycles, chair_index(mh, e), describe(mh, e)))
+        ph.cmd('pad 0 0 0 32000')     # walk: the carry heartbeat (500 ms) is in flight while it breaks
+        time.sleep(1.4)
+        ph.cmd('pad 0 0 0 0')
+        time.sleep(0.3)
+        fh0, fg0 = frames(ph), frames(pg)
+        broke = False
+        for _i in range(4):
+            press_a(ph, 0)
+            okb, secs = wait_for(lambda: u32(mh, e + 0xa4) != 0, 1.5)
+            if okb:
+                broke = True
+                break
+        if not broke:
+            fails.append('break-while-carried %d: the swing did not break the carried chair' % (k + 1))
+            break
+        okg, secsg = wait_for(lambda: u32(mg, (chair_same(mh, e, mg) or 0) + 0xa4) != 0, 3.0)
+        time.sleep(1.0)
+        fh1, fg1 = frames(ph), frames(pg)
+        alive = []
+        for name, pipe in (('host', ph), ('guest', pg)):
+            try:
+                alive.append((name, pipe.cmd('ping').startswith('pong')))
+            except OSError:
+                alive.append((name, False))
+        print('  break-while-carried %d/%d: broken on the owner after %.2f s; partner copy %s (%.2f s) | frames '
+              'host %s->%s guest %s->%s | alive %s'
+              % (k + 1, cycles, secs, 'broken' if okg else 'STILL WHOLE', secsg, fh0, fh1, fg0, fg1, alive))
+        if not okg:
+            fails.append('break-while-carried %d: the partner copy still shows the chair whole' % (k + 1))
+        if not all(a for _n, a in alive):
+            fails.append('break-while-carried %d: a copy stopped answering (%s)' % (k + 1, alive))
+            break
+        if fh0 == fh1 or fg0 == fg1:
+            fails.append('break-while-carried %d: a copy stopped ticking (host %s->%s guest %s->%s)'
+                         % (k + 1, fh0, fh1, fg0, fg1))
+            break
+        time.sleep(0.4)
+    return fails
 
 
 def task53_carry_walk(mh, mg, ph):
@@ -376,6 +464,12 @@ def task53_carry_walk(mh, mg, ph):
     pe = human_by_tag(mg, tag_me)
     print('  carry-walk: %s carries %s' % (tag_me, describe(mh, e)))
     time.sleep(0.5)
+    # TASK 54: the puppet must actually be driven before the comparison means anything - after the level
+    # load of a lossy link it is (correctly) gated for a while, and a gated copy keeps its old pose.
+    if pe:
+        okp, secsp = wait_for(lambda: anim_of(mh, ctl_human(mh, 0)) == anim_of(mg, pe), 6.0)
+        print('  carry-walk: the partner mirrors the carry pose before the walk: %s (%.2f s)'
+              % ('yes' if okp else 'NO', secsp))
     # walk: the owner holds the stick forward while carrying
     rows = []
     ph.cmd('pad 0 0 0 32000')
@@ -407,6 +501,18 @@ def task53_carry_walk(mh, mg, ph):
     elif nl_same < 0.7 * len(nonloco):
         fails.append('carry-walk: the partner plays a different animation while the owner walks carrying '
                      '(%d/%d identical)' % (nl_same, len(nonloco)))
+    # TASK 54: give the hand back. The action button swings the carried chair and the game's own detach
+    # ends the swing with an empty hand; without this the next phase would find a chair already carried.
+    for _i in range(4):
+        press_a(ph, 0)
+        okd, _s = wait_for(lambda: carry_of(mh, 0) == 0, 1.5)
+        if okd:
+            print('  carry-walk: the chair is released again (hand empty)')
+            break
+    else:
+        print('  carry-walk: the host hand is still full (%x) - the next phases may pick the wrong prop'
+              % carry_of(mh, 0))
+    time.sleep(0.4)
     return fails
 
 
@@ -420,28 +526,35 @@ def task53_push(mh, mg, ph):
         fails.append('push: no usable prop')
         return fails
     e = mine[0]
-    ok, how = tp_near(ph, mh, 0, epos(mh, e), )
-    print('  push: tp next to %s: %s' % (describe(mh, e), how))
-    if not ok:
-        fails.append('push: could not stand next to the prop')
-        return fails
-    eo = prop_same(mh, e, mg)
-    p0o, p0g = epos(mh, e), epos(mg, eo) if eo else (0, 0, 0)
-    print('  push: before: own (%.1f,%.1f,%.1f) | other (%.1f,%.1f,%.1f)' % (p0o + p0g))
-    # walk into it from four directions (the stick is camera-relative, so try them all)
-    for lx, ly in ((0, 32000), (32000, 0), (0, -32000), (-32000, 0), (0, 32000)):
-        ph.cmd('pad 0 0 %d %d' % (lx, ly))
-        time.sleep(0.55)
-    ph.cmd('pad 0 0 0 0')
-    time.sleep(1.2)
-    eo = prop_same(mh, e, mg)
-    po, pg_ = epos(mh, e), epos(mg, eo) if eo else None
-    moved = d3(po, p0o)
-    print('  push: after:  own (%.1f,%.1f,%.1f) moved %.1f | other %s'
-          % (po[0], po[1], po[2], moved, 'missing' if not pg_ else '(%.1f,%.1f,%.1f) differs %.1f'
-             % (pg_[0], pg_[1], pg_[2], d3(po, pg_))))
+    moved = 0.0
+    po, pg_, p0o = epos(mh, e), None, epos(mh, e)
+    for attempt in range(3):   # TASK 54: the safe tp can settle the character where the walk never touches
+        ok, how = tp_near(ph, mh, 0, epos(mh, e))
+        print('  push: attempt %d: tp next to %s: %s' % (attempt + 1, describe(mh, e), how))
+        if not ok:
+            continue
+        eo = prop_same(mh, e, mg)
+        p0o, p0g = epos(mh, e), epos(mg, eo) if eo else (0, 0, 0)
+        print('  push: before: own (%.1f,%.1f,%.1f) | other (%.1f,%.1f,%.1f)' % (p0o + p0g))
+        print('  push: before body: own %s | other %s' % (fmt_xf(body_xf(mh, e)), fmt_xf(body_xf(mg, eo) if eo else None)))
+        # walk into it from four directions (the stick is camera-relative, so try them all)
+        for lx, ly in ((0, 32000), (32000, 0), (0, -32000), (-32000, 0), (0, 32000)):
+            ph.cmd('pad 0 0 %d %d' % (lx, ly))
+            time.sleep(0.55)
+        ph.cmd('pad 0 0 0 0')
+        time.sleep(2.0)   # the 1 Hz transform heartbeat must land and settle before the reading
+        eo = prop_same(mh, e, mg)
+        po, pg_ = epos(mh, e), epos(mg, eo) if eo else None
+        moved = d3(po, p0o)
+        print('  push: after:  own (%.1f,%.1f,%.1f) moved %.1f | other %s'
+              % (po[0], po[1], po[2], moved, 'missing' if not pg_ else '(%.1f,%.1f,%.1f) differs %.1f'
+                 % (pg_[0], pg_[1], pg_[2], d3(po, pg_))))
+        print('  push: after body: own %s | other %s' % (fmt_xf(body_xf(mh, e)), fmt_xf(body_xf(mg, eo) if eo else None)))
+        if moved >= 1.0:
+            break
+        print('  push: the prop did not move on the host in this position - another approach')
     if moved < 1.0:
-        print('  push: the prop did not move on the host either - no push happened in this position')
+        fails.append('push: the host character could not push the prop in three positions')
     elif not pg_ or d3(po, pg_) > 10.0:
         fails.append('push: the pushed prop is not in the same place on both copies (%s)'
                      % ('missing on the partner copy' if not pg_ else '%.1f units apart' % d3(po, pg_)))
@@ -449,90 +562,16 @@ def task53_push(mh, mg, ph):
 
 
 def task53_throw(mh, mg, ph, pg):
-    """(c) a prop broken by THROWING another prop at it: the break must reach both copies and neither game
-    may die (the 2.1 playtest: the box stayed whole on the guest and its game crashed). Throws with the
-    input the game uses for a carried prop (aim + attack); tries the two forms until the owner's copy
-    breaks the target."""
-    fails = []
-    me = ctl_human(mh, 0)
-    mine = sorted(usable_like(mh), key=lambda e: d3(epos(mh, e), hpos(mh, me)))
-    if len(mine) < 2:
-        fails.append('throw: fewer than two props in the level')
-        return fails
-    e = 0
-    for cand in mine[:3]:
-        ok, how = tp_near(ph, mh, 0, epos(mh, cand))
-        if ok:
-            e = pickup(ph, mh, 0)
-            if e:
-                break
-    if not e:
-        fails.append('throw: the host player could not pick a prop up')
-        return fails
-    targets = [x for x in usable_like(mh) if x != e]
-    t0 = 0
-    target, best = 0, 1e9
-    for x in targets:
-        dd = d3(epos(mh, x), epos(mh, e))
-        if dd < best:
-            best, target = dd, x
-    if not target:
-        fails.append('throw: no second prop to throw at')
-        return fails
-    print('  throw: carrying %s, target %s %.1f units away' % (describe(mh, e), describe(mh, target), best))
-    ok, how = tp_near(ph, mh, 0, epos(mh, target))
-    print('  throw: tp toward the target: %s' % how)
-    to = prop_same(mh, target, mg)
-    print('  throw: before: target own broken %d | other broken %d'
-          % (u32(mh, target + 0xa4), u32(mg, to + 0xa4) if to else -1))
-    broke = False
-    for name, keys in (('aim + tap attack', 'aimtap'), ('aim + hold attack', 'aimhold'), ('aim + action', 'aima')):
-        if broke:
-            break
-        if keys == 'aimtap':
-            ph.cmd('pad 0 %x 0 0' % 0x100)
-            time.sleep(0.4)
-            for _ in range(2):
-                ph.cmd('pad 0 %x 0 0' % (0x100 | 0x200))
-                time.sleep(0.12)
-                ph.cmd('pad 0 %x 0 0' % 0x100)
-                time.sleep(0.15)
-        elif keys == 'aimhold':
-            ph.cmd('pad 0 %x 0 0' % (0x100 | 0x200))
-            time.sleep(0.5)
-        else:
-            ph.cmd('pad 0 %x 0 0' % 0x100)
-            time.sleep(0.4)
-            ph.cmd('pad 0 %x 0 0' % (0x100 | 0x1000))
-            time.sleep(0.2)
-        ph.cmd('pad 0 0 0 0')
-        time.sleep(2.0)
-        broke = u32(mh, target + 0xa4) != 0
-        print('  throw: %-18s -> target broken on the owner copy: %s (carried prop now %s)'
-              % (name, 'yes' if broke else 'no', describe(mh, e)))
-    if not broke:
-        print('  throw: none of the input forms broke the target - no throw observed (see FINDINGS)')
-        return fails
-    okb, secs = wait_for(lambda: u32(mg, (prop_same(mh, target, mg) or 0) + 0xa4) != 0, 4.0)
-    to = prop_same(mh, target, mg)
-    print('  throw: break on the partner copy: %s after %.2f s -> %s'
-          % ('yes' if okb else 'NO', secs, describe(mg, to)))
-    if not okb:
-        fails.append('throw: the prop broken by the thrown prop stays whole on the partner copy')
-    # both copies alive and ticking (the 2.1 playtest crash): the game thread's frame counter must have
-    # advanced and the child processes must still be there
-    fh0, fg0 = frames(ph), frames(pg)
-    time.sleep(1.0)
-    fh1, fg1 = frames(ph), frames(pg)
-    print('  throw: frames host %s -> %s | guest %s -> %s' % (fh0, fh1, fg0, fg1))
-    try:
-        alive = ph.cmd('ping').startswith('pong') and pg.cmd('ping').startswith('pong')
-    except OSError:
-        alive = False
-    if not alive or fh0 == fh1 or fg0 == fg1:
-        fails.append('throw: a copy stopped after the throw (alive %s, frames host %s->%s guest %s->%s)'
-                     % (alive, fh0, fh1, fg0, fg1))
-    return fails
+    """(c) DROPPED in TASK 54: Obscure II has no control that THROWS a carried prop. The carried prop is a
+    melee weapon - the action button swings it (GAME_MECHANICS: "boxes and chairs are picked up with the
+    action button and swung with it again"). The character state machine RELEASES it when the swing ends
+    (state 0xa8d -> the held object's slot 29 = FUN_00412010 detach, decompile 140706-140712, state 0
+    after) and nothing gives it a launch velocity: FUN_004c5c40, the call the swing makes, only builds a
+    pad/rumble word (decompile 120164). The TASK 53 phase tried aim+attack here and broke the CARRIED
+    chair itself, never a target, exactly as this says. So the thrown-prop requirement is dropped; what a
+    swing can break is the prop in the hand, and the break-while-carried phase above covers it."""
+    print('  throw: no throw control exists in this game (a carried prop is swung, not thrown; see FINDINGS_54)')
+    return []
 
 
 def raw_move_test(m, pipe, label):
@@ -578,10 +617,12 @@ def main():
     dump_props(mh, 'host ')
     dump_props(mg, 'guest')
     fails = []
-    # TASK 53: carry-walk animation, a pushed prop, a prop broken by a thrown prop. Save 01 (I100) has no
-    # prop that is still whole (measured), so the phase first loads save slot 3 (game3.sav = J002).
+    # TASK 53/54: carry-walk animation, a pushed prop, and a chair broken while its owner carries it.
+    # Save 01 (I100) has no prop that is still whole (measured), so the phase first loads save slot 3
+    # (game3.sav = J002).
     print('\nbreakables: TASK 53 phases')
     if task53_level(mh, mg, ph, pg):
+        fails += task54_break_while_carried(mh, mg, ph, pg)
         fails += task53_carry_walk(mh, mg, ph)
         fails += task53_push(mh, mg, ph)
         fails += task53_throw(mh, mg, ph, pg)

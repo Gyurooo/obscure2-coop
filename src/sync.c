@@ -1299,6 +1299,51 @@ static int prop_alive(unsigned e, DWORD cls, DWORD vt)
 	return 1;
 }
 
+// TASK 54: a prop's transform is moved through the game's OWN entity setter, not written raw. Writing
+// the entity position +0x6c alone is undone by the physics (check_breakables' raw_move_test prints
+// REVERTED) and so is the collision body's +0xcc (the body's slot 5 write reverted in run 6 of this
+// task), because the physics body and the mesh keep their own copy. The engine's own entry is the
+// entity's vtable slot 34 (bytes +0x88), FUN_00402930: it shifts the collision body (+0xcc) by the same
+// delta, writes the entity position (+0x6c), the mesh node transform (+0x34) and the +0x38 node, and
+// hands the new position to the body through the body's OWN vtable slot 3 (+0xc), i.e. the physics
+// simulator (decompile 1066-1108). Only that slot is ever called, and only when it is that function.
+#define PROP_ENT_SETPOS 0x402930u
+
+// A world position is only usable when every component is finite. The 2.1 guest log ends on the chair the
+// host had just broken while carrying it, and its owner copy's position had already turned NaN
+// (FINDINGS_54 section 3.1): NaN never compares equal, so the peer's prop_find cannot match it either.
+static int fin3(const float *p)
+{
+	return p[0] > -1.0e6f && p[0] < 1.0e6f && p[1] > -1.0e6f && p[1] < 1.0e6f &&
+	       p[2] > -1.0e6f && p[2] < 1.0e6f;
+}
+
+// The live transform of a prop: the entity position +0x6c, else the collision body's +0xcc when the
+// entity field is not finite. 0 = no finite position at all (a NaN prop is never streamed or written).
+static int prop_xf(unsigned ent, float *pos, float *dir)
+{
+	const float *ep = (const float *)(uintptr_t)(ent + 0x6c);
+	unsigned b = (ent && !IsBadReadPtr((const void *)(uintptr_t)(ent + 0x68), 4)) ? rd32(ent + 0x68) : 0;
+	if (mem_ok(ep, 12) && fin3(ep))
+		memcpy(pos, ep, sizeof(float) * 3);
+	else if (b && mem_ok((const void *)(uintptr_t)(b + 0xcc), 12) && fin3((const float *)(uintptr_t)(b + 0xcc)))
+		memcpy(pos, (const void *)(uintptr_t)(b + 0xcc), sizeof(float) * 3);
+	else
+		return 0;
+	if (dir) {
+		const float *ed = (const float *)(uintptr_t)(ent + 0x78);
+		if (mem_ok(ed, 12) && fin3(ed) && ed[0] * ed[0] + ed[1] * ed[1] + ed[2] * ed[2] > 0.25f &&
+		    ed[0] * ed[0] + ed[1] * ed[1] + ed[2] * ed[2] < 4.0f)
+			memcpy(dir, ed, sizeof(float) * 3);
+		else {
+			dir[0] = 0.0f;
+			dir[1] = 0.0f;
+			dir[2] = 1.0f;
+		}
+	}
+	return 1;
+}
+
 // The live fields of the prop in slot `i` (the same offsets the packet names: class +0x10, id +4,
 // broken +0xa4, carrier +0xc4, drop +0x118, position +0x6c).
 static void prop_refresh(int i)
@@ -1311,9 +1356,15 @@ static void prop_refresh(int i)
 	g_props[i].carrier = rd32(e + 0xc4);
 	g_props[i].drop = rd32(e + 0x118);
 	const float *ep = (const float *)(uintptr_t)(e + 0x6c);
-	g_prop_pos[i][0] = ep[0];
-	g_prop_pos[i][1] = ep[1];
-	g_prop_pos[i][2] = ep[2];
+	// TASK 54: only a finite position is kept. A chair broken while its owner carried it had its own
+	// position turn (-nan,-nan,-nan) on the owner's copy; the break announcement then carried NaN and the
+	// peer could never match it (FINDINGS_54 section 3.1). The last finite position is what an
+	// announcement names, and the peer's table is matched with the same rule.
+	if (mem_ok(ep, 12) && fin3(ep)) {
+		g_prop_pos[i][0] = ep[0];
+		g_prop_pos[i][1] = ep[1];
+		g_prop_pos[i][2] = ep[2];
+	}
 }
 
 // Rebuilds the prop table from the manager's two lists (mgr+8 = the level's own entities, mgr+0x18 = the
@@ -1722,22 +1773,65 @@ static void prop_apply_carry(unsigned ch, unsigned ent)
 		return;
 	}
 	unsigned cur = rd32(ch + 0x2bc);
+	// TASK 54 diagnostic: the 2.1 guest log ends inside this path (two carry packets for the chair that
+	// was broken on the host 0.45 s earlier, no line after them), so every step names the game call it is
+	// about to make - a crash log / hang report then shows which call the copy died in.
+	logf("%s: prop carry apply: character %x holds %x, asked for %x (cur broken %u)",
+		g_role == 2 ? "guest" : "host", ch, cur, ent,
+		(cur && !IsBadReadPtr((void *)(uintptr_t)(cur + 0xa4), 4)) ? rd32(cur + 0xa4) : 0xffffffffu);
+	if (ent) {
+		// TASK 54 (A1-1): never attach a prop this copy has BROKEN (or one whose identity has gone). The
+		// game's attach FUN_00411f80 (chair slot 28) wires the object into the hand, calls the carrier's
+		// state setter with 300 and disables the object's collision body; a broken prop has had all of that
+		// done by the break already (prop_break_state), and the audit's crash case is exactly a carry packet
+		// that still names a chair the peer broke (SYNC_AUDIT A1-1). The guard also covers every other class
+		// of the family, which goes through the same attach slot.
+		DWORD ecls = (ent > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)ent, 0x120)) ? rd32(ent + 0x10) : 0;
+		if (!prop_alive(ent, ecls, 0) || !prop_class_tag(ecls) || rd32(ent + 0xa4)) {
+			static unsigned logged[4];
+			int seen = 0;
+			for (int i = 0; i < 4; i++)
+				if (logged[i] == ent) seen = 1;
+			if (!seen) {
+				for (int i = 3; i > 0; i--)
+					logged[i] = logged[i - 1];
+				logged[0] = ent;
+				logf("%s: prop carry refused: %x is broken or not a prop any more (broken %u class %x)",
+					g_role == 2 ? "guest" : "host", ent, rd32(ent + 0xa4), ecls);
+			}
+			return;
+		}
+	}
 	if (cur == ent)
 		return;
 	if (cur && !IsBadReadPtr((void *)(uintptr_t)cur, 0xcc)) {
 		if (rd32(cur + 0xa4))
 			return;   // a broken chair stays where the break left it
 		void **vt = *(void ***)(uintptr_t)cur;
+		// TASK 54: only a prop whose own carrier field still points back at this character is in its hand.
+		// A hand pointer that names another character (or a reused block) is stale, and the detach
+		// (FUN_00412010) dereferences +0x110 of the object it is given.
+		if (rd32(cur + 0xc4) != ch)
+			return;
 		if (vt && image_ptr((DWORD)(uintptr_t)vt) && !IsBadReadPtr(vt, 30 * sizeof(void *)) &&
-		    vt[28] == (void *)(uintptr_t)PROP_ATTACH_CHAIR && code_in_exe((DWORD)(uintptr_t)vt[29]))
+		    vt[28] == (void *)(uintptr_t)PROP_ATTACH_CHAIR && code_in_exe((DWORD)(uintptr_t)vt[29])) {
+			hang_phase("in the prop carry detach (game call)");
 			((void(__fastcall *)(void *, void *))vt[29])((void *)(uintptr_t)cur, NULL);   // detach
+			logf("%s: prop carry apply: detach of %x done", g_role == 2 ? "guest" : "host", cur);
+		}
 	}
 	if (ent) {
 		void **vt = *(void ***)(uintptr_t)ent;
 		if (vt && image_ptr((DWORD)(uintptr_t)vt) && !IsBadReadPtr(vt, 29 * sizeof(void *)) &&
-		    vt[28] == (void *)(uintptr_t)PROP_ATTACH_CHAIR)
+		    vt[28] == (void *)(uintptr_t)PROP_ATTACH_CHAIR) {
+			hang_phase("in the prop carry attach (game call)");
 			((void(__fastcall *)(void *, void *, void *))vt[28])((void *)(uintptr_t)ent, NULL, (void *)(uintptr_t)ch);
+			logf("%s: prop carry apply: attach of %x done (holds %x, broken %u)",
+				g_role == 2 ? "guest" : "host", ent, rd32(ch + 0x2bc),
+				IsBadReadPtr((void *)(uintptr_t)(ent + 0xa4), 4) ? 0xffffffffu : rd32(ent + 0xa4));
+		}
 	}
+	hang_phase("in the prop path (after a carry apply)");
 	char c[5], i[5];
 	logf("%s: prop carry applied: %s id %s -> %s", g_role == 2 ? "guest" : "host",
 		ent ? tag4(rd32(ent + 0x10), c) : "-----", ent ? tag4(rd32(ent + 4), i) : "----",
@@ -1772,10 +1866,20 @@ static int prop_apply_packet(const pkt_prop *pp)
 	int host_word = g_role == 2;   // the packet came from the host
 	unsigned ch = pp->ch_tag ? human_exact(pp->ch_tag) : 0;
 	unsigned ent = 0;
-	if (pp->kind == 3 && ch) {
-		ent = prop_held_chair(ch, pp->cls);   // a carried prop is named exactly by the hand it is in
-		if (ent && pp->id && rd32(ent + 4) != pp->id)
-			ent = 0;
+	// TASK 54: a carry packet names a prop that is in a hand. Prefer the hand over prop_find's "nearest
+	// same-class prop to the announced position": around a carried chair there are other chairs (the row
+	// the owner just broke), and attaching one of those instead is exactly the A1-1 crash case. The hand
+	// is only trusted when its own position (the pickup point; a carried prop's +0x6c does not move with
+	// the hand) is within prop_find's own 400-unit radius of the packet's.
+	if ((pp->kind == 1 || pp->kind == 3) && ch) {
+		unsigned h = prop_held_chair(ch, pp->cls);
+		if (h && !rd32(h + 0xa4) && (!pp->id || rd32(h + 4) == pp->id)) {
+			const float *hp = (const float *)(uintptr_t)(h + 0x6c);
+			float dx = hp[0] - pp->pos[0], dy = hp[1] - pp->pos[1], dz = hp[2] - pp->pos[2];
+			if (mem_ok(hp, 12) && fin3((const float *)(uintptr_t)pp->pos) && fin3(hp) &&
+			    dx * dx + dy * dy + dz * dz < 400.0f * 400.0f)
+				ent = h;
+		}
 	}
 	if (!ent)
 		ent = prop_find(pp->cls, pp->id, pp->pos);
@@ -1797,14 +1901,6 @@ static int prop_apply_packet(const pkt_prop *pp)
 				tag4(pp->ch_tag, ct), ch, ch ? rd32(ch + 0x2bc) : 0);
 		}
 		prop_apply_carry(ch, pp->kind == 1 ? ent : 0);
-		InterlockedIncrement(&g_prop_applied);
-		return 1;
-	}
-	if (pp->kind == 4) {   // TASK 53: the prop moved on the copy whose character touched it
-		if (!ent)
-			return 0;      // not in the table yet: try again after the next scan
-		if (!prop_own_here(ent))
-			prop_apply_move(ent, pp->pos, pp->drop_pos);
 		InterlockedIncrement(&g_prop_applied);
 		return 1;
 	}
@@ -2270,6 +2366,10 @@ static void fx_replay_tick(void)
 // prop's transform while it moves (prop_move_tick) and the other copy writes it (prop_apply_move). The
 // distance rule is symmetric and both copies know both characters (the peer's is the puppet), so exactly
 // one side sends and the receiver never writes a prop its own character is touching.
+// TASK 54: a prop that has NOT moved on the owner is still sent once a second. The receiver keeps
+// simulating it (the puppet's collision body shoves it too), and nothing else ever tells the receiver's
+// copy to come back: run 5 of this task left the two copies 37 units apart although the owner's prop had
+// been static since the push (its copy had been shoved by the puppet in the other world).
 typedef struct { unsigned ent; float pos[3]; DWORD at; } prop_move_slot;
 static prop_move_slot g_pmove[PROP_MAX];
 static volatile LONG g_prop_moves;
@@ -2291,7 +2391,15 @@ static int prop_own_here(unsigned ent)
 	float *ep = (float *)(uintptr_t)(ent + 0x6c);
 	if (!peer || IsBadReadPtr((const void *)(uintptr_t)(peer + H_POS), 12))
 		return 1;
-	return prop_dist2(ep, me) < prop_dist2(ep, peer) - 1.0f;
+	float dm = prop_dist2(ep, me), dp = prop_dist2(ep, peer);
+	if (dm < dp - 1.0f)
+		return 1;
+	if (dp < dm - 1.0f)
+		return 0;
+	// TASK 54: both characters are about equally close (a prop between them) - the rule must still name
+	// exactly ONE sender, or neither copy streams and the receiver's own physics (the puppet's body
+	// shoving the prop) is never corrected. The host owns a tie.
+	return g_role == 1;
 }
 
 static prop_move_slot *prop_move_entry(unsigned ent, DWORD now, int create)
@@ -2310,14 +2418,48 @@ static prop_move_slot *prop_move_entry(unsigned ent, DWORD now, int create)
 	return oldest;
 }
 
-// The entity's own position and facing - the two fields the renderer and the game's entity code read
-// (prop_refresh reads the same +0x6c; FUN_00412720 reads the facing at +0x78).
+// TASK 54: the last finite position this copy knows for a prop - the table's (kept finite by
+// prop_refresh), else the entity's own +0x6c when that is still finite. 0 = the copy knows none.
+static int prop_pos_for(unsigned ent, float *out)
+{
+	for (int i = 0; i < g_prop_n; i++)
+		if (g_props[i].ent == ent) {
+			memcpy(out, g_prop_pos[i], sizeof(float) * 3);
+			return 1;
+		}
+	unsigned e = ent;
+	if (e && mem_ok((const void *)(uintptr_t)(e + 0x6c), 12) && fin3((const float *)(uintptr_t)(e + 0x6c))) {
+		memcpy(out, (const void *)(uintptr_t)(e + 0x6c), sizeof(float) * 3);
+		return 1;
+	}
+	return 0;
+}
+
+// TASK 54 (A1-3): the transform is applied through the game's OWN entity setter (PROP_ENT_SETPOS above),
+// so the collision body, the mesh node and the physics simulator all follow. A prop whose class does not
+// carry that function is left alone rather than pretending a raw write worked. The facing +0x78 is what
+// the carried transform (FUN_00412720) reads; the setter does not touch it, so it is written directly.
 static void prop_apply_move(unsigned ent, const float *pos, const float *dir)
 {
-	if (!ent || IsBadWritePtr((void *)(uintptr_t)(ent + 0x6c), 12))
+	if (!ent || !pos || !fin3(pos))
 		return;
-	memcpy((void *)(uintptr_t)(ent + 0x6c), pos, 12);
-	if (dir && !IsBadWritePtr((void *)(uintptr_t)(ent + 0x78), 12))
+	unsigned vt = rd32(ent);
+	if (!vt || !image_ptr(vt) || IsBadReadPtr((const void *)(uintptr_t)vt, 35 * 4))
+		return;
+	unsigned fn = rd32(vt + 0x88);
+	if (fn != PROP_ENT_SETPOS || !code_in_exe(fn))
+		return;
+	float p[3] = { pos[0], pos[1], pos[2] };
+	const float *live = (const float *)(uintptr_t)(ent + 0x6c);
+	if (mem_ok(live, 12) && fin3(live)) {
+		float dx = p[0] - live[0], dy = p[1] - live[1], dz = p[2] - live[2];
+		if (dx * dx + dy * dy + dz * dz > 400.0f)   // 20 units: a correction worth a log line
+			logf("%s: prop move: %x corrected by %.1f units (%.1f,%.1f,%.1f -> %.1f,%.1f,%.1f)",
+				g_role == 2 ? "guest" : "host", ent, sqrtf(dx * dx + dy * dy + dz * dz),
+				live[0], live[1], live[2], p[0], p[1], p[2]);
+	}
+	((void(__fastcall *)(void *, void *, float *))fn)((void *)(uintptr_t)ent, NULL, p);
+	if (dir && fin3(dir) && !IsBadWritePtr((void *)(uintptr_t)(ent + 0x78), 12))
 		memcpy((void *)(uintptr_t)(ent + 0x78), dir, 12);
 	InterlockedIncrement(&g_prop_moves);
 }
@@ -2331,35 +2473,80 @@ static void prop_move_tick(DWORD level)
 		prop_slot *p = &g_props[i];
 		if (!p->ent || p->broken || p->carrier || !prop_alive(p->ent, p->cls, p->vt))
 			continue;
-		const float *ep = (const float *)(uintptr_t)(p->ent + 0x6c);
+		float pos[3], dir[3];
+		if (!prop_xf(p->ent, pos, dir))
+			continue;   // a NaN transform is never streamed (TASK 54)
 		prop_move_slot *m = prop_move_entry(p->ent, now, 1);
 		if (!m)
 			continue;
 		if (!m->pos[0] && !m->pos[1] && !m->pos[2]) {   // first sight: remember it, do not send
-			memcpy(m->pos, ep, sizeof m->pos);
+			memcpy(m->pos, pos, sizeof m->pos);
 			m->at = now;
 			continue;
 		}
-		float dx = ep[0] - m->pos[0], dy = ep[1] - m->pos[1], dz = ep[2] - m->pos[2];
-		if (dx * dx + dy * dy + dz * dz < 0.36f)   // 0.6 units: what the physics settle leaves behind
-			continue;
+		float dx = pos[0] - m->pos[0], dy = pos[1] - m->pos[1], dz = pos[2] - m->pos[2];
+		int moved = dx * dx + dy * dy + dz * dz >= 0.36f;   // 0.6 units: what the physics settle leaves
+		if (!moved && now - m->at < 1000)
+			continue;   // nothing to say, and the slow heartbeat below is not due
 		if (now - m->at < 60)   // 16 Hz per prop: enough for a box the other copy follows
 			continue;
 		if (!prop_own_here(p->ent))
 			continue;           // the peer's character is the one touching it: its copy decides
 		m->at = now;
-		memcpy(m->pos, ep, sizeof m->pos);
-		pkt_prop q;
+		memcpy(m->pos, pos, sizeof m->pos);
+		pkt_propmove q;
 		memset(&q, 0, sizeof q);
-		q.kind = 4;
 		q.level = level;
 		q.cls = p->cls;
 		q.id = p->id;
-		memcpy(q.pos, ep, sizeof q.pos);
-		if (mem_ok((const void *)(uintptr_t)(p->ent + 0x78), 12))
-			memcpy(q.drop_pos, (const void *)(uintptr_t)(p->ent + 0x78), sizeof q.drop_pos);
-		net_send(PKT_PROP, &q, (WORD)(sizeof q - sizeof(pkt_hdr)));
+		memcpy(q.pos, pos, sizeof q.pos);
+		memcpy(q.dir, dir, sizeof q.dir);
+		net_send(PKT_PROPMOVE, &q, (WORD)(sizeof q - sizeof(pkt_hdr)));
 		InterlockedIncrement(&g_prop_sent);
+	}
+}
+
+// TASK 54: the peer's moved-prop packets. Filled on the transport thread, applied on the game thread
+// (the body's setter is a game call, and a prop pointer must not cross threads).
+#define PROPMOVE_Q 16
+static CRITICAL_SECTION g_pmove_cs;
+static pkt_propmove g_pmove_q[PROPMOVE_Q];
+static int g_pmove_head, g_pmove_tail;
+
+static void peer_on_propmove(const char *buf, int n)
+{
+	if (n != (int)sizeof(pkt_propmove))
+		return;
+	EnterCriticalSection(&g_pmove_cs);
+	int next = (g_pmove_tail + 1) & (PROPMOVE_Q - 1);
+	if (next == g_pmove_head)
+		g_pmove_head = (g_pmove_head + 1) & (PROPMOVE_Q - 1);   // full: the oldest transform is lost
+	memcpy(&g_pmove_q[g_pmove_tail], buf, sizeof(pkt_propmove));
+	g_pmove_tail = next;
+	LeaveCriticalSection(&g_pmove_cs);
+	InterlockedIncrement(&g_prop_rcv);
+}
+
+static void peer_apply_moves(void)
+{
+	for (;;) {
+		pkt_propmove p;
+		EnterCriticalSection(&g_pmove_cs);
+		if (g_pmove_head == g_pmove_tail) {
+			LeaveCriticalSection(&g_pmove_cs);
+			return;
+		}
+		p = g_pmove_q[g_pmove_head];
+		g_pmove_head = (g_pmove_head + 1) & (PROPMOVE_Q - 1);
+		LeaveCriticalSection(&g_pmove_cs);
+		unsigned w = world_obj();
+		if (!w || !world_ready() || g_prop_gen != g_world_gen || rd32(w + 4) != p.level)
+			continue;   // another level (or the world is being built): the transform is old news
+		unsigned ent = prop_find(p.cls, p.id, p.pos);
+		if (!ent)
+			continue;
+		if (!prop_own_here(ent))
+			prop_apply_move(ent, p.pos, p.dir);
 	}
 }
 
@@ -2390,13 +2577,19 @@ static void prop_tick(void)
 		prop_scan(w, level);
 		prop_pending_flush();   // TASK 35: no entity pointer survives the rebuild
 	}
+	hang_phase("in peer_apply_props (a prop packet)");
 	peer_apply_props();
+	hang_phase("in peer_apply_moves (the peer's moved props)");
+	peer_apply_moves();
+	hang_phase("in prop_tick_pending (a break)");
 	prop_tick_pending();
+	hang_phase("in prop_retry_tick");
 	prop_retry_tick();
 	if (g_role == 1)
 		host_send_prop_state(level);
 	else
 		guest_apply_prop_state();
+	hang_phase("in prop_move_tick");
 	prop_move_tick(level);   // TASK 53: a prop this copy's character pushed follows on the other screen
 
 	// 1. the character this copy owns: announce what it carries (on change, plus a slow heartbeat so a
@@ -2412,21 +2605,30 @@ static void prop_tick(void)
 			p.kind = held ? 1 : 2;
 			p.level = level;
 			p.ch_tag = rd32(me + H_TAG);
+			int send = 1;
 			if (held) {
 				p.cls = rd32(held + 0x10);
 				p.id = rd32(held + 4);
-				if (mem_ok((const void *)(uintptr_t)(held + 0x6c), 12))
-					memcpy(p.pos, (const void *)(uintptr_t)(held + 0x6c), sizeof p.pos);
+				const float *hp = (const float *)(uintptr_t)(held + 0x6c);
+				if (mem_ok(hp, 12) && fin3(hp))
+					memcpy(p.pos, hp, sizeof p.pos);
+				else if (!prop_pos_for(held, p.pos))
+					send = 0;   // TASK 54: a NaN prop is never named by a position this copy lacks
 			}
-			net_send(PKT_PROP, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
-			InterlockedIncrement(&g_prop_sent);
-			last_carry = held;
-			last_level = level;
-			last_send = now;
-			if (held) {
-				char c[5], i4[5], ct[5];
-				logf("%s: prop carry sent: %s id %s by %s", g_role == 2 ? "guest" : "host",
-					tag4(rd32(held + 0x10), c), tag4(rd32(held + 4), i4), tag4(rd32(me + H_TAG), ct));
+			if (!send) {
+				logf("%s: prop carry: %x has no finite position, nothing announced", g_role == 2 ? "guest" : "host", held);
+				last_send = now;
+			} else {
+				net_send(PKT_PROP, &p, (WORD)(sizeof p - sizeof(pkt_hdr)));
+				InterlockedIncrement(&g_prop_sent);
+				last_carry = held;
+				last_level = level;
+				last_send = now;
+				if (held) {
+					char c[5], i4[5], ct[5];
+					logf("%s: prop carry sent: %s id %s by %s", g_role == 2 ? "guest" : "host",
+						tag4(rd32(held + 0x10), c), tag4(rd32(held + 4), i4), tag4(rd32(me + H_TAG), ct));
+				}
 			}
 		}
 	}
@@ -3423,6 +3625,15 @@ static int puppet_state_ok(DWORD st)
 	case 200: case 300:                          // swing, charged/special attack
 	case 500: case 600: case 700:                // the combat/stance family of the setter
 	case 0x12d: case 0x12e: case 0x12f:          // use/interaction family (FINDINGS_29 section 2)
+	case 0x708:                                  // TASK 54: using a door/world object (decompile 24514 sets
+	case 0x6a4:                                  //     it before a use path; the setter's case only clears
+	case 0x452:                                  //     a flag / stops the upper layer, no gameplay path)
+	                                             // TASK 54: the other world-object interaction states the
+	                                             //     audit lists (SYNC_AUDIT A1-4): 0x6a4 (setter 138590:
+	                                             //     stops the upper layer, clears +0x9b), 0x452 (setter
+	                                             //     138782: plays clip CD25). None of the three runs any
+	                                             //     game logic; refusing them froze the puppet in its old pose
+	                                             //     while the owner used an object.
 	case 0xa8c: case 0xa8d:                      // TASK 50: carrying a prop / swinging it. The setter's
 	                                             // cases (decompile 138552, 138559) only play the carry clip
 	                                             // (0x4a4d5041) and the swing clip (0x4a4d4355); the chair's
@@ -3652,9 +3863,11 @@ static void puppet_finish(unsigned ch)
 		    !IsBadReadPtr((const void *)(uintptr_t)(held + 0xc4), 4) && rd32(held + 0xc4) == ch &&
 		    !rd32(held + 0xa4)) {
 			unsigned vt = rd32(held), fn = vt ? rd32(vt + 0x6c) : 0;
-			if (fn && code_in_exe(fn))
+			if (fn && code_in_exe(fn)) {
+				hang_phase("in the carried attach of the puppet (game call)");   // TASK 54 diagnostic
 				((void(__fastcall *)(void *, void *, void *))fn)((void *)(uintptr_t)held, NULL,
 				                                                  (void *)(uintptr_t)ch);
+			}
 		}
 	}
 	if (!IsBadWritePtr((void *)(uintptr_t)(ch + 0x2dc), 4)) {
@@ -7375,6 +7588,7 @@ static void sync_init(void)
 	InitializeCriticalSection(&g_rload_cs);
 	InitializeCriticalSection(&g_pick_cs);
 	InitializeCriticalSection(&g_prop_cs);
+	InitializeCriticalSection(&g_pmove_cs);  // TASK 54: the peer's moved-prop transforms
 	InitializeCriticalSection(&g_fx_cs);     // TASK 53: the peer's effect queue
 	InitializeCriticalSection(&g_tp_cs);
 	InitializeCriticalSection(&g_lvl_cs);
