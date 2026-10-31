@@ -123,10 +123,12 @@ def players(m):
 
 def humans(m):
     """This copy's humans by character tag (BOY1/GIR1/...) with their positions; a position that reads
-    as garbage (the objects are rebuilt during a load) is left out."""
+    as garbage (the objects are rebuilt during a load) is left out. A human's position is at +0x23c
+    (+0x240/+0x244), the field every other check uses (check_movement.py's H_POS): +0x6c is the
+    position of a LEVEL entity (CToe*), not of a character."""
     out = {}
     for h in players(m):
-        t, p = tag(u32(m, h + 0x14)), pos(m, h)
+        t, p = tag(u32(m, h + 0x14)), (f32(m, h + 0x23c), f32(m, h + 0x240), f32(m, h + 0x244))
         if t and all(abs(v) < 1e6 for v in p):
             out[t] = p
     return out
@@ -159,6 +161,28 @@ def find_pt(m, cls, near):
     return best
 
 
+def find_save_point(m):
+    """The level's CToeSavePoint ("SAVE"), nearest to player 1, from ALL THREE of the entity manager's
+    lists (mgr+0/+8/+0x18). `entities()` picks one "best" list and can miss the save point after a
+    location change: in the soak's J002 -> I100 load it found none although the entity tables were
+    rebuilt (host log "world ... in level I100 is settled"), so the save test could not run."""
+    w = world(m)
+    mgr = u32(m, w + 0x1768) if w else 0
+    if not mgr:
+        return 0
+    near = pos(m, players(m)[0]) if players(m) else (0.0, 0.0, 0.0)
+    best, bd = 0, 1e18
+    for off in (0, 8, 0x18):
+        for e in walk(m, u32(m, mgr + off)):
+            if u32(m, e + 0x10) != SAVEPT:
+                continue
+            p = pos(m, e)
+            d = sum((p[i] - near[i]) ** 2 for i in range(3))
+            if d < bd:
+                bd, best = d, e
+    return best
+
+
 def wait_level(host_lvl, limit=90):
     t0, stable = time.time(), None
     while time.time() - t0 < limit:
@@ -174,6 +198,57 @@ def wait_level(host_lvl, limit=90):
     print('   NOT in one level after %d s (host %s/%s guest %s/%s)'
           % (limit, tag(level(H)) if world(H) else '-', mode(H), tag(level(G)) if world(G) else '-', mode(G)))
     return False
+
+
+def wait_ready(limit=60):
+    """The game's own "level ready" on BOTH copies, so a read is of finished characters and not of the
+    objects a load is still rebuilding (FINDINGS_61 2.2 read a load half-way): mode 1, world state 1
+    (world+0x11c), the same humans present with finite positions, those positions unchanged for 1 s."""
+    t0, prev, stable = time.time(), None, None
+    hh, gg = {}, {}
+    while time.time() - t0 < limit:
+        hh, gg = humans(H), humans(G)
+        here = in_level(H) and in_level(G) and hh and set(hh) == set(gg) \
+            and u32(H, world(H) + 0x11c) == 1 and u32(G, world(G) + 0x11c) == 1
+        if here:
+            same = prev is not None and set(prev[0]) == set(hh) and \
+                all(math.dist(prev[0][t], hh[t]) <= 0.5 for t in hh) and \
+                all(math.dist(prev[1][t], gg[t]) <= 0.5 for t in gg)
+            if stable is None or not same:
+                stable = time.time()
+            elif time.time() - stable >= 1.0:
+                print('   the level is ready on both copies after %.1f s (mode 1, world state 1, %s)'
+                      % (time.time() - t0, '/'.join(sorted(hh))))
+                return True
+            prev = (hh, gg)
+        else:
+            prev = stable = None
+        time.sleep(0.5)
+    print('   the level is NOT ready on both copies after %d s (mode %s/%s, world state %s/%s, humans %s/%s)'
+          % (limit, mode(H), mode(G), u32(H, world(H) + 0x11c) if world(H) else '-',
+             u32(G, world(G) + 0x11c) if world(G) else '-', sorted(hh), sorted(gg)))
+    return False
+
+
+def walk_away(pipe, m, start, want=12.0):
+    """Holds the move stick until this copy has moved `want` units away from `start`, trying the four
+    directions in turn. Without a real walk the saved-spot comparison proves nothing (TASK 61's run
+    "walked 0.0 units": it read +0x6c, a level-entity field, so even a walking host measured 0)."""
+    best = 0.0
+    for lx, ly in ((0, 32000), (32000, 0), (-32000, 0), (0, -32000)):
+        pipe.cmd('pad 0 0 %d %d' % (lx, ly))
+        t0 = time.time()
+        while time.time() - t0 < 2.5:
+            now = humans(m)
+            best = max(best, max((math.dist(start[t], now[t]) for t in start if t in now), default=0.0))
+            if best >= want:
+                pipe.cmd('pad 0 0 0 0')
+                time.sleep(0.5)
+                return best
+            time.sleep(0.25)
+        pipe.cmd('pad 0 0 0 0')
+        time.sleep(0.3)
+    return best
 
 
 def save_dirs():
@@ -234,7 +309,7 @@ def reset_savepoint(m, pipe, who):
     check wants (FUN_0046e6c0) and the state its own save machine starts from (FUN_0046f330). The ten
     test saves store every save point in the post-save state 3 (FINDINGS_60 2), so a save loaded from
     one of them cannot save again without this. Test-only memory write, never done by the mod."""
-    sp = find_pt(m, SAVEPT, pos(m, players(m)[0]) if players(m) else (0, 0, 0))
+    sp = find_save_point(m)
     if not sp:
         print('   %s: no save point in level %s' % (who, tag(level(m))))
         return 0
@@ -369,16 +444,28 @@ def wait_new_save(d, before_hash, before_time, limit=45):
 
 def save_phase():
     print('\n== A save: the same file on both copies')
-    if not find_pt(H, SAVEPT, pos(H, players(H)[0]) if players(H) else (0, 0, 0)):
-        # The soak's location changes leave the pair in another level (J002) where this level's save
-        # point does not exist; the save test needs I100, the level save 01 loads.
-        print('   level %s has no save point: loading game0.sav (I100, the pair\'s start slot)'
-              % tag(level(H)))
+    if level(H) != 0x49313030:
+        # The soak's location changes leave the pair in another level (J002): the save test belongs in
+        # I100, the level save 01 loads. Its save point is 89 units from the level start, inside the
+        # mod's own 400-unit lookup for the `savepoint` command; a check-only entity scan is more lenient
+        # than that lookup (in J002 it found a save point the mod could not reach), so the level, not the
+        # scan, decides. A save made here also keeps game0.sav an I100 slot for the next session.
+        print('   level %s is not I100: loading game0.sav (the pair\'s start slot)' % tag(level(H)))
         print('   loadsave -> %s' % HP.cmd('loadsave game0.sav'))
         if not wait_level(0x49313030):
-            print('save: NOT DONE - the level with the save point did not load')
+            print('save: NOT DONE - the level with the save point (I100) did not load')
             fails.append('save')
             return
+    sp, t0 = 0, time.time()
+    while time.time() - t0 < 30 and not sp:
+        sp = find_save_point(H)
+        if not sp:
+            time.sleep(1.0)
+    if not sp:
+        print('   level %s has no save point after %.0f s' % (tag(level(H)), time.time() - t0))
+        print('save: NOT DONE - the level with the save point did not load')
+        fails.append('save')
+        return
     dirs = save_dirs()
     names = ['host remote', 'guest remote', 'host Save', 'guest Save']
     b_hash = [save_snap(d) for d in dirs]
@@ -431,20 +518,40 @@ def save_phase():
     #    ISteamRemoteStorage folder through the mod's proxy; FINDINGS_60 section 2)
     print('   -- what changed in the save folders')
     a_dir = [dir_snap(d) for d in dirs]
+    bak = (slot or '') + '.solo.bak'
     for i, nm in enumerate(names):
         changed = sorted(k for k in set(b_dir[i]) | set(a_dir[i]) if b_dir[i].get(k) != a_dir[i].get(k))
         print('   after  %-12s %d files changed: %s' % (nm, len(changed), changed or 'none'))
-        other = [k for k in changed if k != slot]
+        if bak in changed:
+            # TASK 62: the mod keeps this copy's own save once as <slot>.solo.bak before it replaces
+            # bytes that differ (sync.c save_solo_keep, the save push and the join transfer alike).
+            print('   %s: %s kept this copy\'s own %s before the save replaced it (sha256 %s)'
+                  % (nm, bak, slot, a_dir[i][bak][:16]))
+            if b_dir[i].get(slot) and a_dir[i][bak] != b_dir[i][slot]:
+                print('   %s: %s is not the copy that was there before the save' % (nm, bak))
+                ok = False
+        other = [k for k in changed if k != slot and k != bak]
         if other:
             print('   %s changed a file that is not the saved slot: %s' % (nm, other))
             ok = False
-        elif i < 2 and changed:
-            continue                                        # the slot itself, in the game's folder
-        elif changed:
+        elif i >= 2 and slot in changed:
             # <exe>\Save is the mod's own mirror of what the game reads from coop_profile\remote
             # (sync.c save60_store writes both); the game itself writes only the remote folder.
             print('   %s: %s is the mod\'s mirror of the slot (sync.c save60_store), not a game write'
-                  % (nm, changed))
+                  % (nm, slot))
+    # The owner's data: the backup must be visible in the guest's own folders (its game save folder and
+    # the Save mirror), holding exactly the file the save replaced.
+    for i in (1, 3):
+        listing = sorted(a_dir[i])
+        print('   %-12s listing: %s' % (names[i], listing))
+        if bak in a_dir[i]:
+            print('   %-12s %s = %s (sha256 %s)'
+                  % (names[i], bak, 'the copy that was there before the save'
+                     if b_dir[i].get(slot) == a_dir[i][bak]
+                     else 'an earlier copy, not the one there before this save', a_dir[i][bak][:16]))
+        elif i == 1:
+            print('   guest remote: no %s: the guest\'s own save was replaced without a backup' % bak)
+            ok = False
     if saved == 0:
         print('save: NOT DONE - no save file was written by the game')
         print('   host save counters:  %s' % [s for s in HP.cmd('sync').split('|') if 'saves sent' in s or 'savept' in s])
@@ -452,20 +559,30 @@ def save_phase():
         print('save FAIL')
         fails.append('save')
         return
-    # 4. the next session: the save both copies now hold loads into the same place on both
+    # 4. the next session: both copies load the save they both hold and come up in the same place.
+    #    The game's own save at a save point carries NO player position (probe62: walk 74 units away, save
+    #    at the save point, load -> exactly the level's own start again; none of the live positions or the
+    #    save point's own is anywhere in the 40 KB file), so a load restarts the level from its start, not
+    #    from the spot the player stood on. What the next session must show is therefore that BOTH copies
+    #    come up in the same place, and that the load really ran (the host is no longer where it walked
+    #    to). The distance from the live saved spot is printed as information only.
     print('   -- the next session: both copies load %s' % slot)
     saved_at = humans(H)
-    HP.cmd('pad 0 0 32000 0')           # walk away, so the load has a position to restore
-    time.sleep(1.2)
-    HP.cmd('pad 0 0 0 0')
-    time.sleep(0.8)
-    moved = humans(H)
-    walked = max((math.dist(saved_at[t], moved[t]) for t in saved_at if t in moved), default=0.0)
+    if not saved_at:
+        print('   the host reads no human position at the saved spot')
+    walked = walk_away(HP, H, saved_at)
+    walked_at = humans(H)
     print('   the host walked %.1f units away from the saved spot' % walked)
+    if walked <= 10:
+        print('   the host did not get away from the saved spot: the reload cannot be told from standing still')
+        ok = False
     lv = level(H)
     print('   loadsave -> %s' % HP.cmd('loadsave ' + slot))
     if not wait_level(lv):
         print('   the save did not load on both copies')
+        ok = False
+    elif not wait_ready():
+        print('   the loaded level never became ready on both copies')
         ok = False
     else:
         good = False
@@ -485,12 +602,18 @@ def save_phase():
                         print('   both copies hold %s within %.2f units after %.1f s: %s'
                               % ('/'.join(sorted(ds)), max(ds.values()), time.time() - t0,
                                  {t: round(v, 2) for t, v in sorted(ds.items())}))
-                        if walked > 10:
-                            back = {t: math.dist(saved_at[t], hs[t]) for t in saved_at if t in hs}
-                            print('   distance from the saved spot: %s'
+                        back = {t: math.dist(saved_at[t], hs[t]) for t in saved_at if t in hs}
+                        if back:
+                            print('   distance from the live saved spot (the game restores the level '
+                                  'start, not that spot): %s'
                                   % {t: round(v, 1) for t, v in sorted(back.items())})
-                            if back and max(back.values()) > 5:
-                                print('   the load did NOT restore the saved position')
+                        off = {t: math.dist(walked_at[t], hs[t]) for t in walked_at if t in hs}
+                        if off:
+                            print('   the load moved the host %.1f units off the spot it walked to'
+                                  % max(off.values()))
+                            if max(off.values()) <= 10:
+                                print('   the host is still where it walked to: the load did not restart '
+                                      'the level')
                                 good = False
                         break
                 else:

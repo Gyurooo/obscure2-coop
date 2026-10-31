@@ -609,6 +609,46 @@ static int save_existing_path(char *out, size_t n, const char *name)
 	return GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES;
 }
 
+// TASK 62: the guest's own save (the owner's real data) must survive this mod replacing it. A received
+// save is written over the file the game reads; when a file is already there with DIFFERENT bytes, keep
+// it once as "<name>.solo.bak" next to it. CopyFileA(bFailIfExists = TRUE) means the first differing
+// copy is the one kept: a later save never replaces that backup.
+static void save_solo_keep(const char *path)
+{
+	char bak[MAX_PATH];
+	_snprintf(bak, sizeof bak, "%s.solo.bak", path);
+	if (CopyFileA(path, bak, TRUE))
+		logf("%s: kept this copy's own save %s (%s) as %s before the peer's save replaced it",
+		     g_role == 2 ? "guest" : "host", strrchr(path, '\\') + 1,
+		     strstr(path, "coop_profile") ? "the game's save folder" : "Save", strrchr(bak, '\\') + 1);
+}
+
+// Does the file at `path` already hold the incoming bytes: the whole file (off 0, len = its length) or
+// the region one chunk of the join transfer is about to write? 0 when it is missing, shorter where the
+// chunk writes, or different there.
+static int save_has_bytes(const char *path, DWORD off, const BYTE *data, DWORD len)
+{
+	HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	if (f == INVALID_HANDLE_VALUE)
+		return 0;
+	DWORD size = GetFileSize(f, NULL);
+	int same = 0;
+	if (size >= off + len && len > 0) {
+		BYTE have[SAVE_CHUNK];
+		DWORD done = 0;
+		SetFilePointer(f, (LONG)off, NULL, FILE_BEGIN);
+		same = 1;
+		while (same && done < len) {
+			DWORD want = len - done < SAVE_CHUNK ? len - done : SAVE_CHUNK, got = 0;
+			if (!ReadFile(f, have, want, &got, NULL) || got != want || memcmp(have, data + done, want))
+				same = 0;
+			done += got;
+		}
+	}
+	CloseHandle(f);
+	return same;
+}
+
 // Host: send the saves again from the first file. Called from the welcome path, so a guest that reconnects
 // (or missed chunks) gets a clean transfer. The file the host's latest load named goes first: the guest's
 // load waits for exactly that file.
@@ -911,6 +951,9 @@ static void guest_on_save(const char *buf, int n)
 				p->name, strstr(src, "coop_profile") ? "the game's save folder" : "Save");
 	}
 	for (int i = 0; i < 2; i++) {
+		// TASK 62: before this chunk replaces bytes that are there and differ, keep the whole file once.
+		if (p->len && !save_has_bytes(paths[i], p->off, p->data, p->len))
+			save_solo_keep(paths[i]);
 		HANDLE f = CreateFileA(paths[i], GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
 		if (f == INVALID_HANDLE_VALUE) {
 			if (i == 0) return;   // the game's own copy is the one that matters: not acked, retransmitted
@@ -995,6 +1038,9 @@ static int save60_store(const char *name, const BYTE *data, DWORD len)
 		char *slash = strrchr(dir, '\\');
 		if (slash) *slash = 0;
 		CreateDirectoryA(dir, NULL);
+		// TASK 62: the same file with different bytes is being replaced: keep this copy's own save once.
+		if (!save_has_bytes(paths[i], 0, data, len))
+			save_solo_keep(paths[i]);
 		HANDLE f = CreateFileA(paths[i], GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
 		DWORD wrote = 0;
 		int good = f != INVALID_HANDLE_VALUE && WriteFile(f, data, len, &wrote, NULL) && wrote == len;
