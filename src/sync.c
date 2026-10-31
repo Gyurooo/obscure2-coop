@@ -1775,6 +1775,57 @@ static unsigned human_exact(unsigned tag)
 	return 0;
 }
 
+// TASK 59: remember the carried prop's LOCAL mesh transform as the OWNER's own carried transform wrote it
+// (mesh+0x1c8/+0x1e0, pkt_prop.cdir). The applying copy cannot recompute it: FUN_00412720 picks one of
+// eight hardcoded hand offsets from the prop's own direction +0x78 and grip point +0x104 (plus the
+// carrier's position and tag), and only the copy that SIMULATES the prop keeps those current - the two
+// copies took mirrored offsets (reviewer run: 3.98 units = the A3/A4 pair, 2.96 = A1/A2, 1.41 = B2/B3).
+// The receiver still calls slot 27 (the RHand binding, +0x110) and then writes these seven values in
+// puppet_finish every frame; the packet is a 500 ms heartbeat because the values only change when the
+// game's own selection changes.
+typedef struct { unsigned ent; float v[7]; DWORD at; } prop_mesh_slot;
+static prop_mesh_slot g_pmesh[4];
+
+static int fin7(const float *v)
+{
+	for (int i = 0; i < 7; i++)
+		if (!(v[i] > -1.0e9f && v[i] < 1.0e9f))   // catches NaN too
+			return 0;
+	return 1;
+}
+
+static void prop_mesh_remember(unsigned ent, const float *v)
+{
+	int all_zero = 1;
+	for (int i = 0; i < 7; i++)
+		if (v[i] != 0.0f)
+			all_zero = 0;
+	if (!ent || all_zero || !fin7(v))
+		return;   // the owner sent none (its own carried transform had not run yet)
+	int slot = -1, oldest = 0;
+	for (int i = 0; i < 4; i++) {
+		if (g_pmesh[i].ent == ent || !g_pmesh[i].ent) {
+			slot = i;
+			break;
+		}
+		if ((LONG)(g_pmesh[i].at - g_pmesh[oldest].at) < 0)
+			oldest = i;
+	}
+	if (slot < 0)
+		slot = oldest;   // all four in use: the oldest entry goes
+	g_pmesh[slot].ent = ent;
+	memcpy(g_pmesh[slot].v, v, sizeof g_pmesh[slot].v);
+	g_pmesh[slot].at = GetTickCount();
+}
+
+static const float *prop_mesh_for(unsigned ent)
+{
+	for (int i = 0; i < 4; i++)
+		if (g_pmesh[i].ent == ent && GetTickCount() - g_pmesh[i].at < 3000)
+			return g_pmesh[i].v;
+	return 0;
+}
+
 // Carry: attach the prop to that character (slot 28) or detach what it holds (slot 29), the game's own
 // methods. `ent` 0 = the character holds nothing.
 // TASK 27: a BROKEN prop is never detached. The game keeps a broken chair linked in the hand on purpose
@@ -1915,6 +1966,7 @@ static int prop_apply_packet(const pkt_prop *pp)
 				g_role == 2 ? "guest" : "host", tag4(pp->cls, c), tag4(pp->id, i4), ent, ep[0], ep[1], ep[2],
 				tag4(pp->ch_tag, ct), ch, ch ? rd32(ch + 0x2bc) : 0);
 		}
+		prop_mesh_remember(ent, pp->cdir);   // TASK 59: the owner's carried mesh transform (puppet_finish writes it)
 		prop_apply_carry(ch, pp->kind == 1 ? ent : 0);
 		InterlockedIncrement(&g_prop_applied);
 		return 1;
@@ -2892,6 +2944,14 @@ static void prop_tick(void)
 					memcpy(p.pos, hp, sizeof p.pos);
 				else if (!prop_pos_for(held, p.pos))
 					send = 0;   // TASK 54: a NaN prop is never named by a position this copy lacks
+				// TASK 59: the local mesh transform this copy's own carried transform wrote (pkt_prop.cdir).
+				// Only the copy that simulates the prop has it; the other copy cannot recompute it.
+				unsigned mesh = rd32(held + 0x34);
+				if (mesh && mem_ok((const void *)(uintptr_t)(mesh + 0x1c8), 12) &&
+				    mem_ok((const void *)(uintptr_t)(mesh + 0x1e0), 16)) {
+					memcpy(p.cdir, (const void *)(uintptr_t)(mesh + 0x1c8), 12);
+					memcpy(p.cdir + 3, (const void *)(uintptr_t)(mesh + 0x1e0), 16);
+				}
 			}
 			if (!send) {
 				logf("%s: prop carry: %x has no finite position, nothing announced", g_role == 2 ? "guest" : "host", held);
@@ -4141,6 +4201,17 @@ static void puppet_finish(unsigned ch)
 				hang_phase("in the carried attach of the puppet (game call)");   // TASK 54 diagnostic
 				((void(__fastcall *)(void *, void *, void *))fn)((void *)(uintptr_t)held, NULL,
 				                                                  (void *)(uintptr_t)ch);
+				// TASK 59: the OWNER's seven floats win over this copy's recomputation. FUN_00412720
+				// selects one of eight hardcoded hand offsets from fields only the simulating copy
+				// updates, so the same call here can pick the mirrored side (3.98 units, reviewer run).
+				const float *mv = prop_mesh_for(held);
+				unsigned mesh = rd32(held + 0x34);
+				if (mv && mesh && mem_ok((const void *)(uintptr_t)(mesh + 0x1c8), 12) &&
+				    !IsBadWritePtr((void *)(uintptr_t)(mesh + 0x1c8), 12) &&
+				    !IsBadWritePtr((void *)(uintptr_t)(mesh + 0x1e0), 16)) {
+					memcpy((void *)(uintptr_t)(mesh + 0x1c8), mv, 12);
+					memcpy((void *)(uintptr_t)(mesh + 0x1e0), mv + 3, 16);
+				}
 			}
 		}
 	}

@@ -14,7 +14,7 @@
 #include <ws2tcpip.h>
 
 #define NET_MAGIC 0x50324f42u   // "BO2P" little-endian
-#define NET_VERSION 29   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
+#define NET_VERSION 30   // 2: pad packets carry the sender's camera yaw; 3: timeline stamps, input delay, clock sync;
                         // 4: the state snapshot also carries the host's pad and yaw, so a lost HOSTPAD does not stop player 1 animating
                         // 5: ch_state carries the four live weapon tags and the selected slot (the hands)
                         // 6: PKT_ITEM carries whole 32-byte inventory entries (chunked), not 16-byte halves
@@ -103,6 +103,16 @@
                         //     heartbeat of a prop at rest does not). The host owns prop physics (Obscure 1
                         //     host_send_props); the receiver freezes the prop's collision body while the
                         //     motion lasts instead of simulating it a second time.
+                        // 30: TASK 59. pkt_prop kind 1 (a character carries a prop) also carries the prop's
+                        //     LOCAL mesh transform as the owner's own carried-transform call (vtable slot
+                        //     27 = FUN_00412720) wrote it: mesh+0x1c8 (3 floats) and mesh+0x1e0 (4
+                        //     floats). That function picks one of eight hardcoded hand offsets by a
+                        //     dot/angle test and a cross-product sign over the prop's own +0x78 direction
+                        //     and +0x104 grip point, which only the copy that SIMULATES the prop keeps
+                        //     current: the two copies took mirrored offsets (reviewer run: 3.98 units =
+                        //     the A3/A4 pair, 2.96 = A1/A2, 1.41 = B2/B3). The receiver still calls slot 27
+                        //     (that is what binds the mesh to RHand) and then writes the owner's seven
+                        //     values.
 enum { PKT_HELLO = 1, PKT_WELCOME = 2, PKT_INPUT = 3, PKT_PING = 4, PKT_PONG = 5, PKT_BYE = 6, PKT_HOSTPAD = 7,
 	PKT_STATE = 8, PKT_REQ = 9, PKT_NPC = 10, PKT_REGION = 11, PKT_ITEM = 12, PKT_SAVE = 13, PKT_SAVE_ACK = 14,
 	PKT_SAVES_DONE = 15, PKT_PICKUP = 16, PKT_ITEMUSE = 17, PKT_CHAR = 18, PKT_PROP = 19, PKT_PROPS = 20,
@@ -187,8 +197,11 @@ typedef struct { pkt_hdr h; DWORD player; DWORD tag; } pkt_itemuse;
 // its new position, drop_pos its facing - the receiver writes them so both screens agree). cls/id/pos name
 // the prop (class tag at +0x10, id at +4, position at +0x6c); ch_tag names the character for a carry;
 // drop_cls/drop_id/drop_pos name the item entity the break enabled (0 = the break produced none).
+// cdir (TASK 59, kind 1 only) = the carried prop's LOCAL mesh transform exactly as the OWNER's own carried
+// transform (FUN_00412720) wrote it: mesh+0x1c8 (3 floats, a hardcoded hand offset) then mesh+0x1e0 (4
+// floats, its quaternion). All zero = the owner had none yet, and the receiver keeps its own call's result.
 typedef struct { pkt_hdr h; DWORD kind; DWORD level; DWORD ch_tag; DWORD cls, id; float pos[3];
-                 DWORD drop_cls, drop_id; float drop_pos[3]; } pkt_prop;
+                 DWORD drop_cls, drop_id; float drop_pos[3]; float cdir[7]; } pkt_prop;
 // The host's prop state once a second (TASK 26): every prop that is broken and the drop it enabled, so a
 // break announcement lost with a packet, or made while the link was paused, still reaches the guest.
 #define PROP_STATE_MAX 24
